@@ -1,5 +1,7 @@
 # devloop
 
+[![CI](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml/badge.svg)](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml)
+
 `devloop` is a standalone local development supervisor.
 
 It is meant to sit outside an application repository and run that
@@ -105,19 +107,19 @@ process, not a wrapper script:
 The client config can then compose derived values with `write_state`
 steps, for example:
 
-```toml
+```json
 { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" }
 ```
 
 Workflows can also emit rendered log lines:
 
-```toml
+```json
 { action = "log", message = "current post url: {{current_post_url}}" }
 ```
 
 For high-visibility output in a mixed process log, use the boxed style:
 
-```toml
+```json
 { action = "log", message = "current post url: {{current_post_url}}", style = "boxed" }
 ```
 
