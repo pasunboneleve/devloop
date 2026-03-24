@@ -86,9 +86,16 @@ fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::default_rust_log;
+    use std::sync::{Mutex, OnceLock};
+
+    fn rust_log_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn default_rust_log_uses_info_when_unset() {
+        let _guard = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
         unsafe {
             std::env::remove_var("RUST_LOG");
         }
@@ -97,6 +104,7 @@ mod tests {
 
     #[test]
     fn default_rust_log_respects_environment_override() {
+        let _guard = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
         unsafe {
             std::env::set_var("RUST_LOG", "debug,devloop=trace");
         }
