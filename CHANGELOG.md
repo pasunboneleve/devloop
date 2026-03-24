@@ -1,0 +1,32 @@
+# Changelog
+
+All notable changes to `devloop` will be recorded in this file.
+
+## [0.2.0] - 2026-03-24
+
+### Added
+- Config-driven process supervision with startup workflows, readiness checks,
+  liveness checks, and restart policies.
+- Output-derived session state capture for long-running processes such as
+  `cloudflared`.
+- Generic `write_state` interpolation for composing derived values from session
+  state.
+- Reusable `run_workflow` steps with validation against missing nested
+  workflows and recursive workflow graphs.
+- Generic blog example config under [`examples/blog/devloop.toml`].
+- Human-readable CLI help text for the top-level command and subcommands.
+
+### Changed
+- Moved the real working blog config out of `devloop` and into the client
+  repository.
+- Resolved repo-local hook commands relative to the client repository root.
+- Reworked session state ownership to be in-memory and shared across the
+  running engine.
+- Avoided redundant state-file writes and released the in-memory state lock
+  before file I/O.
+
+## [0.1.0] - 2026-03-24
+
+### Added
+- Initial `devloop` bootstrap with config loading, file watching, process
+  management, and workflow execution.
