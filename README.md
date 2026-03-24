@@ -53,22 +53,23 @@ The initial MVP should support:
 
 ## First client
 
-The first client config lives at:
+The generic example config lives at:
 
-`examples/gcp-rust-blog-public/devloop.toml`
+`examples/blog/devloop.toml`
 
-It models the blog workflow as configuration:
+It models a blog workflow as configuration:
 
 - `rust` changes restart the server, wait for health, rebuild CSS, then
   restart the tunnel and publish the current post URL
 - `content` changes restart the tunnel and republish the current post URL
 - `css` changes trigger a one-shot Tailwind build
 
-The example also keeps blog-specific logic out of the engine:
+The example expects repo-owned helper scripts:
 
-- `hooks/current-post-slug.sh` derives the post slug from repo content
+- `./scripts/build-css.sh`
+- `./scripts/current-post-slug.sh`
 
-At the same time, the tunnel itself is now described as a managed
+At the same time, the tunnel itself is described as a managed
 process, not a wrapper script:
 
 - `cloudflared` is started directly by the engine
@@ -83,9 +84,8 @@ URL" script.
 
 ## Known gap
 
-The next client-side step is to consume `DEVLOOP_STATE` directly in the
-application so app-rendered metadata follows the tunnel state without a
-server restart.
+Real working configs should live in the client repository, not under
+`devloop/examples/`. The example here is intentionally generic.
 
 ## Development
 

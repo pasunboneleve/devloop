@@ -1,6 +1,9 @@
-root = "/home/dmvianna/src/sandbox/iac/gcp-rust-blog-public"
+# Generic blog example for devloop.
+# Copy this file into your blog repository and adjust the values there.
+
+root = "/path/to/your-blog-repo"
 debounce_ms = 300
-state_file = "./state.json"
+state_file = "./.devloop/state.json"
 startup_workflows = ["startup"]
 
 [watch.rust]
