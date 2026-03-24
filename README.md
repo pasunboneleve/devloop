@@ -89,6 +89,12 @@ steps, for example:
 { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" }
 ```
 
+Workflows can also emit rendered log lines:
+
+```toml
+{ action = "log", message = "current post url: {{current_post_url}}" }
+```
+
 Repeated setup can be factored into helper workflows and reused with
 `run_workflow`, for example a `publish_post_url` workflow that waits for
 the tunnel and then writes the derived URL.

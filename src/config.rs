@@ -359,7 +359,9 @@ impl WorkflowSpec {
                     nested.validate_inner(config, stack)?;
                     stack.pop();
                 }
-                WorkflowStep::SleepMs { .. } | WorkflowStep::WriteState { .. } => {}
+                WorkflowStep::SleepMs { .. }
+                | WorkflowStep::WriteState { .. }
+                | WorkflowStep::Log { .. } => {}
             }
         }
         Ok(())
@@ -377,6 +379,7 @@ pub enum WorkflowStep {
     RunWorkflow { workflow: String },
     SleepMs { duration_ms: u64 },
     WriteState { key: String, value: String },
+    Log { message: String },
 }
 
 pub fn absolutize(base: &Path, path: &Path) -> PathBuf {

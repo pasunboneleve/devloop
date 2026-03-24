@@ -154,6 +154,10 @@ async fn run_workflow_inner(
                 let rendered = state.render_template(value)?;
                 state.set(key, rendered.into())?;
             }
+            WorkflowStep::Log { message } => {
+                let rendered = state.render_template(message)?;
+                info!("{}", rendered);
+            }
         }
     }
     Ok(())
@@ -229,6 +233,15 @@ mod tests {
     use crate::config::{Config, WorkflowSpec, WorkflowStep};
     use notify::{Event, EventKind, event::ModifyKind};
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_state_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("devloop-engine-state-{unique}.json"))
+    }
 
     #[test]
     fn classify_changes_by_workflow() {
@@ -367,6 +380,45 @@ mod tests {
                 .as_deref(),
             Some("content")
         );
+
+        std::fs::remove_file(state_path).expect("cleanup state file");
+    }
+
+    #[tokio::test]
+    async fn log_step_renders_session_template() {
+        let root = PathBuf::from(".");
+        let state_path = unique_state_path();
+        let state = SessionState::load(state_path.clone()).expect("load state");
+        state
+            .set(
+                "current_post_url",
+                Value::String("https://example.trycloudflare.com/posts/example-post".into()),
+            )
+            .expect("set current_post_url");
+
+        let mut config = Config {
+            root,
+            debounce_ms: 100,
+            state_file: Some(state_path.clone()),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.workflow.insert(
+            "announce".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "current post url: {{current_post_url}}".into(),
+                }],
+            },
+        );
+
+        let mut processes = ProcessManager::new(&config);
+        run_workflow(&config, &mut processes, &state, "announce", &[])
+            .await
+            .expect("run workflow");
 
         std::fs::remove_file(state_path).expect("cleanup state file");
     }
