@@ -449,4 +449,22 @@ mod tests {
             .expect_err("recursive workflow should fail");
         assert!(error.to_string().contains("workflow recursion detected"));
     }
+
+    #[test]
+    fn validate_rejects_missing_nested_workflow() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "outer".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "missing".into(),
+                }],
+            },
+        );
+
+        let error = config.workflow["outer"]
+            .validate(&config)
+            .expect_err("missing nested workflow should fail");
+        assert!(error.to_string().contains("missing workflow 'missing'"));
+    }
 }

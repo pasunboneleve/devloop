@@ -359,6 +359,13 @@ mod tests {
                 .as_deref(),
             Some("https://example.trycloudflare.com/posts/nested-post")
         );
+        assert_eq!(
+            state
+                .get_string("last_workflow")
+                .expect("get last_workflow")
+                .as_deref(),
+            Some("content")
+        );
 
         std::fs::remove_file(state_path).expect("cleanup state file");
     }
