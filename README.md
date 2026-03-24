@@ -7,6 +7,26 @@ repository through configuration and hooks. The goal is to make local
 developer workflows configurable, ordered, and easy to adapt as the
 project changes.
 
+## Install
+
+Install the latest published `main` branch directly from GitHub:
+
+```bash
+cargo install --git https://github.com/pasunboneleve/devloop.git
+```
+
+For local development from a checkout:
+
+```bash
+cargo install --path .
+```
+
+## Releases
+
+`devloop` is still early-stage. For now, the most reliable release
+signal is the tagged commit history and the passing CI workflow on
+GitHub.
+
 ## Why this exists
 
 Common local setups start simple and then drift into a tangle of shell
