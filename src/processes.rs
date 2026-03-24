@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -9,7 +8,7 @@ use regex::Regex;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{
     Config, HookSpec, OutputExtract, OutputRule, ProbeSpec, ProcessSpec, RestartPolicy,
@@ -20,8 +19,6 @@ pub struct ProcessManager<'a> {
     config: &'a Config,
     children: BTreeMap<String, ManagedProcess>,
     client: reqwest::Client,
-    event_tx: tokio::sync::mpsc::UnboundedSender<ProcessEvent>,
-    observed_state: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 struct ManagedProcess {
@@ -29,25 +26,13 @@ struct ManagedProcess {
     last_liveness_check: Option<std::time::Instant>,
 }
 
-#[derive(Debug)]
-pub enum ProcessEvent {
-    StateUpdate { key: String, value: String },
-}
-
 impl<'a> ProcessManager<'a> {
-    pub fn new(config: &'a Config) -> (Self, tokio::sync::mpsc::UnboundedReceiver<ProcessEvent>) {
-        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let observed_state = Arc::new(Mutex::new(BTreeMap::new()));
-        (
-            Self {
-                config,
-                children: BTreeMap::new(),
-                client: reqwest::Client::new(),
-                event_tx,
-                observed_state,
-            },
-            event_rx,
-        )
+    pub fn new(config: &'a Config) -> Self {
+        Self {
+            config,
+            children: BTreeMap::new(),
+            client: reqwest::Client::new(),
+        }
     }
 
     pub async fn start_autostart(&mut self, state: &SessionState) -> Result<()> {
@@ -80,14 +65,14 @@ impl<'a> ProcessManager<'a> {
         self.start_named(name, state).await
     }
 
-    pub async fn wait_for_named(&self, name: &str, state: &mut SessionState) -> Result<()> {
+    pub async fn wait_for_named(&self, name: &str, state: &SessionState) -> Result<()> {
         let spec = self
             .config
             .process
             .get(name)
             .ok_or_else(|| anyhow!("unknown process '{name}'"))?;
         if let Some(check) = &spec.readiness {
-            wait_for_probe(&self.client, name, check, state, &self.observed_state).await?;
+            wait_for_probe(&self.client, name, check, state).await?;
         }
         Ok(())
     }
@@ -95,7 +80,7 @@ impl<'a> ProcessManager<'a> {
     pub async fn run_hook(
         &self,
         name: &str,
-        state: &mut SessionState,
+        state: &SessionState,
         changed_files: &[String],
         workflow: &str,
     ) -> Result<()> {
@@ -136,16 +121,7 @@ impl<'a> ProcessManager<'a> {
         Ok(())
     }
 
-    pub fn apply_event(&self, event: ProcessEvent, state: &mut SessionState) -> Result<()> {
-        match event {
-            ProcessEvent::StateUpdate { key, value } => {
-                state.set(key, value.into())?;
-                sync_current_post_url(state)
-            }
-        }
-    }
-
-    pub async fn maintain(&mut self, state: &mut SessionState) -> Result<()> {
+    pub async fn maintain(&mut self, state: &SessionState) -> Result<()> {
         let names: Vec<String> = self.children.keys().cloned().collect();
         for name in names {
             let Some(spec) = self.config.process.get(&name) else {
@@ -180,9 +156,7 @@ impl<'a> ProcessManager<'a> {
                     })
                 };
                 if should_check {
-                    let result =
-                        check_probe(&self.client, &name, liveness, state, &self.observed_state)
-                            .await;
+                    let result = check_probe(&self.client, &name, liveness, state).await;
                     if let Some(managed) = self.children.get_mut(&name) {
                         managed.last_liveness_check = Some(std::time::Instant::now());
                     }
@@ -221,23 +195,17 @@ impl<'a> ProcessManager<'a> {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to start process '{name}'"))?;
-        clear_output_state_keys(&spec.output.rules, state.path())?;
-        clear_observed_state_keys(&self.observed_state, &spec.output.rules)?;
+        clear_output_state_keys(&spec.output.rules, state)?;
         let process_name = name.to_owned();
         let inherit_output = spec.output.inherit;
         let rules = compile_output_rules(&spec.output.rules)?;
-        let observed_state = Arc::clone(&self.observed_state);
-        let event_tx = self.event_tx.clone();
-        let state_path = state.path().to_path_buf();
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(forward_output_lines(
                 stdout,
                 process_name.clone(),
                 inherit_output,
                 rules.clone(),
-                Arc::clone(&observed_state),
-                event_tx.clone(),
-                state_path.clone(),
+                state.clone(),
             ));
         }
         if let Some(stderr) = child.stderr.take() {
@@ -246,9 +214,7 @@ impl<'a> ProcessManager<'a> {
                 process_name,
                 inherit_output,
                 rules,
-                observed_state,
-                event_tx,
-                state_path,
+                state.clone(),
             ));
         }
         self.children.insert(
@@ -276,9 +242,7 @@ async fn forward_output_lines<T>(
     process_name: String,
     inherit_output: bool,
     rules: Vec<CompiledOutputRule>,
-    observed_state: Arc<Mutex<BTreeMap<String, String>>>,
-    event_tx: tokio::sync::mpsc::UnboundedSender<ProcessEvent>,
-    state_path: PathBuf,
+    state: SessionState,
 ) where
     T: tokio::io::AsyncRead + Unpin,
 {
@@ -288,36 +252,13 @@ async fn forward_output_lines<T>(
             println!("{line}");
         }
         for rule in &rules {
-            if let Some(value) = extract_output_value(rule, &line) {
-                if let Ok(mut state) = observed_state.lock() {
-                    state.insert(rule.state_key.clone(), value.clone());
-                }
-                match SessionState::load(state_path.clone()) {
-                    Ok(mut state) => {
-                        if let Err(error) = state.set(&rule.state_key, value.clone().into()) {
-                            error!(
-                                "failed to persist output state for {} key {}: {}",
-                                process_name, rule.state_key, error
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        error!(
-                            "failed to load state file for {} key {}: {}",
-                            process_name, rule.state_key, error
-                        );
-                    }
-                }
-                if event_tx
-                    .send(ProcessEvent::StateUpdate {
-                        key: rule.state_key.clone(),
-                        value,
-                    })
-                    .is_err()
-                {
-                    error!("failed to publish output state for {}", process_name);
-                    return;
-                }
+            if let Some(value) = extract_output_value(rule, &line)
+                && let Err(error) = state.set(&rule.state_key, value.into())
+            {
+                warn!(
+                    "failed to persist output state for {} key {}: {}",
+                    process_name, rule.state_key, error
+                );
             }
         }
     }
@@ -367,7 +308,7 @@ fn resolve_cwd(root: &Path, cwd: Option<&Path>) -> PathBuf {
     }
 }
 
-fn apply_hook_capture(spec: &HookSpec, stdout: &str, state: &mut SessionState) -> Result<()> {
+fn apply_hook_capture(spec: &HookSpec, stdout: &str, state: &SessionState) -> Result<()> {
     match spec.capture {
         None | Some(crate::config::CaptureMode::Ignore) => Ok(()),
         Some(crate::config::CaptureMode::Text) => state.set(
@@ -380,8 +321,7 @@ fn apply_hook_capture(spec: &HookSpec, stdout: &str, state: &mut SessionState) -
             let object = serde_json::from_str(stdout).context("hook stdout was not valid JSON")?;
             state.merge_json_object(object)
         }
-    }?;
-    sync_current_post_url(state)
+    }
 }
 
 fn compile_output_rules(rules: &[OutputRule]) -> Result<Vec<CompiledOutputRule>> {
@@ -417,41 +357,12 @@ fn extract_output_value(rule: &CompiledOutputRule, line: &str) -> Option<String>
     }
 }
 
-fn clear_output_state_keys(rules: &[OutputRule], state_path: &Path) -> Result<()> {
+fn clear_output_state_keys(rules: &[OutputRule], state: &SessionState) -> Result<()> {
     if rules.is_empty() {
         return Ok(());
     }
-    let mut state = SessionState::load(state_path.to_path_buf())?;
     for rule in rules {
         state.set(&rule.state_key, "".into())?;
-    }
-    Ok(())
-}
-
-fn sync_current_post_url(state: &mut SessionState) -> Result<()> {
-    let tunnel_url = state.get_string("tunnel_url")?;
-    let slug = state.get_string("current_post_slug")?;
-    if let (Some(tunnel_url), Some(slug)) = (tunnel_url, slug)
-        && !tunnel_url.trim().is_empty()
-        && !slug.trim().is_empty()
-    {
-        state.set(
-            "current_post_url",
-            format!("{}/posts/{}", tunnel_url.trim_end_matches('/'), slug.trim()).into(),
-        )?;
-    }
-    Ok(())
-}
-
-fn clear_observed_state_keys(
-    observed_state: &Arc<Mutex<BTreeMap<String, String>>>,
-    rules: &[OutputRule],
-) -> Result<()> {
-    let mut state = observed_state
-        .lock()
-        .map_err(|_| anyhow!("observed state mutex was poisoned"))?;
-    for rule in rules {
-        state.insert(rule.state_key.clone(), String::new());
     }
     Ok(())
 }
@@ -481,8 +392,7 @@ async fn wait_for_probe(
     client: &reqwest::Client,
     name: &str,
     probe: &ProbeSpec,
-    state: &mut SessionState,
-    observed_state: &Arc<Mutex<BTreeMap<String, String>>>,
+    state: &SessionState,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let timeout = match probe {
@@ -492,10 +402,7 @@ async fn wait_for_probe(
     };
     let interval = Duration::from_millis(probe.interval());
     loop {
-        if check_probe(client, name, probe, state, observed_state)
-            .await
-            .is_ok()
-        {
+        if check_probe(client, name, probe, state).await.is_ok() {
             return Ok(());
         }
         if started.elapsed() >= timeout {
@@ -509,8 +416,7 @@ async fn check_probe(
     client: &reqwest::Client,
     name: &str,
     probe: &ProbeSpec,
-    state: &mut SessionState,
-    observed_state: &Arc<Mutex<BTreeMap<String, String>>>,
+    state: &SessionState,
 ) -> Result<()> {
     match probe {
         ProbeSpec::Http { url, .. } => match client.get(url).send().await {
@@ -527,14 +433,8 @@ async fn check_probe(
             Err(error) => Err(anyhow!("probe for '{}' at {} failed: {}", name, url, error)),
         },
         ProbeSpec::StateKey { key, .. } => {
-            let observed = observed_state
-                .lock()
-                .map_err(|_| anyhow!("observed state mutex was poisoned"))?
-                .get(key)
-                .cloned();
-            let value = observed.or_else(|| state.get_string(key).ok().flatten());
-            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-                state.set(key, value.into())?;
+            let value = state.get_string(key)?;
+            if value.is_some_and(|value| !value.trim().is_empty()) {
                 info!("process {} is ready via state key {}", name, key);
                 Ok(())
             } else {
@@ -552,5 +452,65 @@ fn timeout_error(name: &str, probe: &ProbeSpec) -> anyhow::Error {
         ProbeSpec::StateKey { key, .. } => {
             anyhow!("timed out waiting for process '{}' state key {}", name, key)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{OutputExtract, ProbeSpec};
+    use serde_json::Value;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_state_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("devloop-process-state-{unique}.json"))
+    }
+
+    #[test]
+    fn extract_url_token_finds_cloudflare_url() {
+        let rule = CompiledOutputRule {
+            regex: None,
+            state_key: "tunnel_url".into(),
+            extract: OutputExtract::UrlToken,
+            capture_group: 1,
+        };
+
+        let value = extract_output_value(
+            &rule,
+            "INF | Your quick Tunnel has been created! Visit it: https://abc.trycloudflare.com |",
+        );
+
+        assert_eq!(value.as_deref(), Some("https://abc.trycloudflare.com"));
+    }
+
+    #[tokio::test]
+    async fn state_key_probe_reads_shared_session_state() {
+        let state_path = unique_state_path();
+        let state = SessionState::load(state_path.clone()).expect("load state");
+        state
+            .set(
+                "tunnel_url",
+                Value::String("https://abc.trycloudflare.com".into()),
+            )
+            .expect("set tunnel_url");
+
+        check_probe(
+            &reqwest::Client::new(),
+            "tunnel",
+            &ProbeSpec::StateKey {
+                key: "tunnel_url".into(),
+                interval_ms: 100,
+                timeout_ms: 1000,
+            },
+            &state,
+        )
+        .await
+        .expect("probe should succeed");
+
+        std::fs::remove_file(state_path).expect("cleanup state file");
     }
 }

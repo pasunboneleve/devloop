@@ -64,6 +64,7 @@ steps = [
   { action = "run_hook", hook = "current_post_slug" },
   { action = "start_process", process = "tunnel" },
   { action = "wait_for_process", process = "tunnel" },
+  { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" },
 ]
 
 [workflow.rust]
@@ -74,6 +75,7 @@ steps = [
   { action = "run_hook", hook = "current_post_slug" },
   { action = "restart_process", process = "tunnel" },
   { action = "wait_for_process", process = "tunnel" },
+  { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" },
 ]
 
 [workflow.content]
@@ -81,4 +83,5 @@ steps = [
   { action = "run_hook", hook = "current_post_slug" },
   { action = "restart_process", process = "tunnel" },
   { action = "wait_for_process", process = "tunnel" },
+  { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" },
 ]

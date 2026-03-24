@@ -78,9 +78,12 @@ process, not a wrapper script:
 - readiness waits for the state key to be populated
 - restart policy keeps the process alive if it exits
 
-The engine then derives `current_post_url` from `current_post_slug` and
-`tunnel_url`, so the client config does not need a custom "compose this
-URL" script.
+The client config can then compose derived values with `write_state`
+steps, for example:
+
+```toml
+{ action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" }
+```
 
 ## Known gap
 

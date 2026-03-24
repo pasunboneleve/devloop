@@ -26,7 +26,7 @@ impl Engine {
     }
 
     pub async fn run(self) -> Result<()> {
-        let mut state = SessionState::load(
+        let state = SessionState::load(
             self.config
                 .state_file
                 .clone()
@@ -36,10 +36,10 @@ impl Engine {
             "root",
             Value::String(self.config.root.display().to_string()),
         )?;
-        let (mut processes, mut process_events) = ProcessManager::new(&self.config);
+        let mut processes = ProcessManager::new(&self.config);
         processes.start_autostart(&state).await?;
         for workflow_name in &self.config.startup_workflows {
-            run_workflow(&self.config, &mut processes, &mut state, workflow_name, &[]).await?;
+            run_workflow(&self.config, &mut processes, &state, workflow_name, &[]).await?;
         }
 
         let watch_groups = self.config.compiled_watchers()?;
@@ -62,11 +62,8 @@ impl Engine {
                     processes.stop_all().await?;
                     return Ok(());
                 }
-                Some(event) = process_events.recv() => {
-                    processes.apply_event(event, &mut state)?;
-                }
                 _ = maintain_tick.tick() => {
-                    processes.maintain(&mut state).await?;
+                    processes.maintain(&state).await?;
                 }
                 batch = next_batch(&rx, self.config.debounce()) => {
                     let Some(events) = batch? else {
@@ -77,7 +74,7 @@ impl Engine {
                         run_workflow(
                             &self.config,
                             &mut processes,
-                            &mut state,
+                            &state,
                             &workflow_name,
                             &changed_files,
                         ).await?;
@@ -91,7 +88,7 @@ impl Engine {
 async fn run_workflow(
     config: &Config,
     processes: &mut ProcessManager<'_>,
-    state: &mut SessionState,
+    state: &SessionState,
     workflow_name: &str,
     changed_files: &[String],
 ) -> Result<()> {
@@ -129,7 +126,8 @@ async fn run_workflow(
                 sleep(Duration::from_millis(*duration_ms)).await;
             }
             WorkflowStep::WriteState { key, value } => {
-                state.set(key, value.clone().into())?;
+                let rendered = state.render_template(value)?;
+                state.set(key, rendered.into())?;
             }
         }
     }
@@ -203,6 +201,7 @@ fn is_relevant_event(kind: &EventKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Config, WorkflowSpec, WorkflowStep};
     use notify::{Event, EventKind, event::ModifyKind};
     use std::path::PathBuf;
 
@@ -228,5 +227,56 @@ mod tests {
         let grouped = classify_events(&root, &groups, &events);
         assert_eq!(grouped["server"], vec!["src/main.rs"]);
         assert_eq!(grouped["content"], vec!["content/posts/example.md"]);
+    }
+
+    #[tokio::test]
+    async fn write_state_step_renders_session_template() {
+        let root = std::env::temp_dir().join("devloop-engine-test");
+        let state_path = root.join("state.json");
+        let state = SessionState::load(state_path.clone()).expect("load state");
+        state
+            .set(
+                "tunnel_url",
+                Value::String("https://example.trycloudflare.com".into()),
+            )
+            .expect("set tunnel url");
+        state
+            .set("current_post_slug", Value::String("example-post".into()))
+            .expect("set slug");
+
+        let mut config = Config {
+            root: root.clone(),
+            debounce_ms: 100,
+            state_file: Some(state_path.clone()),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.workflow.insert(
+            "compose".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::WriteState {
+                    key: "current_post_url".into(),
+                    value: "{{tunnel_url}}/posts/{{current_post_slug}}".into(),
+                }],
+            },
+        );
+
+        let mut processes = ProcessManager::new(&config);
+        run_workflow(&config, &mut processes, &state, "compose", &[])
+            .await
+            .expect("run workflow");
+
+        assert_eq!(
+            state
+                .get_string("current_post_url")
+                .expect("get current_post_url")
+                .as_deref(),
+            Some("https://example.trycloudflare.com/posts/example-post")
+        );
+
+        std::fs::remove_file(state_path).expect("cleanup state file");
     }
 }
