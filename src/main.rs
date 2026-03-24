@@ -13,7 +13,12 @@ use crate::config::Config;
 use crate::engine::Engine;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about = "Run config-driven local development workflows",
+    long_about = "devloop watches a client repository, supervises its processes, and executes ordered workflows defined in a TOML config file."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -21,11 +26,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate a devloop config file without starting any processes.
     Validate {
+        /// Path to the devloop TOML config file.
         #[arg(long)]
         config: PathBuf,
     },
+    /// Run the configured watch, process, and workflow loop.
     Run {
+        /// Path to the devloop TOML config file.
         #[arg(long)]
         config: PathBuf,
     },
