@@ -19,6 +19,7 @@ pub struct ProcessManager<'a> {
     config: &'a Config,
     children: BTreeMap<String, ManagedProcess>,
     client: reqwest::Client,
+    shutting_down: bool,
 }
 
 struct ManagedProcess {
@@ -32,6 +33,7 @@ impl<'a> ProcessManager<'a> {
             config,
             children: BTreeMap::new(),
             client: reqwest::Client::new(),
+            shutting_down: false,
         }
     }
 
@@ -45,6 +47,9 @@ impl<'a> ProcessManager<'a> {
     }
 
     pub async fn start_named(&mut self, name: &str, state: &SessionState) -> Result<()> {
+        if self.shutting_down {
+            return Ok(());
+        }
         let spec = self
             .config
             .process
@@ -61,6 +66,9 @@ impl<'a> ProcessManager<'a> {
     }
 
     pub async fn restart_named(&mut self, name: &str, state: &SessionState) -> Result<()> {
+        if self.shutting_down {
+            return Ok(());
+        }
         self.stop_named(name).await?;
         self.start_named(name, state).await
     }
@@ -114,6 +122,7 @@ impl<'a> ProcessManager<'a> {
     }
 
     pub async fn stop_all(&mut self) -> Result<()> {
+        self.initiate_shutdown();
         let names: Vec<String> = self.children.keys().cloned().collect();
         for name in names {
             self.stop_named(&name).await?;
@@ -139,7 +148,7 @@ impl<'a> ProcessManager<'a> {
             if let Some(status) = exited {
                 warn!("process {} exited with {}", name, status);
                 self.children.remove(&name);
-                if should_restart(spec.restart, status.success()) {
+                if should_restart(spec.restart, status.success(), self.shutting_down) {
                     self.start_named(&name, state).await?;
                 }
                 continue;
@@ -162,7 +171,7 @@ impl<'a> ProcessManager<'a> {
                     }
                     if let Err(error) = result {
                         warn!("liveness probe failed for {}: {}", name, error);
-                        if spec.restart != RestartPolicy::Never {
+                        if spec.restart != RestartPolicy::Never && !self.shutting_down {
                             self.restart_named(&name, state).await?;
                         }
                     }
@@ -226,6 +235,10 @@ impl<'a> ProcessManager<'a> {
         );
         info!("started process {}", name);
         Ok(())
+    }
+
+    pub fn initiate_shutdown(&mut self) {
+        self.shutting_down = true;
     }
 }
 
@@ -380,7 +393,10 @@ async fn terminate_child(name: &str, child: &mut Child) -> Result<()> {
     Ok(())
 }
 
-fn should_restart(policy: RestartPolicy, success: bool) -> bool {
+fn should_restart(policy: RestartPolicy, success: bool, shutting_down: bool) -> bool {
+    if shutting_down {
+        return false;
+    }
     match policy {
         RestartPolicy::Never => false,
         RestartPolicy::OnFailure => !success,
@@ -512,5 +528,11 @@ mod tests {
         .expect("probe should succeed");
 
         std::fs::remove_file(state_path).expect("cleanup state file");
+    }
+
+    #[test]
+    fn should_not_restart_while_shutting_down() {
+        assert!(!should_restart(RestartPolicy::Always, true, true));
+        assert!(!should_restart(RestartPolicy::OnFailure, false, true));
     }
 }

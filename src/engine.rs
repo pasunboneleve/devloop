@@ -56,9 +56,11 @@ impl Engine {
 
         loop {
             tokio::select! {
+                biased;
                 result = signal::ctrl_c() => {
                     result?;
                     info!("received ctrl-c, shutting down");
+                    processes.initiate_shutdown();
                     processes.stop_all().await?;
                     return Ok(());
                 }
