@@ -107,31 +107,20 @@ process, not a wrapper script:
 The client config can then compose derived values with `write_state`
 steps, for example:
 
-```json
-{
-  "action": "write_state",
-  "key": "current_post_url",
-  "value": "{{tunnel_url}}/posts/{{current_post_slug}}"
-}
+```toml
+step = { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" }
 ```
 
 Workflows can also emit rendered log lines:
 
-```json
-{
-  "action": "log",
-  "message": "current post url: {{current_post_url}}"
-}
+```toml
+step = { action = "log", message = "current post url: {{current_post_url}}" }
 ```
 
 For high-visibility output in a mixed process log, use the boxed style:
 
-```json
-{
-  "action": "log",
-  "message": "current post url: {{current_post_url}}",
-  "style": "boxed"
-}
+```toml
+step = { action = "log", message = "current post url: {{current_post_url}}", style = "boxed" }
 ```
 
 Repeated setup can be factored into helper workflows and reused with
