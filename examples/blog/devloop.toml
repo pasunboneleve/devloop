@@ -60,7 +60,7 @@ state_key = "current_post_slug"
 steps = [
   { action = "wait_for_process", process = "tunnel" },
   { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" },
-  { action = "log", message = "current post url: {{current_post_url}}" },
+  { action = "log", message = "current post url: {{current_post_url}}", style = "boxed" },
 ]
 
 [workflow.startup]

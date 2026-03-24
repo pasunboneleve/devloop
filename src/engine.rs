@@ -12,7 +12,7 @@ use tokio::signal;
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 
-use crate::config::{CompiledWatchGroup, Config, WorkflowStep};
+use crate::config::{CompiledWatchGroup, Config, LogStyle, WorkflowStep};
 use crate::processes::ProcessManager;
 use crate::state::SessionState;
 
@@ -154,13 +154,29 @@ async fn run_workflow_inner(
                 let rendered = state.render_template(value)?;
                 state.set(key, rendered.into())?;
             }
-            WorkflowStep::Log { message } => {
+            WorkflowStep::Log { message, style } => {
                 let rendered = state.render_template(message)?;
-                info!("{}", rendered);
+                log_workflow_message(style, &rendered);
             }
         }
     }
     Ok(())
+}
+
+fn log_workflow_message(style: &LogStyle, message: &str) {
+    match style {
+        LogStyle::Plain => info!("{}", message),
+        LogStyle::Boxed => log_boxed_banner(message),
+    }
+}
+
+fn log_boxed_banner(message: &str) {
+    let width = message.chars().count() + 4;
+    let border = format!("+{}+", "-".repeat(width));
+    let line = format!("|  {}  |", message);
+    info!("{}", border);
+    info!("{}", line);
+    info!("{}", border);
 }
 
 async fn next_batch(
@@ -411,6 +427,7 @@ mod tests {
             WorkflowSpec {
                 steps: vec![WorkflowStep::Log {
                     message: "current post url: {{current_post_url}}".into(),
+                    style: LogStyle::Plain,
                 }],
             },
         );

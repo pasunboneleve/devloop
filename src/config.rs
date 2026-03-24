@@ -379,7 +379,19 @@ pub enum WorkflowStep {
     RunWorkflow { workflow: String },
     SleepMs { duration_ms: u64 },
     WriteState { key: String, value: String },
-    Log { message: String },
+    Log {
+        message: String,
+        #[serde(default)]
+        style: LogStyle,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStyle {
+    #[default]
+    Plain,
+    Boxed,
 }
 
 pub fn absolutize(base: &Path, path: &Path) -> PathBuf {

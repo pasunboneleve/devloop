@@ -115,6 +115,12 @@ Workflows can also emit rendered log lines:
 { action = "log", message = "current post url: {{current_post_url}}" }
 ```
 
+For high-visibility output in a mixed process log, use the boxed style:
+
+```toml
+{ action = "log", message = "current post url: {{current_post_url}}", style = "boxed" }
+```
+
 Repeated setup can be factored into helper workflows and reused with
 `run_workflow`, for example a `publish_post_url` workflow that waits for
 the tunnel and then writes the derived URL.
