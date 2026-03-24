@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use regex::Regex;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,9 +158,14 @@ pub struct ProcessSpec {
     pub cwd: Option<PathBuf>,
     #[serde(default = "default_true")]
     pub autostart: bool,
-    pub healthcheck: Option<HttpHealthcheck>,
+    pub readiness: Option<ProbeSpec>,
+    pub liveness: Option<ProbeSpec>,
+    #[serde(default)]
+    pub restart: RestartPolicy,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub output: OutputConfig,
 }
 
 impl ProcessSpec {
@@ -167,17 +173,115 @@ impl ProcessSpec {
         if self.command.is_empty() {
             return Err(anyhow!("process command must not be empty"));
         }
+        if let Some(readiness) = &self.readiness {
+            readiness.validate()?;
+        }
+        if let Some(liveness) = &self.liveness {
+            liveness.validate()?;
+        }
+        self.output.validate()?;
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct HttpHealthcheck {
-    pub url: String,
-    #[serde(default = "default_interval_ms")]
-    pub interval_ms: u64,
-    #[serde(default = "default_timeout_ms")]
-    pub timeout_ms: u64,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProbeSpec {
+    Http {
+        url: String,
+        #[serde(default = "default_interval_ms")]
+        interval_ms: u64,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
+    StateKey {
+        key: String,
+        #[serde(default = "default_interval_ms")]
+        interval_ms: u64,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
+}
+
+impl ProbeSpec {
+    pub fn interval(&self) -> u64 {
+        match self {
+            Self::Http { interval_ms, .. } | Self::StateKey { interval_ms, .. } => *interval_ms,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Http { url, .. } => {
+                if url.trim().is_empty() {
+                    return Err(anyhow!("http probe url must not be empty"));
+                }
+            }
+            Self::StateKey { key, .. } => {
+                if key.trim().is_empty() {
+                    return Err(anyhow!("state_key probe key must not be empty"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPolicy {
+    #[default]
+    Never,
+    OnFailure,
+    Always,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OutputConfig {
+    #[serde(default = "default_true")]
+    pub inherit: bool,
+    #[serde(default)]
+    pub rules: Vec<OutputRule>,
+}
+
+impl OutputConfig {
+    fn validate(&self) -> Result<()> {
+        for rule in &self.rules {
+            rule.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutputRule {
+    pub state_key: String,
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub extract: OutputExtract,
+    #[serde(default = "default_capture_group")]
+    pub capture_group: usize,
+}
+
+impl OutputRule {
+    fn validate(&self) -> Result<()> {
+        if self.state_key.trim().is_empty() {
+            return Err(anyhow!("output rule state_key must not be empty"));
+        }
+        if let Some(pattern) = &self.pattern {
+            Regex::new(pattern)
+                .with_context(|| format!("invalid output rule regex '{}'", pattern))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputExtract {
+    #[default]
+    Regex,
+    UrlToken,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -267,7 +371,7 @@ fn default_debounce_ms() -> u64 {
 }
 
 fn default_interval_ms() -> u64 {
-    250
+    500
 }
 
 fn default_timeout_ms() -> u64 {
@@ -276,4 +380,8 @@ fn default_timeout_ms() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_capture_group() -> usize {
+    1
 }

@@ -39,6 +39,15 @@ impl SessionState {
         self.save()
     }
 
+    pub fn get_string(&mut self, key: &str) -> Result<Option<String>> {
+        self.refresh()?;
+        Ok(self
+            .values
+            .get(key)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned))
+    }
+
     fn refresh(&mut self) -> Result<()> {
         if !self.path.exists() {
             return Ok(());

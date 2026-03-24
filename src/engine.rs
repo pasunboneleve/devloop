@@ -36,7 +36,7 @@ impl Engine {
             "root",
             Value::String(self.config.root.display().to_string()),
         )?;
-        let mut processes = ProcessManager::new(&self.config);
+        let (mut processes, mut process_events) = ProcessManager::new(&self.config);
         processes.start_autostart(&state).await?;
         for workflow_name in &self.config.startup_workflows {
             run_workflow(&self.config, &mut processes, &mut state, workflow_name, &[]).await?;
@@ -52,6 +52,7 @@ impl Engine {
         )?;
         watcher.watch(&self.config.root, RecursiveMode::Recursive)?;
         info!("watching {}", self.config.root.display());
+        let mut maintain_tick = tokio::time::interval(Duration::from_secs(1));
 
         loop {
             tokio::select! {
@@ -60,6 +61,12 @@ impl Engine {
                     info!("received ctrl-c, shutting down");
                     processes.stop_all().await?;
                     return Ok(());
+                }
+                Some(event) = process_events.recv() => {
+                    processes.apply_event(event, &mut state)?;
+                }
+                _ = maintain_tick.tick() => {
+                    processes.maintain(&mut state).await?;
                 }
                 batch = next_batch(&rx, self.config.debounce()) => {
                     let Some(events) = batch? else {
@@ -110,7 +117,9 @@ async fn run_workflow(
             WorkflowStep::RestartProcess { process } => {
                 processes.restart_named(process, state).await?
             }
-            WorkflowStep::WaitForProcess { process } => processes.wait_for_named(process).await?,
+            WorkflowStep::WaitForProcess { process } => {
+                processes.wait_for_named(process, state).await?
+            }
             WorkflowStep::RunHook { hook } => {
                 processes
                     .run_hook(hook, state, changed_files, workflow_name)

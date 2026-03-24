@@ -66,20 +66,26 @@ It models the blog workflow as configuration:
 
 The example also keeps blog-specific logic out of the engine:
 
-- `bin/run-cloudflared.sh` manages tunnel startup and writes the current
-  tunnel URL into state
-- `hooks/publish-current-url.sh` derives the latest post slug and emits a
-  shareable URL as JSON
+- `hooks/current-post-slug.sh` derives the post slug from repo content
+
+At the same time, the tunnel itself is now described as a managed
+process, not a wrapper script:
+
+- `cloudflared` is started directly by the engine
+- stdout is scanned with regex rules
+- the matched tunnel URL is written into session state
+- readiness waits for the state key to be populated
+- restart policy keeps the process alive if it exits
+
+The engine then derives `current_post_url` from `current_post_slug` and
+`tunnel_url`, so the client config does not need a custom "compose this
+URL" script.
 
 ## Known gap
 
-The current blog application still treats `SITE_URL` as process startup
-state. That means restarting `cloudflared` without restarting the server
-does not yet update app-rendered metadata such as social tags.
-
-This is not a `devloop` engine problem. It is a client integration
-problem: the app needs a dynamic way to read tunnel state, such as a
-state file or a local adapter.
+The next client-side step is to consume `DEVLOOP_STATE` directly in the
+application so app-rendered metadata follows the tunnel state without a
+server restart.
 
 ## Development
 
