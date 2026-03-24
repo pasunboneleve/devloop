@@ -269,8 +269,8 @@ mod tests {
 
     #[tokio::test]
     async fn write_state_step_renders_session_template() {
-        let root = std::env::temp_dir().join("devloop-engine-test");
-        let state_path = root.join("state.json");
+        let state_path = unique_state_path();
+        let root = state_path.parent().expect("state parent").to_path_buf();
         let state = SessionState::load(state_path.clone()).expect("load state");
         state
             .set(
@@ -320,8 +320,8 @@ mod tests {
 
     #[tokio::test]
     async fn nested_workflow_runs_helper_steps() {
-        let root = std::env::temp_dir().join("devloop-engine-nested-test");
-        let state_path = root.join("state.json");
+        let state_path = unique_state_path();
+        let root = state_path.parent().expect("state parent").to_path_buf();
         let state = SessionState::load(state_path.clone()).expect("load state");
         state
             .set(
