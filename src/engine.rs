@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::signal;
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::{CompiledWatchGroup, Config, LogStyle, WorkflowStep};
 use crate::processes::ProcessManager;
@@ -171,12 +172,16 @@ fn log_workflow_message(style: &LogStyle, message: &str) {
 }
 
 fn log_boxed_banner(message: &str) {
-    let width = message.chars().count() + 4;
+    for line in boxed_banner_lines(message) {
+        info!("{}", line);
+    }
+}
+
+fn boxed_banner_lines(message: &str) -> [String; 3] {
+    let width = UnicodeWidthStr::width(message) + 4;
     let border = format!("+{}+", "-".repeat(width));
     let line = format!("|  {}  |", message);
-    info!("{}", border);
-    info!("{}", line);
-    info!("{}", border);
+    [border.clone(), line, border]
 }
 
 async fn next_batch(
@@ -438,5 +443,23 @@ mod tests {
             .expect("run workflow");
 
         std::fs::remove_file(state_path).expect("cleanup state file");
+    }
+
+    #[test]
+    fn boxed_banner_lines_wrap_message() {
+        let lines = boxed_banner_lines("current post url: https://example.test/posts/x");
+        assert_eq!(lines[0], lines[2]);
+        assert_eq!(
+            lines[1],
+            "|  current post url: https://example.test/posts/x  |"
+        );
+    }
+
+    #[test]
+    fn boxed_banner_lines_use_display_width() {
+        let lines = boxed_banner_lines("URL 測試");
+        assert_eq!(lines[0], lines[2]);
+        assert_eq!(UnicodeWidthStr::width(lines[0].as_str()), 14);
+        assert_eq!(UnicodeWidthStr::width(lines[1].as_str()), 14);
     }
 }
