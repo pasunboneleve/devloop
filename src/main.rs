@@ -43,7 +43,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(EnvFilter::new(default_rust_log()))
         .init();
 
     let cli = Cli::parse();
@@ -63,6 +63,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn default_rust_log() -> String {
+    std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
+}
+
 fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(config) = config {
         return Ok(config);
@@ -76,5 +80,29 @@ fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
             "no devloop config provided and no ./devloop.toml found in {}",
             std::env::current_dir()?.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_rust_log;
+
+    #[test]
+    fn default_rust_log_uses_info_when_unset() {
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+        }
+        assert_eq!(default_rust_log(), "info");
+    }
+
+    #[test]
+    fn default_rust_log_respects_environment_override() {
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug,devloop=trace");
+        }
+        assert_eq!(default_rust_log(), "debug,devloop=trace");
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+        }
     }
 }
