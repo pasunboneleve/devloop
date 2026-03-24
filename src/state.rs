@@ -34,14 +34,31 @@ impl SessionState {
 
     pub fn set(&self, key: impl Into<String>, value: Value) -> Result<()> {
         let mut values = self.lock_values()?;
-        values.insert(key.into(), value);
-        self.save_locked(&values)
+        let key = key.into();
+        if values.get(&key) == Some(&value) {
+            return Ok(());
+        }
+        values.insert(key, value);
+        let snapshot = values.clone();
+        drop(values);
+        self.save_snapshot(&snapshot)
     }
 
     pub fn merge_json_object(&self, object: Map<String, Value>) -> Result<()> {
         let mut values = self.lock_values()?;
-        values.extend(object);
-        self.save_locked(&values)
+        let mut changed = false;
+        for (key, value) in object {
+            if values.get(&key) != Some(&value) {
+                values.insert(key, value);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        let snapshot = values.clone();
+        drop(values);
+        self.save_snapshot(&snapshot)
     }
 
     pub fn get_string(&self, key: &str) -> Result<Option<String>> {
@@ -71,7 +88,7 @@ impl SessionState {
             .map_err(|_| anyhow!("session state mutex was poisoned"))
     }
 
-    fn save_locked(&self, values: &Map<String, Value>) -> Result<()> {
+    fn save_snapshot(&self, values: &Map<String, Value>) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create state directory {}", parent.display())

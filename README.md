@@ -38,6 +38,10 @@ The tool has three layers:
    Small commands that answer project-specific questions such as "what is
    the current post slug?" or "what public URL should be printed now?"
 
+The session state file is owned by `devloop` while it is running.
+External edits to that file are not merged back into the live session;
+restart the supervisor if you need to seed a different initial state.
+
 ## MVP scope
 
 The initial MVP should support:
