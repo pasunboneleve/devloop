@@ -47,11 +47,11 @@ interval_ms = 250
 timeout_ms = 30000
 
 [hook.build_css]
-command = ["/bin/bash", "/tmp/devloop/examples/gcp-rust-blog-public/hooks/build-css.sh"]
+command = ["./scripts/build-css.sh"]
 cwd = "."
 
 [hook.current_post_slug]
-command = ["/bin/bash", "/tmp/devloop/examples/gcp-rust-blog-public/hooks/current-post-slug.sh"]
+command = ["./scripts/current-post-slug.sh"]
 cwd = "."
 capture = "text"
 state_key = "current_post_slug"

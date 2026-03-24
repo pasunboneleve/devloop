@@ -335,6 +335,7 @@ fn configure_command(
     let Some(program) = command.first() else {
         return Err(anyhow!("command must not be empty"));
     };
+    let program = resolve_program(root, program);
     let mut cmd = Command::new(program);
     cmd.args(&command[1..]);
     cmd.current_dir(cwd);
@@ -347,6 +348,15 @@ fn configure_command(
         serde_json::to_string(changed_files)?,
     );
     Ok(cmd)
+}
+
+fn resolve_program(root: &Path, program: &str) -> PathBuf {
+    let path = Path::new(program);
+    if path.is_absolute() || path.components().count() == 1 {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
 }
 
 fn resolve_cwd(root: &Path, cwd: Option<&Path>) -> PathBuf {
