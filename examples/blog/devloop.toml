@@ -52,6 +52,7 @@ cwd = "."
 [hook.current_post_slug]
 command = ["./scripts/current-post-slug.sh"]
 cwd = "."
+env = { PORT = "18080" }
 capture = "text"
 state_key = "current_post_slug"
 
