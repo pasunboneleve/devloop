@@ -89,6 +89,10 @@ steps, for example:
 { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" }
 ```
 
+Repeated setup can be factored into helper workflows and reused with
+`run_workflow`, for example a `publish_post_url` workflow that waits for
+the tunnel and then writes the derived URL.
+
 ## Known gap
 
 Real working configs should live in the client repository, not under

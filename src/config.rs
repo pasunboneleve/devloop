@@ -321,6 +321,10 @@ pub struct WorkflowSpec {
 
 impl WorkflowSpec {
     fn validate(&self, config: &Config) -> Result<()> {
+        self.validate_inner(config, &mut Vec::new())
+    }
+
+    fn validate_inner(&self, config: &Config, stack: &mut Vec<String>) -> Result<()> {
         if self.steps.is_empty() {
             return Err(anyhow!("workflow must contain at least one step"));
         }
@@ -339,6 +343,22 @@ impl WorkflowSpec {
                         return Err(anyhow!("workflow references missing hook '{hook}'"));
                     }
                 }
+                WorkflowStep::RunWorkflow { workflow } => {
+                    if stack.iter().any(|name| name == workflow) {
+                        let mut cycle = stack.clone();
+                        cycle.push(workflow.clone());
+                        return Err(anyhow!(
+                            "workflow recursion detected: {}",
+                            cycle.join(" -> ")
+                        ));
+                    }
+                    let nested = config.workflow.get(workflow).ok_or_else(|| {
+                        anyhow!("workflow references missing workflow '{workflow}'")
+                    })?;
+                    stack.push(workflow.clone());
+                    nested.validate_inner(config, stack)?;
+                    stack.pop();
+                }
                 WorkflowStep::SleepMs { .. } | WorkflowStep::WriteState { .. } => {}
             }
         }
@@ -354,6 +374,7 @@ pub enum WorkflowStep {
     RestartProcess { process: String },
     WaitForProcess { process: String },
     RunHook { hook: String },
+    RunWorkflow { workflow: String },
     SleepMs { duration_ms: u64 },
     WriteState { key: String, value: String },
 }
@@ -384,4 +405,48 @@ fn default_true() -> bool {
 
 fn default_capture_group() -> usize {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> Config {
+        Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_recursive_workflows() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "outer".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "inner".into(),
+                }],
+            },
+        );
+        config.workflow.insert(
+            "inner".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "outer".into(),
+                }],
+            },
+        );
+
+        let error = config.workflow["outer"]
+            .validate(&config)
+            .expect_err("recursive workflow should fail");
+        assert!(error.to_string().contains("workflow recursion detected"));
+    }
 }

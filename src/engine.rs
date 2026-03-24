@@ -92,21 +92,34 @@ async fn run_workflow(
     workflow_name: &str,
     changed_files: &[String],
 ) -> Result<()> {
+    run_workflow_inner(config, processes, state, workflow_name, changed_files, true).await
+}
+
+async fn run_workflow_inner(
+    config: &Config,
+    processes: &mut ProcessManager<'_>,
+    state: &SessionState,
+    workflow_name: &str,
+    changed_files: &[String],
+    record_change_context: bool,
+) -> Result<()> {
     let Some(workflow) = config.workflow.get(workflow_name) else {
         warn!("skipping missing workflow {}", workflow_name);
         return Ok(());
     };
     info!("running workflow {}", workflow_name);
-    state.set("last_workflow", workflow_name.to_owned().into())?;
-    state.set(
-        "last_changed_files",
-        Value::Array(
-            changed_files
-                .iter()
-                .map(|file| Value::String(file.clone()))
-                .collect(),
-        ),
-    )?;
+    if record_change_context {
+        state.set("last_workflow", workflow_name.to_owned().into())?;
+        state.set(
+            "last_changed_files",
+            Value::Array(
+                changed_files
+                    .iter()
+                    .map(|file| Value::String(file.clone()))
+                    .collect(),
+            ),
+        )?;
+    }
     for step in &workflow.steps {
         match step {
             WorkflowStep::StartProcess { process } => processes.start_named(process, state).await?,
@@ -121,6 +134,17 @@ async fn run_workflow(
                 processes
                     .run_hook(hook, state, changed_files, workflow_name)
                     .await?
+            }
+            WorkflowStep::RunWorkflow { workflow } => {
+                Box::pin(run_workflow_inner(
+                    config,
+                    processes,
+                    state,
+                    workflow,
+                    changed_files,
+                    false,
+                ))
+                .await?;
             }
             WorkflowStep::SleepMs { duration_ms } => {
                 sleep(Duration::from_millis(*duration_ms)).await;
@@ -275,6 +299,65 @@ mod tests {
                 .expect("get current_post_url")
                 .as_deref(),
             Some("https://example.trycloudflare.com/posts/example-post")
+        );
+
+        std::fs::remove_file(state_path).expect("cleanup state file");
+    }
+
+    #[tokio::test]
+    async fn nested_workflow_runs_helper_steps() {
+        let root = std::env::temp_dir().join("devloop-engine-nested-test");
+        let state_path = root.join("state.json");
+        let state = SessionState::load(state_path.clone()).expect("load state");
+        state
+            .set(
+                "tunnel_url",
+                Value::String("https://example.trycloudflare.com".into()),
+            )
+            .expect("set tunnel url");
+        state
+            .set("current_post_slug", Value::String("nested-post".into()))
+            .expect("set slug");
+
+        let mut config = Config {
+            root: root.clone(),
+            debounce_ms: 100,
+            state_file: Some(state_path.clone()),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.workflow.insert(
+            "publish_post_url".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::WriteState {
+                    key: "current_post_url".into(),
+                    value: "{{tunnel_url}}/posts/{{current_post_slug}}".into(),
+                }],
+            },
+        );
+        config.workflow.insert(
+            "content".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "publish_post_url".into(),
+                }],
+            },
+        );
+
+        let mut processes = ProcessManager::new(&config);
+        run_workflow(&config, &mut processes, &state, "content", &[])
+            .await
+            .expect("run workflow");
+
+        assert_eq!(
+            state
+                .get_string("current_post_url")
+                .expect("get current_post_url")
+                .as_deref(),
+            Some("https://example.trycloudflare.com/posts/nested-post")
         );
 
         std::fs::remove_file(state_path).expect("cleanup state file");
