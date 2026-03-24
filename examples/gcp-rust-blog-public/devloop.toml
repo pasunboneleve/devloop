@@ -1,0 +1,80 @@
+root = "/home/dmvianna/src/sandbox/iac/gcp-rust-blog-public"
+debounce_ms = 300
+state_file = "./state.json"
+startup_workflows = ["startup"]
+
+[watch.rust]
+paths = ["src/**/*.rs", "Cargo.toml", "content/layout.html", "content/banner.html", "content/site.toml"]
+workflow = "rust"
+
+[watch.content]
+paths = ["content/**/*.md", "content/**/*.html"]
+workflow = "content"
+
+[watch.css]
+paths = ["tailwind.css"]
+workflow = "css"
+
+[process.css_watch]
+command = ["./scripts/tailwatch.sh"]
+cwd = "."
+autostart = false
+
+[process.server]
+command = ["cargo", "run"]
+cwd = "."
+autostart = false
+env = { PORT = "18080" }
+
+[process.server.healthcheck]
+url = "http://127.0.0.1:18080/"
+interval_ms = 500
+timeout_ms = 30000
+
+[process.tunnel]
+command = ["/bin/bash", "/tmp/devloop/examples/gcp-rust-blog-public/bin/run-cloudflared.sh"]
+cwd = "."
+autostart = false
+env = { LOCAL_PORT = "18080" }
+
+[hook.build_css]
+command = ["/bin/bash", "/tmp/devloop/examples/gcp-rust-blog-public/hooks/build-css.sh"]
+cwd = "."
+
+[hook.publish_current_url]
+command = ["/bin/bash", "/tmp/devloop/examples/gcp-rust-blog-public/hooks/publish-current-url.sh"]
+cwd = "."
+capture = "json"
+
+[workflow.startup]
+steps = [
+  { action = "start_process", process = "css_watch" },
+  { action = "start_process", process = "server" },
+  { action = "wait_for_process", process = "server" },
+  { action = "run_hook", hook = "build_css" },
+  { action = "write_state", key = "tunnel_url", value = "" },
+  { action = "start_process", process = "tunnel" },
+  { action = "run_hook", hook = "publish_current_url" }
+]
+
+[workflow.rust]
+steps = [
+  { action = "restart_process", process = "server" },
+  { action = "wait_for_process", process = "server" },
+  { action = "run_hook", hook = "build_css" },
+  { action = "write_state", key = "tunnel_url", value = "" },
+  { action = "restart_process", process = "tunnel" },
+  { action = "run_hook", hook = "publish_current_url" }
+]
+
+[workflow.content]
+steps = [
+  { action = "write_state", key = "tunnel_url", value = "" },
+  { action = "restart_process", process = "tunnel" },
+  { action = "run_hook", hook = "publish_current_url" }
+]
+
+[workflow.css]
+steps = [
+  { action = "run_hook", hook = "build_css" }
+]
