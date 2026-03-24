@@ -9,6 +9,10 @@ repository through configuration and hooks. The goal is to make local
 developer workflows configurable, ordered, and easy to adapt as the
 project changes.
 
+The first real client is
+[`gcp-rust-blog-public`](https://github.com/pasunboneleve/gcp-rust-blog-public),
+which uses `devloop` as its primary local development workflow.
+
 ## Install
 
 Install the latest published `main` branch directly from GitHub:
@@ -82,6 +86,11 @@ The initial MVP should support:
 The generic example config lives at:
 
 `examples/blog/devloop.toml`
+
+The real client config for the published blog repo lives in the client
+repository itself:
+
+[`gcp-rust-blog-public/devloop.toml`](https://github.com/pasunboneleve/gcp-rust-blog-public/blob/main/devloop.toml)
 
 It models a blog workflow as configuration:
 
