@@ -14,10 +14,6 @@ workflow = "rust"
 paths = ["content/**/*.md", "content/**/*.html"]
 workflow = "content"
 
-[watch.css]
-paths = ["tailwind.css"]
-workflow = "css"
-
 [process.css_watch]
 command = ["tailwindcss", "-i", "tailwind.css", "-o", "content/static/tailwind.css", "--watch=always"]
 cwd = "."
@@ -85,9 +81,4 @@ steps = [
   { action = "run_hook", hook = "current_post_slug" },
   { action = "restart_process", process = "tunnel" },
   { action = "wait_for_process", process = "tunnel" },
-]
-
-[workflow.css]
-steps = [
-  { action = "run_hook", hook = "build_css" }
 ]
