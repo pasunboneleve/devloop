@@ -5,7 +5,7 @@ mod state;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -28,15 +28,15 @@ struct Cli {
 enum Command {
     /// Validate a devloop config file without starting any processes.
     Validate {
-        /// Path to the devloop TOML config file.
+        /// Path to the devloop TOML config file. Defaults to ./devloop.toml.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
     /// Run the configured watch, process, and workflow loop.
     Run {
-        /// Path to the devloop TOML config file.
+        /// Path to the devloop TOML config file. Defaults to ./devloop.toml.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
 }
 
@@ -49,14 +49,32 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Validate { config } => {
+            let config = resolve_config_path(config)?;
             let config = Config::load(&config)?;
             config.validate()?;
         }
         Command::Run { config } => {
+            let config = resolve_config_path(config)?;
             let config = Config::load(&config)?;
             config.validate()?;
             Engine::new(config).run().await?;
         }
     }
     Ok(())
+}
+
+fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(config) = config {
+        return Ok(config);
+    }
+
+    let default = std::env::current_dir()?.join("devloop.toml");
+    if default.exists() {
+        Ok(default)
+    } else {
+        Err(anyhow!(
+            "no devloop config provided and no ./devloop.toml found in {}",
+            std::env::current_dir()?.display()
+        ))
+    }
 }
