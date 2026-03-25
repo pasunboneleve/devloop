@@ -36,29 +36,8 @@ Without `devloop`:
 - the tunnel keeps the old URL unless you restart `cloudflared` yourself
 - you rebuild the full public URL by hand every time
 
-The pieces exist.  
+The pieces exist.\
 They just don’t know about each other.
-
-## What it feels like
-
-You are working on a system with multiple processes:
-- a server
-- a CSS build
-- a tunnel
-
-You start `devloop` once.
-
-Then:
-
-- edit a markdown file -> the page updates
-- change Rust code -> the server restarts and the loop stays coordinated
-- update CSS -> a one-shot build runs
-
-No manual restarts.\
-No lost state.\
-No remembering which script to run.
-
-The scripts still exist, but they’re no longer part of your mental loop.
 
 ## Install
 
