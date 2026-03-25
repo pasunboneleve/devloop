@@ -1,17 +1,44 @@
 # devloop
 
-[![CI](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml/badge.svg)](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml)
+[![CI](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml/badge.svg)](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml/badge.svg)
 
-`devloop` is a standalone local development supervisor.
+**Keep the local loop cheap.**
 
-It is meant to sit outside an application repository and run that
-repository through configuration and hooks. The goal is to make local
-developer workflows configurable, ordered, and easy to adapt as the
-project changes.
+`devloop` is a config-driven tool for running multi-process systems
+locally.
 
-The first real client is
-[`gcp-rust-blog-public`](https://github.com/pasunboneleve/gcp-rust-blog-public),
-which uses `devloop` as its primary local development workflow.
+Most local setups become expensive to change:
+- restarting everything
+- losing state
+- waiting for rebuilds
+- coordinating multiple services
+
+`devloop` keeps everything alive so you can change one thing at a
+time.
+
+## What it feels like
+
+You are working on a system with multiple processes:
+- a server
+- a CSS build
+- a tunnel
+
+You start `devloop` once.
+
+Then:
+
+- edit a markdown file → the page updates
+- change Rust code → the server restarts, everything else stays alive
+- update CSS → a one-shot build runs
+
+No manual restarts.\
+No lost state.\
+No remembering which script to run.
+
+The scripts still exist — but they’re no longer part of your mental loop.
+
+The system still has moving parts.\
+You just don’t have to move them.
 
 ## Install
 
@@ -19,7 +46,7 @@ Install the latest published `main` branch directly from GitHub:
 
 ```bash
 cargo install --git https://github.com/pasunboneleve/devloop.git
-```
+````
 
 For local development from a checkout:
 
@@ -27,28 +54,17 @@ For local development from a checkout:
 cargo install --path .
 ```
 
-## Releases
+## Usage
 
-`devloop` is still early-stage. For now, the most reliable release
-signal is the tagged commit history and the passing CI workflow on
-GitHub.
+Run `devloop` in a repository with a `devloop.toml` config:
 
-## Why this exists
-
-Common local setups start simple and then drift into a tangle of shell
-wrappers:
-
-- one process watches Rust code
-- another watches CSS
-- another starts a tunnel
-- some repo-specific script prints a shareable URL
-
-That works until the workflow needs ordering, dynamic state, or a new
-directory layout. At that point the scripts become bespoke
-orchestration.
-
-`devloop` is an attempt to keep the orchestration generic while allowing
-the client repository to keep its own context.
+```bash
+devloop run
+```
+The tool will:
+* start declared processes
+* watch configured paths
+* execute workflows on change
 
 ## Design
 
@@ -57,9 +73,11 @@ The tool has three layers:
 1. Engine
    Watches files, supervises processes, executes workflows, and stores
    session state.
+
 2. Repository config
    Declares watch groups, named processes, workflow steps, and hook
    commands.
+
 3. Repository hooks
    Small commands that answer project-specific questions such as "what is
    the current post slug?" or "what public URL should be printed now?"
@@ -68,78 +86,73 @@ The session state file is owned by `devloop` while it is running.
 External edits to that file are not merged back into the live session;
 restart the supervisor if you need to seed a different initial state.
 
-## MVP scope
+## Example use case
 
-The initial MVP should support:
+Used as the primary local development workflow for:
 
-- loading a config file from a client repo
-- named watch groups over path globs
-- named long-running processes
-- ordered workflows per watch group
-- ordered startup workflows
-- hook commands
-- session state persisted to a local file
-- a first working client against the `gcp-rust-blog-public` repo
+[`gcp-rust-blog-public`](https://github.com/pasunboneleve/gcp-rust-blog-public)
 
-## First client
+It uses `devloop` as its primary local development workflow.
 
 The generic example config lives at:
 
-`examples/blog/devloop.toml`
+[`examples/blog/devloop.toml`](examples/blog/devloop.toml)
 
-The real client config for the published blog repo lives in the client
-repository itself:
+The real client config lives in the client repository itself:
 
 [`gcp-rust-blog-public/devloop.toml`](https://github.com/pasunboneleve/gcp-rust-blog-public/blob/main/devloop.toml)
 
 It models a blog workflow as configuration:
 
-- `rust` changes restart the server, wait for health, rebuild CSS, then
+* `rust` changes restart the server, wait for health, rebuild CSS, then
   restart the tunnel and publish the current post URL
-- `content` changes restart the tunnel and republish the current post URL
-- `css` changes trigger a one-shot Tailwind build
+* `content` changes restart the tunnel and republish the current post URL
+* `css` changes trigger a one-shot Tailwind build
 
 The example expects repo-owned helper scripts:
 
-- `./scripts/build-css.sh`
-- `./scripts/current-post-slug.sh`
+* `./scripts/build-css.sh`
+* `./scripts/current-post-slug.sh`
 
-At the same time, the tunnel itself is described as a managed
-process, not a wrapper script:
+At the same time, the tunnel itself is described as a managed process:
 
-- `cloudflared` is started directly by the engine
-- stdout is scanned with regex rules
-- the matched tunnel URL is written into session state
-- readiness waits for the state key to be populated
-- restart policy keeps the process alive if it exits
+* `cloudflared` is started directly by the engine
+* stdout is scanned with regex rules
+* the matched tunnel URL is written into session state
+* readiness waits for the state key to be populated
+* restart policy keeps the process alive if it exits
 
 The client config can then compose derived values with `write_state`
 steps, for example:
 
 ```toml
-step = { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" }
+step = { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}"}
 ```
 
 Workflows can also emit rendered log lines:
 
 ```toml
-step = { action = "log", message = "current post url: {{current_post_url}}" }
+step = { action = "log", message = "current post url: {{current_post_url}}"}
 ```
 
 For high-visibility output in a mixed process log, use the boxed style:
 
 ```toml
-step = { action = "log", message = "current post url: {{current_post_url}}", style = "boxed" }
+step = { action = "log", message = "current post url: {{current_post_url}}", style = "boxed"}
 ```
 
 Repeated setup can be factored into helper workflows and reused with
 `run_workflow`, for example a `publish_post_url` workflow that waits for
 the tunnel and then writes the derived URL.
 
+---
+
 ## Known gap
 
 Real working configs should live in the client repository, not under
 `devloop/examples/`. The example here is intentionally generic.
+
+---
 
 ## Development
 
