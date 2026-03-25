@@ -7,7 +7,12 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
+use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
+use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::Config;
 use crate::engine::Engine;
@@ -44,6 +49,7 @@ enum Command {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(default_rust_log()))
+        .event_format(DevloopLogFormatter::default())
         .init();
 
     let cli = Cli::parse();
@@ -67,6 +73,40 @@ fn default_rust_log() -> String {
     std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
 }
 
+#[derive(Debug, Default)]
+struct DevloopLogFormatter {
+    timer: SystemTime,
+}
+
+impl<S, N> FormatEvent<S, N> for DevloopLogFormatter
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        let metadata = event.metadata();
+        write!(
+            writer,
+            "{} {} ",
+            format_log_target(metadata.target()),
+            metadata.level()
+        )?;
+        self.timer.format_time(&mut writer)?;
+        writer.write_char(' ')?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
+fn format_log_target(target: &str) -> String {
+    format!("[{}]", target.replace("::", " "))
+}
+
 fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(config) = config {
         return Ok(config);
@@ -85,7 +125,7 @@ fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_rust_log;
+    use super::{default_rust_log, format_log_target};
     use std::sync::{Mutex, OnceLock};
 
     fn rust_log_lock() -> &'static Mutex<()> {
@@ -112,5 +152,13 @@ mod tests {
         unsafe {
             std::env::remove_var("RUST_LOG");
         }
+    }
+
+    #[test]
+    fn format_log_target_rewrites_module_path_for_prefix() {
+        assert_eq!(
+            format_log_target("devloop::processes"),
+            "[devloop processes]"
+        );
     }
 }
