@@ -59,6 +59,8 @@ Managed processes are long-running child commands.
   `devloop` is shutting down.
 - `restart = "on_failure"` restarts only after unsuccessful exit.
 - `restart = "never"` never restarts automatically.
+- Managed child processes default to `RUST_LOG=info` unless the process
+  config explicitly sets `env.RUST_LOG`.
 
 Liveness probes are checked on the configured interval while the process
 is running. If a liveness probe fails and the restart policy allows it,
@@ -98,10 +100,13 @@ Colorized output is enabled when stdout is a terminal and `NO_COLOR` is
 not set.
 
 - `body_style = "plain"` preserves subprocess body text as-is.
-- `body_style = "dim"` dims the inherited body text.
+- `body_style = "dim"` dims both the inherited source label and body
+  text.
 - When a subprocess emits ANSI SGR color sequences while `body_style =
   "dim"`, `devloop` reapplies dim after each SGR sequence so the
   original tint is preserved as much as the terminal allows.
+- Source-label colors intentionally avoid bright white because it is too
+  visually aggressive in mixed logs.
 
 ### Carriage returns and line boundaries
 

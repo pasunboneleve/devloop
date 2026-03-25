@@ -8,6 +8,10 @@ All notable changes to `devloop` will be recorded in this file.
 - Stopped `devloop`'s own `RUST_LOG` setting from leaking into managed
   child processes unless the child explicitly sets `RUST_LOG` in
   config.
+- Defaulted managed child `RUST_LOG` to `info` when unset so Rust-based
+  child processes do not surprise users with verbose debug output.
+- Removed bright white from inherited output label colors and dimmed
+  source labels alongside dimmed inherited process bodies.
 
 ## [0.4.0] - 2026-03-25
 

@@ -1,7 +1,6 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::IsTerminal;
 
-#[cfg(test)]
 use crate::config::OutputBodyStyle;
 
 pub(crate) fn normalize_source_label(source_label: &str) -> String {
@@ -9,11 +8,19 @@ pub(crate) fn normalize_source_label(source_label: &str) -> String {
 }
 
 pub(crate) fn format_output_prefix(source_label: &str, colorize: bool) -> String {
+    format_output_prefix_with_style(source_label, colorize, OutputBodyStyle::Plain)
+}
+
+pub(crate) fn format_output_prefix_with_style(
+    source_label: &str,
+    colorize: bool,
+    body_style: OutputBodyStyle,
+) -> String {
     if !colorize {
         return format!("[{source_label}] ");
     }
 
-    format!("{} ", colorize_label(source_label))
+    format!("{} ", colorize_label(source_label, body_style))
 }
 
 pub(crate) fn should_colorize_output() -> bool {
@@ -41,15 +48,18 @@ pub(crate) fn style_reset(colorize: bool) -> &'static str {
 }
 
 pub(crate) fn output_color_code(process_name: &str) -> u8 {
-    const PALETTE: [u8; 6] = [31, 32, 33, 34, 36, 37];
+    const PALETTE: [u8; 5] = [31, 32, 33, 34, 36];
     let mut hasher = DefaultHasher::new();
     process_name.hash(&mut hasher);
     PALETTE[(hasher.finish() as usize) % PALETTE.len()]
 }
 
-fn colorize_label(source_label: &str) -> String {
+fn colorize_label(source_label: &str, body_style: OutputBodyStyle) -> String {
+    let dim = matches!(body_style, OutputBodyStyle::Dim);
+    let dim_code = if dim { "2;" } else { "" };
     format!(
-        "\u{1b}[1;{}m[{}]\u{1b}[0m",
+        "\u{1b}[{}1;{}m[{}]\u{1b}[0m",
+        dim_code,
         output_color_code(source_label),
         source_label
     )
@@ -58,8 +68,8 @@ fn colorize_label(source_label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dim_start, format_output_prefix, normalize_source_label, output_color_code,
-        style_output_text, style_reset,
+        dim_start, format_output_prefix, format_output_prefix_with_style, normalize_source_label,
+        output_color_code, style_output_text, style_reset,
     };
     use crate::config::OutputBodyStyle;
 
@@ -89,8 +99,29 @@ mod tests {
     }
 
     #[test]
+    fn format_output_prefix_can_dim_label() {
+        let rendered =
+            format_output_prefix_with_style("tunnel cloudflared", true, OutputBodyStyle::Dim);
+
+        assert!(rendered.contains("[tunnel cloudflared]"));
+        assert!(rendered.starts_with("\u{1b}[2;1;"));
+        assert!(rendered.ends_with(" "));
+    }
+
+    #[test]
     fn output_color_code_is_stable_for_same_process() {
         assert_eq!(output_color_code("tunnel"), output_color_code("tunnel"));
+    }
+
+    #[test]
+    fn output_color_palette_avoids_bright_white() {
+        for source in [
+            "server cargo",
+            "css_watch tailwindcss",
+            "tunnel cloudflared",
+        ] {
+            assert_ne!(output_color_code(source), 37);
+        }
     }
 
     #[test]

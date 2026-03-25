@@ -16,7 +16,9 @@ use crate::config::{
     Config, HookOutputConfig, HookSpec, OutputBodyStyle, OutputExtract, OutputRule, ProbeSpec,
     ProcessSpec, RestartPolicy,
 };
-use crate::output::{dim_start, format_output_prefix, should_colorize_output, style_reset};
+use crate::output::{
+    dim_start, format_output_prefix_with_style, should_colorize_output, style_reset,
+};
 use crate::state::SessionState;
 
 pub struct ProcessManager<'a> {
@@ -383,7 +385,7 @@ fn format_output_line(
 ) -> String {
     use crate::output::style_output_text;
 
-    let prefix = format_output_prefix(source_label, colorize);
+    let prefix = format_output_prefix_with_style(source_label, colorize, body_style);
     let body = style_output_text(line, body_style, colorize);
     format!("{prefix}{body}")
 }
@@ -543,7 +545,7 @@ where
     render_state.last_was_carriage_return = false;
 
     if render_state.at_line_start {
-        let prefix = format_output_prefix(source_label, colorize);
+        let prefix = format_output_prefix_with_style(source_label, colorize, body_style);
         render_state.rendered_line.push_str(&prefix);
         if matches!(body_style, OutputBodyStyle::Dim) {
             render_state.rendered_line.push_str(dim_start(colorize));
@@ -751,6 +753,9 @@ fn configure_command(
     cmd.args(&command[1..]);
     cmd.current_dir(cwd);
     cmd.env_remove("RUST_LOG");
+    if !env.contains_key("RUST_LOG") {
+        cmd.env("RUST_LOG", "info");
+    }
     cmd.envs(env);
     cmd.env("DEVLOOP_ROOT", root);
     cmd.env("DEVLOOP_STATE", state_path);
@@ -986,8 +991,8 @@ mod tests {
         );
 
         assert!(rendered.contains("[tunnel cloudflared]"));
+        assert!(rendered.starts_with("\u{1b}[2;1;"));
         assert!(rendered.contains("\u{1b}[2mINF ready\u{1b}[0m"));
-        assert!(rendered.starts_with("\u{1b}[1;"));
     }
 
     #[test]
@@ -1220,7 +1225,7 @@ mod tests {
             .await
             .expect("read rendered output");
 
-        assert!(rendered.starts_with("\u{1b}[1;"));
+        assert!(rendered.starts_with("\u{1b}[2;1;"));
         assert!(rendered.contains("[echo python3]"));
         assert!(rendered.ends_with("\u{1b}[2malpha\u{1b}[0m\n"));
     }
@@ -1271,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn configure_command_removes_inherited_rust_log_by_default() {
+    fn configure_command_defaults_child_rust_log_to_info() {
         let original = std::env::var_os("RUST_LOG");
         unsafe {
             std::env::set_var("RUST_LOG", "debug");
@@ -1292,9 +1297,10 @@ mod tests {
             .as_std()
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new("RUST_LOG"))
-            .expect("RUST_LOG entry should be present after env_remove");
+            .and_then(|(_, value)| value)
+            .expect("RUST_LOG entry should be set");
 
-        assert_eq!(rust_log.1, None);
+        assert_eq!(rust_log, "info");
 
         restore_rust_log(original);
     }
