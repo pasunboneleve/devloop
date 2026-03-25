@@ -151,6 +151,15 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+Git hook setup:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+That enables the versioned pre-commit hook in [`.githooks/pre-commit`](.githooks/pre-commit),
+which runs `cargo fmt` before each commit.
+
 Task tracking:
 
 ```bash

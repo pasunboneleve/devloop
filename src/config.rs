@@ -371,14 +371,31 @@ impl WorkflowSpec {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum WorkflowStep {
-    StartProcess { process: String },
-    StopProcess { process: String },
-    RestartProcess { process: String },
-    WaitForProcess { process: String },
-    RunHook { hook: String },
-    RunWorkflow { workflow: String },
-    SleepMs { duration_ms: u64 },
-    WriteState { key: String, value: String },
+    StartProcess {
+        process: String,
+    },
+    StopProcess {
+        process: String,
+    },
+    RestartProcess {
+        process: String,
+    },
+    WaitForProcess {
+        process: String,
+    },
+    RunHook {
+        hook: String,
+    },
+    RunWorkflow {
+        workflow: String,
+    },
+    SleepMs {
+        duration_ms: u64,
+    },
+    WriteState {
+        key: String,
+        value: String,
+    },
     Log {
         message: String,
         #[serde(default)]
