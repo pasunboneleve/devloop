@@ -1,6 +1,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::IsTerminal;
 
+#[cfg(test)]
 use crate::config::OutputBodyStyle;
 
 pub(crate) fn normalize_source_label(source_label: &str) -> String {
@@ -19,6 +20,7 @@ pub(crate) fn should_colorize_output() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
+#[cfg(test)]
 pub(crate) fn style_output_text(text: &str, body_style: OutputBodyStyle, colorize: bool) -> String {
     if !colorize {
         return text.to_owned();
@@ -28,6 +30,14 @@ pub(crate) fn style_output_text(text: &str, body_style: OutputBodyStyle, coloriz
         OutputBodyStyle::Plain => text.to_owned(),
         OutputBodyStyle::Dim => format!("\u{1b}[2m{text}\u{1b}[0m"),
     }
+}
+
+pub(crate) fn dim_start(colorize: bool) -> &'static str {
+    if colorize { "\u{1b}[2m" } else { "" }
+}
+
+pub(crate) fn style_reset(colorize: bool) -> &'static str {
+    if colorize { "\u{1b}[0m" } else { "" }
 }
 
 pub(crate) fn output_color_code(process_name: &str) -> u8 {
@@ -48,7 +58,8 @@ fn colorize_label(source_label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_output_prefix, normalize_source_label, output_color_code, style_output_text,
+        dim_start, format_output_prefix, normalize_source_label, output_color_code,
+        style_output_text, style_reset,
     };
     use crate::config::OutputBodyStyle;
 
@@ -96,5 +107,11 @@ mod tests {
             style_output_text("ready", OutputBodyStyle::Dim, true),
             "\u{1b}[2mready\u{1b}[0m"
         );
+    }
+
+    #[test]
+    fn dim_helpers_emit_sequences_when_colorized() {
+        assert_eq!(dim_start(true), "\u{1b}[2m");
+        assert_eq!(style_reset(true), "\u{1b}[0m");
     }
 }

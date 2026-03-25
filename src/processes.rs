@@ -16,7 +16,7 @@ use crate::config::{
     Config, HookSpec, OutputBodyStyle, OutputExtract, OutputRule, ProbeSpec, ProcessSpec,
     RestartPolicy,
 };
-use crate::output::{format_output_prefix, should_colorize_output, style_output_text};
+use crate::output::{dim_start, format_output_prefix, should_colorize_output, style_reset};
 use crate::state::SessionState;
 
 pub struct ProcessManager<'a> {
@@ -346,6 +346,8 @@ fn format_output_line(
     colorize: bool,
     body_style: OutputBodyStyle,
 ) -> String {
+    use crate::output::style_output_text;
+
     let prefix = format_output_prefix(source_label, colorize);
     let body = style_output_text(line, body_style, colorize);
     format!("{prefix}{body}")
@@ -356,6 +358,9 @@ struct OutputRenderState {
     at_line_start: bool,
     last_was_carriage_return: bool,
     ansi_escape_state: AnsiEscapeState,
+    body_style: OutputBodyStyle,
+    colorize: bool,
+    dim_active: bool,
     rendered_line: String,
 }
 
@@ -372,6 +377,9 @@ impl OutputRenderState {
             at_line_start: true,
             last_was_carriage_return: false,
             ansi_escape_state: AnsiEscapeState::None,
+            body_style: OutputBodyStyle::Plain,
+            colorize: false,
+            dim_active: false,
             rendered_line: String::new(),
         }
     }
@@ -450,12 +458,16 @@ where
     W: AsyncWriteExt + Unpin + Send,
 {
     if byte == b'\r' {
+        render_state.body_style = body_style;
+        render_state.colorize = colorize;
         flush_rendered_output_to_writer(writer, render_state, true).await?;
         render_state.last_was_carriage_return = true;
         return Ok(());
     }
 
     if byte == b'\n' {
+        render_state.body_style = body_style;
+        render_state.colorize = colorize;
         if render_state.last_was_carriage_return {
             render_state.last_was_carriage_return = false;
             return Ok(());
@@ -469,6 +481,10 @@ where
     if render_state.at_line_start {
         let prefix = format_output_prefix(source_label, colorize);
         render_state.rendered_line.push_str(&prefix);
+        if matches!(body_style, OutputBodyStyle::Dim) {
+            render_state.rendered_line.push_str(dim_start(colorize));
+            render_state.dim_active = colorize;
+        }
         render_state.at_line_start = false;
     }
 
@@ -491,6 +507,12 @@ where
 
     let mut writer = writer.lock().await;
     if !render_state.rendered_line.is_empty() {
+        if render_state.dim_active {
+            render_state
+                .rendered_line
+                .push_str(style_reset(render_state.colorize));
+            render_state.dim_active = false;
+        }
         writer
             .write_all(render_state.rendered_line.as_bytes())
             .await?;
@@ -539,7 +561,9 @@ fn render_output_byte(
         return text;
     }
 
-    style_output_text(&text, body_style, colorize)
+    match body_style {
+        OutputBodyStyle::Plain | OutputBodyStyle::Dim => text,
+    }
 }
 
 fn process_output_byte_for_rules(
@@ -903,7 +927,7 @@ mod tests {
         ]
         .concat();
 
-        assert_eq!(rendered, "\u{1b}[34m\u{1b}[2mD\u{1b}[0m");
+        assert_eq!(rendered, "\u{1b}[34mD");
     }
 
     #[tokio::test]
@@ -913,6 +937,9 @@ mod tests {
             at_line_start: false,
             last_was_carriage_return: false,
             ansi_escape_state: AnsiEscapeState::None,
+            body_style: OutputBodyStyle::Plain,
+            colorize: false,
+            dim_active: false,
             rendered_line: String::new(),
         };
         let writer = Arc::new(Mutex::new(writer));
@@ -948,6 +975,9 @@ mod tests {
             at_line_start: true,
             last_was_carriage_return: true,
             ansi_escape_state: AnsiEscapeState::None,
+            body_style: OutputBodyStyle::Plain,
+            colorize: false,
+            dim_active: false,
             rendered_line: String::new(),
         };
         let writer = Arc::new(Mutex::new(writer));
@@ -1004,6 +1034,38 @@ mod tests {
             .expect("read rendered output");
 
         assert_eq!(rendered, "[echo python3] alpha\n");
+    }
+
+    #[tokio::test]
+    async fn write_output_byte_can_dim_entire_line_once() {
+        let (writer, mut reader) = tokio::io::duplex(256);
+        let mut render_state = OutputRenderState::new();
+        let writer = Arc::new(Mutex::new(writer));
+
+        for byte in b"alpha\n".iter().copied() {
+            write_output_byte_to_writer(
+                &writer,
+                "echo python3",
+                byte,
+                true,
+                OutputBodyStyle::Dim,
+                &mut render_state,
+            )
+            .await
+            .expect("write byte");
+        }
+
+        drop(writer);
+
+        let mut rendered = String::new();
+        reader
+            .read_to_string(&mut rendered)
+            .await
+            .expect("read rendered output");
+
+        assert!(rendered.starts_with("\u{1b}[1;"));
+        assert!(rendered.contains("[echo python3]"));
+        assert!(rendered.ends_with("\u{1b}[2malpha\u{1b}[0m\n"));
     }
 
     #[test]
