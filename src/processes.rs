@@ -724,7 +724,7 @@ fn process_output_source_label(name: &str, command: &[String]) -> String {
         .first()
         .map(|program| executable_display_name(program))
         .unwrap_or_else(|| "unknown".to_owned());
-    format!("{name} {executable}")
+    format!("{executable} {name}")
 }
 
 fn executable_display_name(program: &str) -> String {
@@ -752,10 +752,6 @@ fn configure_command(
     let mut cmd = Command::new(program);
     cmd.args(&command[1..]);
     cmd.current_dir(cwd);
-    cmd.env_remove("RUST_LOG");
-    if !env.contains_key("RUST_LOG") {
-        cmd.env("RUST_LOG", "info");
-    }
     cmd.envs(env);
     cmd.env("DEVLOOP_ROOT", root);
     cmd.env("DEVLOOP_STATE", state_path);
@@ -1237,7 +1233,7 @@ mod tests {
 
         write_captured_output_to_writer(
             &writer,
-            "build_css build-css.sh",
+            "build-css.sh build_css",
             b"Done in 73ms\n",
             OutputBodyStyle::Dim,
         )
@@ -1252,7 +1248,7 @@ mod tests {
             .await
             .expect("read rendered output");
 
-        assert!(rendered.contains("[build_css build-css.sh]"));
+        assert!(rendered.contains("[build-css.sh build_css]"));
         if should_colorize_output() {
             assert!(rendered.contains("\u{1b}[2mDone in 73ms\u{1b}[0m"));
         } else {
@@ -1261,13 +1257,13 @@ mod tests {
     }
 
     #[test]
-    fn process_output_source_label_uses_process_name_and_executable() {
+    fn process_output_source_label_uses_executable_before_process_name() {
         let label = process_output_source_label(
             "build_css",
             &["./scripts/build-css.sh".into(), "--watch".into()],
         );
 
-        assert_eq!(label, "build_css build-css.sh");
+        assert_eq!(label, "build-css.sh build_css");
     }
 
     #[test]
@@ -1276,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn configure_command_defaults_child_rust_log_to_info() {
+    fn configure_command_inherits_parent_rust_log_by_default() {
         let original = std::env::var_os("RUST_LOG");
         unsafe {
             std::env::set_var("RUST_LOG", "debug");
@@ -1296,11 +1292,12 @@ mod tests {
         let rust_log = command
             .as_std()
             .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new("RUST_LOG"))
-            .and_then(|(_, value)| value)
-            .expect("RUST_LOG entry should be set");
+            .find(|(key, _)| *key == std::ffi::OsStr::new("RUST_LOG"));
 
-        assert_eq!(rust_log, "info");
+        assert!(
+            rust_log.is_none(),
+            "RUST_LOG should not be overridden in child env"
+        );
 
         restore_rust_log(original);
     }

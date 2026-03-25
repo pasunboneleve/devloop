@@ -122,9 +122,9 @@ At the same time, the tunnel itself is described as a managed process:
 * inherited process output is source-labeled without wrapper scripts
 
 When you need to identify which managed process emitted a line in mixed
-output, inherited process lines include the configured process name and
-executable automatically. The label is color-coded per process, and the
-body style is configurable:
+output, inherited process lines include the executable first and the
+configured process name second. The label is color-coded per process,
+and the body style is configurable:
 
 ```toml
 [process.tunnel]
@@ -132,8 +132,8 @@ command = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:18080"]
 output = { inherit = true, body_style = "plain", rules = [{ state_key = "tunnel_url", extract = "url_token" }] }
 ```
 
-That renders inherited lines with the process name and executable, for
-example `[tunnel cloudflared] ...`, using ANSI color when stdout is a
+That renders inherited lines with the executable and process name, for
+example `[cloudflared tunnel] ...`, using ANSI color when stdout is a
 terminal and `NO_COLOR` is not set.
 
 For the runtime behavior reference, see

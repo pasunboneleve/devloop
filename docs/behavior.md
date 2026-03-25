@@ -59,8 +59,9 @@ Managed processes are long-running child commands.
   `devloop` is shutting down.
 - `restart = "on_failure"` restarts only after unsuccessful exit.
 - `restart = "never"` never restarts automatically.
-- Managed child processes default to `RUST_LOG=info` unless the process
-  config explicitly sets `env.RUST_LOG`.
+- Managed child processes inherit the ambient environment unless the
+  process config explicitly overrides individual variables such as
+  `env.RUST_LOG`.
 
 Liveness probes are checked on the configured interval while the process
 is running. If a liveness probe fails and the restart policy allows it,
@@ -90,8 +91,11 @@ Hooks are one-shot commands executed inside workflows.
 - Child stdout is forwarded to `devloop` stdout.
 - Child stderr is forwarded to `devloop` stderr.
 - `devloop` engine and process logs are emitted through `tracing`.
-- Managed-process and hook output is source-labeled with the configured
-  name and executable.
+- Managed-process and hook output is source-labeled as
+  `[executable process-name]`.
+- Internal `devloop` and dependency logs are grouped under
+  `[devloop ...]` labels so the emitting supervisor remains visible
+  first.
 - When output color is enabled, labels are colorized per source.
 
 ### Color rules

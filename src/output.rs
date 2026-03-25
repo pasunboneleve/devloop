@@ -7,6 +7,15 @@ pub(crate) fn normalize_source_label(source_label: &str) -> String {
     source_label.replace("::", " ")
 }
 
+pub(crate) fn normalize_internal_log_label(source_label: &str) -> String {
+    let normalized = normalize_source_label(source_label);
+    if normalized.starts_with("devloop ") {
+        normalized
+    } else {
+        format!("devloop {normalized}")
+    }
+}
+
 pub(crate) fn format_output_prefix(source_label: &str, colorize: bool) -> String {
     format_output_prefix_with_style(source_label, colorize, OutputBodyStyle::Plain)
 }
@@ -68,8 +77,9 @@ fn colorize_label(source_label: &str, body_style: OutputBodyStyle) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dim_start, format_output_prefix, format_output_prefix_with_style, normalize_source_label,
-        output_color_code, style_output_text, style_reset,
+        dim_start, format_output_prefix, format_output_prefix_with_style,
+        normalize_internal_log_label, normalize_source_label, output_color_code, style_output_text,
+        style_reset,
     };
     use crate::config::OutputBodyStyle;
 
@@ -78,6 +88,22 @@ mod tests {
         assert_eq!(
             normalize_source_label("devloop::processes"),
             "devloop processes"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_log_label_prefixes_non_devloop_targets() {
+        assert_eq!(
+            normalize_internal_log_label("hyper_util::client::legacy::connect::http"),
+            "devloop hyper_util client legacy connect http"
+        );
+    }
+
+    #[test]
+    fn normalize_internal_log_label_keeps_devloop_targets_stable() {
+        assert_eq!(
+            normalize_internal_log_label("devloop::engine"),
+            "devloop engine"
         );
     }
 

@@ -17,7 +17,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::Config;
 use crate::engine::Engine;
-use crate::output::{format_output_prefix, normalize_source_label, should_colorize_output};
+use crate::output::{format_output_prefix, normalize_internal_log_label, should_colorize_output};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -93,7 +93,7 @@ where
         event: &Event<'_>,
     ) -> std::fmt::Result {
         let metadata = event.metadata();
-        let label = normalize_source_label(metadata.target());
+        let label = normalize_internal_log_label(metadata.target());
         writer.write_str(&format_output_prefix(&label, should_colorize_output()))?;
         write!(writer, "{} ", metadata.level())?;
         self.timer.format_time(&mut writer)?;
@@ -122,7 +122,9 @@ fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::default_rust_log;
-    use crate::output::{format_output_prefix, normalize_source_label};
+    use crate::output::{
+        format_output_prefix, normalize_internal_log_label, normalize_source_label,
+    };
     use std::sync::{Mutex, OnceLock};
 
     fn rust_log_lock() -> &'static Mutex<()> {
@@ -156,6 +158,17 @@ mod tests {
         assert_eq!(
             format_output_prefix(&normalize_source_label("devloop::processes"), false),
             "[devloop processes] "
+        );
+    }
+
+    #[test]
+    fn tracing_prefix_wraps_dependency_targets_under_devloop() {
+        assert_eq!(
+            format_output_prefix(
+                &normalize_internal_log_label("hyper_util::client::legacy::connect::http"),
+                false
+            ),
+            "[devloop hyper_util client legacy connect http] "
         );
     }
 }
