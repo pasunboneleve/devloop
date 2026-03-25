@@ -82,7 +82,9 @@ output = {
 - `plain`: preserve the process body text as-is, including native ANSI
   colors when present.
 - `dim`: dim non-control body text so `devloop` engine logs stand out
-  more strongly.
+  more strongly. When subprocesses emit ANSI SGR color sequences,
+  `devloop` reapplies dim after each sequence so the original tint is
+  preserved as much as the terminal allows.
 
 Use `plain` when subprocess color or exact body rendering matters. Use
 `dim` when you want inherited process output to recede visually.

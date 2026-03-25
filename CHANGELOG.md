@@ -13,6 +13,9 @@ All notable changes to `devloop` will be recorded in this file.
 ### Fixed
 - Preserved UTF-8 multibyte characters in inherited subprocess output
   so watch tools render units such as `μs` correctly.
+- Reapplied dim styling after child ANSI SGR sequences when
+  `output.body_style = "dim"` so colored subprocess logs can still
+  recede visually without losing their tint entirely.
 
 ## [0.3.0] - 2026-03-25
 

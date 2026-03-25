@@ -556,7 +556,11 @@ fn render_output_byte(
             if matches!(byte, 0x40..=0x7e) {
                 render_state.ansi_escape_state = AnsiEscapeState::None;
             }
-            return (byte as char).to_string();
+            let mut text = (byte as char).to_string();
+            if byte == b'm' && matches!(body_style, OutputBodyStyle::Dim) {
+                text.push_str(dim_start(colorize));
+            }
+            return text;
         }
         AnsiEscapeState::None => {}
     }
@@ -962,7 +966,18 @@ mod tests {
         ]
         .concat();
 
-        assert_eq!(rendered, "\u{1b}[34mD");
+        assert_eq!(rendered, "\u{1b}[34m\u{1b}[2mD");
+    }
+
+    #[test]
+    fn render_output_byte_reapplies_dim_after_reset_sequence() {
+        let mut render_state = OutputRenderState::new();
+        let rendered = [0x1b_u8, b'[', b'0', b'm']
+            .into_iter()
+            .map(|byte| render_output_byte(byte, true, OutputBodyStyle::Dim, &mut render_state))
+            .collect::<String>();
+
+        assert_eq!(rendered, "\u{1b}[0m\u{1b}[2m");
     }
 
     #[test]
