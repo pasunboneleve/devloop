@@ -26,6 +26,11 @@ without hard-coding knowledge of any one repository.
   for line-oriented supervised output, source labeling, and output/state
   extraction through pipes rather than PTY emulation or full-screen
   terminal behavior.
+- When forwarding inherited process output, prefer visible output over
+  suppressing noise. Carriage-return-driven updates should be rendered
+  as visible labeled lines; if a tool is too noisy, fix that at the
+  tool or script layer rather than allowing it to appear silent in
+  `devloop`.
 - Hooks should be narrow and data-oriented. Prefer stdout or JSON output
   over large shell scripts that orchestrate nested workflows.
 - Dynamic state that changes during a session, such as a tunnel URL,

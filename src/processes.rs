@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -264,7 +264,7 @@ async fn forward_output_lines<T>(
     let mut stdout = tokio::io::stdout();
     let mut chunk = [0_u8; 4096];
     let mut line_buffer = Vec::new();
-    let mut at_line_start = true;
+    let mut render_state = OutputRenderState::default();
     let mut last_was_carriage_return = false;
     let mut output_failed = false;
 
@@ -283,11 +283,10 @@ async fn forward_output_lines<T>(
                 && !output_failed
                 && let Err(error) = write_output_byte(
                     &mut stdout,
-                    &process_name,
                     &source_label,
                     byte,
                     colorize,
-                    &mut at_line_start,
+                    &mut render_state,
                 )
                 .await
             {
@@ -321,28 +320,66 @@ fn format_output_line(source_label: &str, line: &str, colorize: bool) -> String 
     format!("{prefix}{body}")
 }
 
-async fn write_output_byte(
-    stdout: &mut tokio::io::Stdout,
-    _process_name: &str,
+#[derive(Debug)]
+struct OutputRenderState {
+    at_line_start: bool,
+    last_was_carriage_return: bool,
+}
+
+impl OutputRenderState {
+    fn new() -> Self {
+        Self {
+            at_line_start: true,
+            last_was_carriage_return: false,
+        }
+    }
+}
+
+impl Default for OutputRenderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+async fn write_output_byte<W>(
+    stdout: &mut W,
     source_label: &str,
     byte: u8,
     colorize: bool,
-    at_line_start: &mut bool,
-) -> std::io::Result<()> {
-    if *at_line_start {
+    render_state: &mut OutputRenderState,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if byte == b'\r' {
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
+        render_state.at_line_start = true;
+        render_state.last_was_carriage_return = true;
+        return Ok(());
+    }
+
+    if byte == b'\n' {
+        if render_state.last_was_carriage_return {
+            render_state.last_was_carriage_return = false;
+            return Ok(());
+        }
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
+        render_state.at_line_start = true;
+        return Ok(());
+    }
+
+    render_state.last_was_carriage_return = false;
+
+    if render_state.at_line_start {
         let prefix = format_output_prefix(source_label, colorize);
         stdout.write_all(prefix.as_bytes()).await?;
-        *at_line_start = false;
+        render_state.at_line_start = false;
     }
 
     let rendered = render_output_byte(byte, colorize);
     stdout.write_all(rendered.as_bytes()).await?;
-
-    if matches!(byte, b'\n' | b'\r') {
-        stdout.flush().await?;
-        *at_line_start = true;
-    }
-
     Ok(())
 }
 
@@ -621,6 +658,7 @@ mod tests {
     use crate::config::{OutputExtract, ProbeSpec};
     use serde_json::Value;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncReadExt;
 
     fn unique_state_path() -> PathBuf {
         let unique = SystemTime::now()
@@ -674,22 +712,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_output_byte_marks_carriage_return_as_line_start() {
-        let mut stdout = tokio::io::stdout();
-        let mut at_line_start = false;
+    async fn write_output_byte_renders_carriage_return_as_visible_newline() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut render_state = OutputRenderState {
+            at_line_start: false,
+            last_was_carriage_return: false,
+        };
 
         write_output_byte(
-            &mut stdout,
-            "css_watch",
+            &mut writer,
             "css_watch tailwindcss",
             b'\r',
             false,
-            &mut at_line_start,
+            &mut render_state,
         )
         .await
         .expect("write carriage return");
 
-        assert!(at_line_start);
+        drop(writer);
+
+        let mut rendered = String::new();
+        reader
+            .read_to_string(&mut rendered)
+            .await
+            .expect("read rendered carriage return");
+
+        assert_eq!(rendered, "\n");
+        assert!(render_state.at_line_start);
+        assert!(render_state.last_was_carriage_return);
+    }
+
+    #[tokio::test]
+    async fn write_output_byte_suppresses_line_feed_after_carriage_return() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut render_state = OutputRenderState {
+            at_line_start: true,
+            last_was_carriage_return: true,
+        };
+
+        write_output_byte(
+            &mut writer,
+            "css_watch tailwindcss",
+            b'\n',
+            false,
+            &mut render_state,
+        )
+        .await
+        .expect("write line feed");
+
+        drop(writer);
+
+        let mut rendered = String::new();
+        reader
+            .read_to_string(&mut rendered)
+            .await
+            .expect("read rendered line feed");
+
+        assert_eq!(rendered, "");
+        assert!(render_state.at_line_start);
+        assert!(!render_state.last_was_carriage_return);
     }
 
     #[test]
