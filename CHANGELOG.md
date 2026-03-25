@@ -4,6 +4,11 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Stopped `devloop`'s own `RUST_LOG` setting from leaking into managed
+  child processes unless the child explicitly sets `RUST_LOG` in
+  config.
+
 ## [0.4.0] - 2026-03-25
 
 ### Added

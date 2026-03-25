@@ -750,6 +750,7 @@ fn configure_command(
     let mut cmd = Command::new(program);
     cmd.args(&command[1..]);
     cmd.current_dir(cwd);
+    cmd.env_remove("RUST_LOG");
     cmd.envs(env);
     cmd.env("DEVLOOP_ROOT", root);
     cmd.env("DEVLOOP_STATE", state_path);
@@ -1267,6 +1268,79 @@ mod tests {
     #[test]
     fn executable_display_name_handles_plain_programs() {
         assert_eq!(executable_display_name("cloudflared"), "cloudflared");
+    }
+
+    #[test]
+    fn configure_command_removes_inherited_rust_log_by_default() {
+        let original = std::env::var_os("RUST_LOG");
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+        }
+
+        let command = configure_command(
+            &["cargo".into(), "run".into()],
+            PathBuf::from("/tmp"),
+            &BTreeMap::new(),
+            Path::new("/tmp"),
+            Path::new("/tmp/state.json"),
+            &[],
+            "startup",
+        )
+        .expect("configure command");
+
+        let rust_log = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("RUST_LOG"))
+            .expect("RUST_LOG entry should be present after env_remove");
+
+        assert_eq!(rust_log.1, None);
+
+        restore_rust_log(original);
+    }
+
+    #[test]
+    fn configure_command_keeps_explicit_rust_log_override() {
+        let original = std::env::var_os("RUST_LOG");
+        unsafe {
+            std::env::set_var("RUST_LOG", "debug");
+        }
+
+        let mut env = BTreeMap::new();
+        env.insert("RUST_LOG".into(), "info,gcp_rust_blog=debug".into());
+
+        let command = configure_command(
+            &["cargo".into(), "run".into()],
+            PathBuf::from("/tmp"),
+            &env,
+            Path::new("/tmp"),
+            Path::new("/tmp/state.json"),
+            &[],
+            "startup",
+        )
+        .expect("configure command");
+
+        let rust_log = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("RUST_LOG"))
+            .and_then(|(_, value)| value)
+            .expect("explicit RUST_LOG should be preserved");
+
+        assert_eq!(rust_log, "info,gcp_rust_blog=debug");
+
+        restore_rust_log(original);
+    }
+
+    fn restore_rust_log(original: Option<std::ffi::OsString>) {
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var("RUST_LOG", value);
+            },
+            None => unsafe {
+                std::env::remove_var("RUST_LOG");
+            },
+        }
     }
 
     #[test]
