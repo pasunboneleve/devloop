@@ -82,7 +82,9 @@ output = {
 - `plain`: preserve the process body text as-is, including native ANSI
   colors when present.
 - `dim`: dim non-control body text so `devloop` engine logs stand out
-  more strongly.
+  more strongly. When subprocesses emit ANSI SGR color sequences,
+  `devloop` reapplies dim after each sequence so the original tint is
+  preserved as much as the terminal allows.
 
 Use `plain` when subprocess color or exact body rendering matters. Use
 `dim` when you want inherited process output to recede visually.
@@ -133,6 +135,7 @@ Hooks are narrow one-shot commands invoked from workflows.
 [hook.current_post_slug]
 command = ["./scripts/current-post-slug.sh"]
 cwd = "."
+output = { inherit = true, body_style = "dim" }
 capture = "text"
 state_key = "current_post_slug"
 ```
@@ -142,14 +145,40 @@ state_key = "current_post_slug"
 - `command`: command and arguments. Required.
 - `cwd`: working directory.
 - `env`: extra environment variables.
+- `output`: inherited-output behavior for hook stdout and stderr.
 - `capture`: one of `ignore`, `text`, or `json`.
 - `state_key`: required for `capture = "text"`.
+
+### Hook output config
+
+```toml
+output = { inherit = true, body_style = "dim" }
+```
+
+- `inherit`: whether hook stdout and stderr should be forwarded by
+  `devloop`. Default: `true`.
+- `body_style`: visual treatment for forwarded hook body text. Default:
+  `dim`.
+
+Hooks default to dimmed inherited output because they are typically
+short-lived helper commands whose output is useful context but not the
+primary long-running log stream.
 
 ### Hook capture modes
 
 - `ignore`: discard stdout.
 - `text`: write trimmed stdout into `state_key`.
 - `json`: parse stdout as a JSON object and merge it into session state.
+
+Hook forwarding and capture are separate behaviors:
+
+- inherited hook output is shown with a source label if `output.inherit`
+  is enabled
+- `capture = "text"` stores trimmed stdout in `state_key`
+- `capture = "json"` parses stdout and merges the result into session
+  state
+- failed hooks return an error after any captured stdout and stderr have
+  been rendered
 
 ## Workflows
 

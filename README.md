@@ -136,6 +136,9 @@ That renders inherited lines with the process name and executable, for
 example `[tunnel cloudflared] ...`, using ANSI color when stdout is a
 terminal and `NO_COLOR` is not set.
 
+For the runtime behavior reference, see
+[`docs/behavior.md`](docs/behavior.md).
+
 For the full configuration reference, see
 [`docs/configuration.md`](docs/configuration.md).
 

@@ -310,6 +310,8 @@ pub struct HookSpec {
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default = "default_hook_output_config")]
+    pub output: HookOutputConfig,
     pub capture: Option<CaptureMode>,
     pub state_key: Option<String>,
 }
@@ -319,9 +321,30 @@ impl HookSpec {
         if self.command.is_empty() {
             return Err(anyhow!("hook command must not be empty"));
         }
+        self.output.validate()?;
         if matches!(self.capture, Some(CaptureMode::Text)) && self.state_key.is_none() {
             return Err(anyhow!("text capture requires state_key"));
         }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookOutputConfig {
+    #[serde(default = "default_true")]
+    pub inherit: bool,
+    #[serde(default = "default_hook_body_style")]
+    pub body_style: OutputBodyStyle,
+}
+
+impl Default for HookOutputConfig {
+    fn default() -> Self {
+        default_hook_output_config()
+    }
+}
+
+impl HookOutputConfig {
+    fn validate(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -459,6 +482,17 @@ fn default_capture_group() -> usize {
     1
 }
 
+fn default_hook_body_style() -> OutputBodyStyle {
+    OutputBodyStyle::Dim
+}
+
+fn default_hook_output_config() -> HookOutputConfig {
+    HookOutputConfig {
+        inherit: true,
+        body_style: OutputBodyStyle::Dim,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +579,29 @@ mod tests {
             toml::from_str("body_style = \"dim\"").expect("parse output config");
 
         assert_eq!(config.body_style, OutputBodyStyle::Dim);
+    }
+
+    #[test]
+    fn hook_output_defaults_to_dimmed_inherited_output() {
+        let config: HookOutputConfig = toml::from_str("").expect("parse hook output config");
+
+        assert!(config.inherit);
+        assert_eq!(config.body_style, OutputBodyStyle::Dim);
+    }
+
+    #[test]
+    fn hook_spec_defaults_to_dimmed_inherited_output() {
+        let hook: HookSpec = toml::from_str("command = [\"echo\", \"ok\"]").expect("parse hook");
+
+        assert!(hook.output.inherit);
+        assert_eq!(hook.output.body_style, OutputBodyStyle::Dim);
+    }
+
+    #[test]
+    fn hook_output_parses_plain_body_style_override() {
+        let config: HookOutputConfig =
+            toml::from_str("body_style = \"plain\"").expect("parse hook output config");
+
+        assert_eq!(config.body_style, OutputBodyStyle::Plain);
     }
 }
