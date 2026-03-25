@@ -339,11 +339,9 @@ async fn write_output_byte(
     let rendered = render_output_byte(byte, colorize);
     stdout.write_all(rendered.as_bytes()).await?;
 
-    if byte == b'\n' {
+    if matches!(byte, b'\n' | b'\r') {
         stdout.flush().await?;
         *at_line_start = true;
-    } else if byte == b'\r' {
-        stdout.flush().await?;
     }
 
     Ok(())
@@ -705,6 +703,25 @@ mod tests {
     #[test]
     fn render_output_byte_does_not_dim_carriage_returns() {
         assert_eq!(render_output_byte(b'\r', true), "\r");
+    }
+
+    #[tokio::test]
+    async fn write_output_byte_marks_carriage_return_as_line_start() {
+        let mut stdout = tokio::io::stdout();
+        let mut at_line_start = false;
+
+        write_output_byte(
+            &mut stdout,
+            "css_watch",
+            "css_watch tailwindcss",
+            b'\r',
+            false,
+            &mut at_line_start,
+        )
+        .await
+        .expect("write carriage return");
+
+        assert!(at_line_start);
     }
 
     #[test]
