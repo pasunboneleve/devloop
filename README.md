@@ -1,6 +1,6 @@
 # devloop
 
-[![CI](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml/badge.svg)](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml/badge.svg)](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml)
 
 **Keep the local loop cheap.**
 
@@ -8,6 +8,7 @@
 locally.
 
 Most local setups become expensive to change:
+
 - restarting everything
 - losing state
 - waiting for rebuilds
@@ -46,7 +47,7 @@ Install the latest published `main` branch directly from GitHub:
 
 ```bash
 cargo install --git https://github.com/pasunboneleve/devloop.git
-````
+```
 
 For local development from a checkout:
 
@@ -88,11 +89,8 @@ restart the supervisor if you need to seed a different initial state.
 
 ## Example use case
 
-Used as the primary local development workflow for:
-
-[`gcp-rust-blog-public`](https://github.com/pasunboneleve/gcp-rust-blog-public)
-
-It uses `devloop` as its primary local development workflow.
+Used as the primary local development workflow for
+[`gcp-rust-blog-public`](https://github.com/pasunboneleve/gcp-rust-blog-public).
 
 The generic example config lives at:
 
@@ -104,10 +102,12 @@ The real client config lives in the client repository itself:
 
 It models a blog workflow as configuration:
 
-* `rust` changes restart the server, wait for health, rebuild CSS, then
-  restart the tunnel and publish the current post URL
-* `content` changes restart the tunnel and republish the current post URL
-* `css` changes trigger a one-shot Tailwind build
+* `rust` changes restart the server, wait for health, refresh the
+  current post slug, restart the tunnel, and publish the current post URL
+* `content` changes refresh the current post slug, restart the tunnel,
+  and republish the current post URL
+* CSS is handled by a long-running Tailwind watch process started by the
+  startup workflow
 
 The example expects repo-owned helper scripts:
 
