@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -15,6 +13,7 @@ use tracing::{info, warn};
 use crate::config::{
     Config, HookSpec, OutputExtract, OutputRule, ProbeSpec, ProcessSpec, RestartPolicy,
 };
+use crate::output::{dim_text, format_output_prefix, should_colorize_output};
 use crate::state::SessionState;
 
 pub struct ProcessManager<'a> {
@@ -313,13 +312,13 @@ async fn forward_output_lines<T>(
 
 #[cfg(test)]
 fn format_output_line(source_label: &str, line: &str, colorize: bool) -> String {
-    if !colorize {
-        return format!("[{source_label}] {line}");
-    }
-
-    let label = colorize_label(source_label);
-    let body = dim_text(line);
-    format!("{label} {body}")
+    let prefix = format_output_prefix(source_label, colorize);
+    let body = if colorize {
+        dim_text(line)
+    } else {
+        line.to_owned()
+    };
+    format!("{prefix}{body}")
 }
 
 async fn write_output_byte(
@@ -345,14 +344,6 @@ async fn write_output_byte(
     }
 
     Ok(())
-}
-
-fn format_output_prefix(source_label: &str, colorize: bool) -> String {
-    if !colorize {
-        return format!("[{source_label}] ");
-    }
-
-    format!("{} ", colorize_label(source_label))
 }
 
 fn render_output_byte(byte: u8, colorize: bool) -> String {
@@ -428,29 +419,6 @@ fn executable_display_name(program: &str) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or(program)
         .to_owned()
-}
-
-fn should_colorize_output() -> bool {
-    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-}
-
-fn colorize_label(source_label: &str) -> String {
-    format!(
-        "\u{1b}[1;{}m[{}]\u{1b}[0m",
-        process_color_code(source_label),
-        source_label
-    )
-}
-
-fn dim_text(text: &str) -> String {
-    format!("\u{1b}[2m{text}\u{1b}[0m")
-}
-
-fn process_color_code(process_name: &str) -> u8 {
-    const PALETTE: [u8; 6] = [31, 32, 33, 34, 36, 37];
-    let mut hasher = DefaultHasher::new();
-    process_name.hash(&mut hasher);
-    PALETTE[(hasher.finish() as usize) % PALETTE.len()]
 }
 
 fn configure_command(
@@ -725,14 +693,6 @@ mod tests {
     }
 
     #[test]
-    fn format_output_prefix_falls_back_without_color() {
-        assert_eq!(
-            format_output_prefix("tunnel cloudflared", false),
-            "[tunnel cloudflared] "
-        );
-    }
-
-    #[test]
     fn process_output_source_label_uses_process_name_and_executable() {
         let label = process_output_source_label(
             "build_css",
@@ -748,8 +708,11 @@ mod tests {
     }
 
     #[test]
-    fn process_color_code_is_stable_for_same_process() {
-        assert_eq!(process_color_code("tunnel"), process_color_code("tunnel"));
+    fn output_color_code_is_stable_for_same_process() {
+        assert_eq!(
+            crate::output::output_color_code("tunnel"),
+            crate::output::output_color_code("tunnel")
+        );
     }
 
     #[test]

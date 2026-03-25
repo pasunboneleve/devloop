@@ -1,5 +1,6 @@
 mod config;
 mod engine;
+mod output;
 mod processes;
 mod state;
 
@@ -16,6 +17,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::Config;
 use crate::engine::Engine;
+use crate::output::{format_output_prefix, normalize_source_label, should_colorize_output};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -90,21 +92,14 @@ where
         event: &Event<'_>,
     ) -> std::fmt::Result {
         let metadata = event.metadata();
-        write!(
-            writer,
-            "{} {} ",
-            format_log_target(metadata.target()),
-            metadata.level()
-        )?;
+        let label = normalize_source_label(metadata.target());
+        writer.write_str(&format_output_prefix(&label, should_colorize_output()))?;
+        write!(writer, "{} ", metadata.level())?;
         self.timer.format_time(&mut writer)?;
         writer.write_char(' ')?;
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
-}
-
-fn format_log_target(target: &str) -> String {
-    format!("[{}]", target.replace("::", " "))
 }
 
 fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
@@ -125,7 +120,8 @@ fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_rust_log, format_log_target};
+    use super::default_rust_log;
+    use crate::output::{format_output_prefix, normalize_source_label};
     use std::sync::{Mutex, OnceLock};
 
     fn rust_log_lock() -> &'static Mutex<()> {
@@ -155,10 +151,10 @@ mod tests {
     }
 
     #[test]
-    fn format_log_target_rewrites_module_path_for_prefix() {
+    fn tracing_prefix_reuses_shared_output_label_format() {
         assert_eq!(
-            format_log_target("devloop::processes"),
-            "[devloop processes]"
+            format_output_prefix(&normalize_source_label("devloop::processes"), false),
+            "[devloop processes] "
         );
     }
 }
