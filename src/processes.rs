@@ -324,6 +324,14 @@ fn format_output_line(source_label: &str, line: &str, colorize: bool) -> String 
 struct OutputRenderState {
     at_line_start: bool,
     last_was_carriage_return: bool,
+    ansi_escape_state: AnsiEscapeState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnsiEscapeState {
+    None,
+    AfterEsc,
+    InCsi,
 }
 
 impl OutputRenderState {
@@ -331,6 +339,7 @@ impl OutputRenderState {
         Self {
             at_line_start: true,
             last_was_carriage_return: false,
+            ansi_escape_state: AnsiEscapeState::None,
         }
     }
 }
@@ -378,16 +387,41 @@ where
         render_state.at_line_start = false;
     }
 
-    let rendered = render_output_byte(byte, colorize);
+    let rendered = render_output_byte(byte, colorize, render_state);
     stdout.write_all(rendered.as_bytes()).await?;
     Ok(())
 }
 
-fn render_output_byte(byte: u8, colorize: bool) -> String {
+fn render_output_byte(byte: u8, colorize: bool, render_state: &mut OutputRenderState) -> String {
     let text = String::from_utf8_lossy(&[byte]).into_owned();
+
+    if byte == 0x1b {
+        render_state.ansi_escape_state = AnsiEscapeState::AfterEsc;
+        return text;
+    }
+
+    match render_state.ansi_escape_state {
+        AnsiEscapeState::AfterEsc => {
+            if byte == b'[' {
+                render_state.ansi_escape_state = AnsiEscapeState::InCsi;
+            } else {
+                render_state.ansi_escape_state = AnsiEscapeState::None;
+            }
+            return text;
+        }
+        AnsiEscapeState::InCsi => {
+            if matches!(byte, 0x40..=0x7e) {
+                render_state.ansi_escape_state = AnsiEscapeState::None;
+            }
+            return text;
+        }
+        AnsiEscapeState::None => {}
+    }
+
     if !colorize || byte.is_ascii_control() {
         return text;
     }
+
     dim_text(&text)
 }
 
@@ -703,12 +737,34 @@ mod tests {
 
     #[test]
     fn render_output_byte_does_not_dim_newlines() {
-        assert_eq!(render_output_byte(b'\n', true), "\n");
+        assert_eq!(
+            render_output_byte(b'\n', true, &mut OutputRenderState::new()),
+            "\n"
+        );
     }
 
     #[test]
     fn render_output_byte_does_not_dim_carriage_returns() {
-        assert_eq!(render_output_byte(b'\r', true), "\r");
+        assert_eq!(
+            render_output_byte(b'\r', true, &mut OutputRenderState::new()),
+            "\r"
+        );
+    }
+
+    #[test]
+    fn render_output_byte_preserves_ansi_escape_sequences() {
+        let mut render_state = OutputRenderState::new();
+        let rendered = [
+            render_output_byte(0x1b, true, &mut render_state),
+            render_output_byte(b'[', true, &mut render_state),
+            render_output_byte(b'3', true, &mut render_state),
+            render_output_byte(b'4', true, &mut render_state),
+            render_output_byte(b'm', true, &mut render_state),
+            render_output_byte(b'D', true, &mut render_state),
+        ]
+        .concat();
+
+        assert_eq!(rendered, "\u{1b}[34m\u{1b}[2mD\u{1b}[0m");
     }
 
     #[tokio::test]
@@ -717,6 +773,7 @@ mod tests {
         let mut render_state = OutputRenderState {
             at_line_start: false,
             last_was_carriage_return: false,
+            ansi_escape_state: AnsiEscapeState::None,
         };
 
         write_output_byte(
@@ -748,6 +805,7 @@ mod tests {
         let mut render_state = OutputRenderState {
             at_line_start: true,
             last_was_carriage_return: true,
+            ansi_escape_state: AnsiEscapeState::None,
         };
 
         write_output_byte(
