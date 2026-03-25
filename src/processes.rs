@@ -13,9 +13,10 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::{
-    Config, HookSpec, OutputExtract, OutputRule, ProbeSpec, ProcessSpec, RestartPolicy,
+    Config, HookSpec, OutputBodyStyle, OutputExtract, OutputRule, ProbeSpec, ProcessSpec,
+    RestartPolicy,
 };
-use crate::output::{format_output_prefix, should_colorize_output};
+use crate::output::{format_output_prefix, should_colorize_output, style_output_text};
 use crate::state::SessionState;
 
 pub struct ProcessManager<'a> {
@@ -210,16 +211,20 @@ impl<'a> ProcessManager<'a> {
         let process_name = name.to_owned();
         let source_label = process_output_source_label(name, &spec.command);
         let inherit_output = spec.output.inherit;
+        let body_style = spec.output.body_style;
         let rules = compile_output_rules(&spec.output.rules)?;
         let stdout_sink = OutputSink::Stdout(self.stdout.clone());
         let stderr_sink = OutputSink::Stderr(self.stderr.clone());
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(forward_output_lines(
                 stdout,
-                stdout_sink,
+                ForwardOutputConfig {
+                    output: stdout_sink,
+                    source_label: source_label.clone(),
+                    inherit_output,
+                    body_style,
+                },
                 process_name.clone(),
-                source_label.clone(),
-                inherit_output,
                 rules.clone(),
                 state.clone(),
             ));
@@ -227,10 +232,13 @@ impl<'a> ProcessManager<'a> {
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(forward_output_lines(
                 stderr,
-                stderr_sink,
+                ForwardOutputConfig {
+                    output: stderr_sink,
+                    source_label,
+                    inherit_output,
+                    body_style,
+                },
                 process_name,
-                source_label,
-                inherit_output,
                 rules,
                 state.clone(),
             ));
@@ -259,12 +267,17 @@ struct CompiledOutputRule {
     capture_group: usize,
 }
 
-async fn forward_output_lines<T>(
-    reader: T,
+struct ForwardOutputConfig {
     output: OutputSink,
-    process_name: String,
     source_label: String,
     inherit_output: bool,
+    body_style: OutputBodyStyle,
+}
+
+async fn forward_output_lines<T>(
+    reader: T,
+    config: ForwardOutputConfig,
+    process_name: String,
     rules: Vec<CompiledOutputRule>,
     state: SessionState,
 ) where
@@ -289,11 +302,17 @@ async fn forward_output_lines<T>(
         };
 
         for &byte in &chunk[..bytes_read] {
-            if inherit_output
+            if config.inherit_output
                 && !output_failed
-                && let Err(error) =
-                    write_output_byte(&output, &source_label, byte, colorize, &mut render_state)
-                        .await
+                && let Err(error) = write_output_byte(
+                    &config.output,
+                    &config.source_label,
+                    byte,
+                    colorize,
+                    config.body_style,
+                    &mut render_state,
+                )
+                .await
             {
                 warn!("failed to write output for {}: {}", process_name, error);
                 output_failed = true;
@@ -312,18 +331,24 @@ async fn forward_output_lines<T>(
     if !line_buffer.is_empty() {
         process_output_line(&process_name, &line_buffer, &rules, &state);
     }
-    if inherit_output
+    if config.inherit_output
         && !output_failed
-        && let Err(error) = flush_rendered_output(&output, &mut render_state, false).await
+        && let Err(error) = flush_rendered_output(&config.output, &mut render_state, false).await
     {
         warn!("failed to flush output for {}: {}", process_name, error);
     }
 }
 
 #[cfg(test)]
-fn format_output_line(source_label: &str, line: &str, colorize: bool) -> String {
+fn format_output_line(
+    source_label: &str,
+    line: &str,
+    colorize: bool,
+    body_style: OutputBodyStyle,
+) -> String {
     let prefix = format_output_prefix(source_label, colorize);
-    format!("{prefix}{line}")
+    let body = style_output_text(line, body_style, colorize);
+    format!("{prefix}{body}")
 }
 
 #[derive(Debug)]
@@ -369,14 +394,31 @@ async fn write_output_byte(
     source_label: &str,
     byte: u8,
     colorize: bool,
+    body_style: OutputBodyStyle,
     render_state: &mut OutputRenderState,
 ) -> std::io::Result<()> {
     match output {
         OutputSink::Stdout(writer) => {
-            write_output_byte_to_writer(writer, source_label, byte, colorize, render_state).await
+            write_output_byte_to_writer(
+                writer,
+                source_label,
+                byte,
+                colorize,
+                body_style,
+                render_state,
+            )
+            .await
         }
         OutputSink::Stderr(writer) => {
-            write_output_byte_to_writer(writer, source_label, byte, colorize, render_state).await
+            write_output_byte_to_writer(
+                writer,
+                source_label,
+                byte,
+                colorize,
+                body_style,
+                render_state,
+            )
+            .await
         }
     }
 }
@@ -401,6 +443,7 @@ async fn write_output_byte_to_writer<W>(
     source_label: &str,
     byte: u8,
     colorize: bool,
+    body_style: OutputBodyStyle,
     render_state: &mut OutputRenderState,
 ) -> std::io::Result<()>
 where
@@ -429,7 +472,7 @@ where
         render_state.at_line_start = false;
     }
 
-    let rendered = render_output_byte(byte, colorize, render_state);
+    let rendered = render_output_byte(byte, colorize, body_style, render_state);
     render_state.rendered_line.push_str(&rendered);
     Ok(())
 }
@@ -461,7 +504,12 @@ where
     Ok(())
 }
 
-fn render_output_byte(byte: u8, colorize: bool, render_state: &mut OutputRenderState) -> String {
+fn render_output_byte(
+    byte: u8,
+    colorize: bool,
+    body_style: OutputBodyStyle,
+    render_state: &mut OutputRenderState,
+) -> String {
     let text = String::from_utf8_lossy(&[byte]).into_owned();
 
     if byte == 0x1b {
@@ -491,7 +539,7 @@ fn render_output_byte(byte: u8, colorize: bool, render_state: &mut OutputRenderS
         return text;
     }
 
-    text
+    style_output_text(&text, body_style, colorize)
 }
 
 fn process_output_byte_for_rules(
@@ -792,24 +840,39 @@ mod tests {
 
     #[test]
     fn format_output_line_prefixes_source() {
-        let rendered = format_output_line("tunnel cloudflared", "INF ready", false);
+        let rendered = format_output_line(
+            "tunnel cloudflared",
+            "INF ready",
+            false,
+            OutputBodyStyle::Plain,
+        );
 
         assert_eq!(rendered, "[tunnel cloudflared] INF ready");
     }
 
     #[test]
     fn format_output_line_colors_label_and_dims_body() {
-        let rendered = format_output_line("tunnel cloudflared", "INF ready", true);
+        let rendered = format_output_line(
+            "tunnel cloudflared",
+            "INF ready",
+            true,
+            OutputBodyStyle::Dim,
+        );
 
         assert!(rendered.contains("[tunnel cloudflared]"));
-        assert!(rendered.ends_with("INF ready"));
+        assert!(rendered.contains("\u{1b}[2mINF ready\u{1b}[0m"));
         assert!(rendered.starts_with("\u{1b}[1;"));
     }
 
     #[test]
     fn render_output_byte_does_not_dim_newlines() {
         assert_eq!(
-            render_output_byte(b'\n', true, &mut OutputRenderState::new()),
+            render_output_byte(
+                b'\n',
+                true,
+                OutputBodyStyle::Plain,
+                &mut OutputRenderState::new(),
+            ),
             "\n"
         );
     }
@@ -817,7 +880,12 @@ mod tests {
     #[test]
     fn render_output_byte_does_not_dim_carriage_returns() {
         assert_eq!(
-            render_output_byte(b'\r', true, &mut OutputRenderState::new()),
+            render_output_byte(
+                b'\r',
+                true,
+                OutputBodyStyle::Plain,
+                &mut OutputRenderState::new(),
+            ),
             "\r"
         );
     }
@@ -826,16 +894,16 @@ mod tests {
     fn render_output_byte_preserves_ansi_escape_sequences() {
         let mut render_state = OutputRenderState::new();
         let rendered = [
-            render_output_byte(0x1b, true, &mut render_state),
-            render_output_byte(b'[', true, &mut render_state),
-            render_output_byte(b'3', true, &mut render_state),
-            render_output_byte(b'4', true, &mut render_state),
-            render_output_byte(b'm', true, &mut render_state),
-            render_output_byte(b'D', true, &mut render_state),
+            render_output_byte(0x1b, true, OutputBodyStyle::Dim, &mut render_state),
+            render_output_byte(b'[', true, OutputBodyStyle::Dim, &mut render_state),
+            render_output_byte(b'3', true, OutputBodyStyle::Dim, &mut render_state),
+            render_output_byte(b'4', true, OutputBodyStyle::Dim, &mut render_state),
+            render_output_byte(b'm', true, OutputBodyStyle::Dim, &mut render_state),
+            render_output_byte(b'D', true, OutputBodyStyle::Dim, &mut render_state),
         ]
         .concat();
 
-        assert_eq!(rendered, "\u{1b}[34mD");
+        assert_eq!(rendered, "\u{1b}[34m\u{1b}[2mD\u{1b}[0m");
     }
 
     #[tokio::test]
@@ -854,6 +922,7 @@ mod tests {
             "css_watch tailwindcss",
             b'\r',
             false,
+            OutputBodyStyle::Plain,
             &mut render_state,
         )
         .await
@@ -888,6 +957,7 @@ mod tests {
             "css_watch tailwindcss",
             b'\n',
             false,
+            OutputBodyStyle::Plain,
             &mut render_state,
         )
         .await
@@ -913,9 +983,16 @@ mod tests {
         let writer = Arc::new(Mutex::new(writer));
 
         for byte in b"alpha\n".iter().copied() {
-            write_output_byte_to_writer(&writer, "echo python3", byte, false, &mut render_state)
-                .await
-                .expect("write byte");
+            write_output_byte_to_writer(
+                &writer,
+                "echo python3",
+                byte,
+                false,
+                OutputBodyStyle::Plain,
+                &mut render_state,
+            )
+            .await
+            .expect("write byte");
         }
 
         drop(writer);

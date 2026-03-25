@@ -1,6 +1,8 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::IsTerminal;
 
+use crate::config::OutputBodyStyle;
+
 pub(crate) fn normalize_source_label(source_label: &str) -> String {
     source_label.replace("::", " ")
 }
@@ -15,6 +17,17 @@ pub(crate) fn format_output_prefix(source_label: &str, colorize: bool) -> String
 
 pub(crate) fn should_colorize_output() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+pub(crate) fn style_output_text(text: &str, body_style: OutputBodyStyle, colorize: bool) -> String {
+    if !colorize {
+        return text.to_owned();
+    }
+
+    match body_style {
+        OutputBodyStyle::Plain => text.to_owned(),
+        OutputBodyStyle::Dim => format!("\u{1b}[2m{text}\u{1b}[0m"),
+    }
 }
 
 pub(crate) fn output_color_code(process_name: &str) -> u8 {
@@ -34,7 +47,10 @@ fn colorize_label(source_label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_output_prefix, normalize_source_label, output_color_code};
+    use super::{
+        format_output_prefix, normalize_source_label, output_color_code, style_output_text,
+    };
+    use crate::config::OutputBodyStyle;
 
     #[test]
     fn normalize_source_label_rewrites_module_path() {
@@ -64,5 +80,21 @@ mod tests {
     #[test]
     fn output_color_code_is_stable_for_same_process() {
         assert_eq!(output_color_code("tunnel"), output_color_code("tunnel"));
+    }
+
+    #[test]
+    fn style_output_text_defaults_to_plain() {
+        assert_eq!(
+            style_output_text("ready", OutputBodyStyle::Plain, true),
+            "ready"
+        );
+    }
+
+    #[test]
+    fn style_output_text_can_dim_body() {
+        assert_eq!(
+            style_output_text("ready", OutputBodyStyle::Dim, true),
+            "\u{1b}[2mready\u{1b}[0m"
+        );
     }
 }

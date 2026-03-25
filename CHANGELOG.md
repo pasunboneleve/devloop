@@ -10,6 +10,14 @@ All notable changes to `devloop` will be recorded in this file.
 - Stable per-process label colors and dimmed managed-process bodies so
   `devloop` workflow and engine logs stand out by contrast.
 
+## [0.3.0] - 2026-03-25
+
+### Added
+- Configurable inherited process body styling via `output.body_style`,
+  allowing developers to choose between preserving native subprocess
+  colors and dimming inherited output bodies.
+- Detailed configuration reference docs under [`docs/`](docs/README.md).
+
 ## [0.2.3] - 2026-03-25
 
 ### Changed

@@ -241,6 +241,8 @@ pub struct OutputConfig {
     #[serde(default = "default_true")]
     pub inherit: bool,
     #[serde(default)]
+    pub body_style: OutputBodyStyle,
+    #[serde(default)]
     pub rules: Vec<OutputRule>,
 }
 
@@ -248,6 +250,7 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             inherit: true,
+            body_style: OutputBodyStyle::Plain,
             rules: Vec::new(),
         }
     }
@@ -283,6 +286,14 @@ impl OutputRule {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputBodyStyle {
+    #[default]
+    Plain,
+    Dim,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -514,6 +525,7 @@ mod tests {
         let config: OutputConfig = toml::from_str("").expect("parse default output config");
 
         assert!(config.inherit);
+        assert_eq!(config.body_style, OutputBodyStyle::Plain);
         assert!(config.rules.is_empty());
     }
 
@@ -523,6 +535,15 @@ mod tests {
             toml::from_str("command = [\"tailwindcss\", \"--watch\"]").expect("parse process");
 
         assert!(process.output.inherit);
+        assert_eq!(process.output.body_style, OutputBodyStyle::Plain);
         assert!(process.output.rules.is_empty());
+    }
+
+    #[test]
+    fn output_config_parses_body_style() {
+        let config: OutputConfig =
+            toml::from_str("body_style = \"dim\"").expect("parse output config");
+
+        assert_eq!(config.body_style, OutputBodyStyle::Dim);
     }
 }
