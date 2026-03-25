@@ -10,6 +10,10 @@ without hard-coding knowledge of any one repository.
   edits.
 - Prefer stable abstractions over repo-specific shortcuts. Put
   project-specific behavior behind config or hooks.
+- Prefer small, focused libraries over bespoke implementations when
+  they solve one problem cleanly and reduce local complexity. Avoid
+  large dependencies that bring in broad architectural weight or make
+  the code harder to understand.
 - Keep the engine small. If a behavior can live in repo-local config,
   avoid baking it into the core.
 - Do not push unless explicitly asked. This repository may not even have a

@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(default_rust_log()))
         .event_format(DevloopLogFormatter::default())
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();

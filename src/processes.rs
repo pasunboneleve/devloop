@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, Stdout};
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -21,6 +23,7 @@ pub struct ProcessManager<'a> {
     children: BTreeMap<String, ManagedProcess>,
     client: reqwest::Client,
     shutting_down: bool,
+    output: Arc<Mutex<Stdout>>,
 }
 
 struct ManagedProcess {
@@ -35,6 +38,7 @@ impl<'a> ProcessManager<'a> {
             children: BTreeMap::new(),
             client: reqwest::Client::new(),
             shutting_down: false,
+            output: Arc::new(Mutex::new(tokio::io::stdout())),
         }
     }
 
@@ -208,6 +212,7 @@ impl<'a> ProcessManager<'a> {
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(forward_output_lines(
                 stdout,
+                self.output.clone(),
                 process_name.clone(),
                 source_label.clone(),
                 inherit_output,
@@ -218,6 +223,7 @@ impl<'a> ProcessManager<'a> {
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(forward_output_lines(
                 stderr,
+                self.output.clone(),
                 process_name,
                 source_label,
                 inherit_output,
@@ -251,6 +257,7 @@ struct CompiledOutputRule {
 
 async fn forward_output_lines<T>(
     reader: T,
+    output: Arc<Mutex<Stdout>>,
     process_name: String,
     source_label: String,
     inherit_output: bool,
@@ -261,7 +268,6 @@ async fn forward_output_lines<T>(
 {
     let colorize = should_colorize_output();
     let mut reader = reader;
-    let mut stdout = tokio::io::stdout();
     let mut chunk = [0_u8; 4096];
     let mut line_buffer = Vec::new();
     let mut render_state = OutputRenderState::default();
@@ -281,14 +287,9 @@ async fn forward_output_lines<T>(
         for &byte in &chunk[..bytes_read] {
             if inherit_output
                 && !output_failed
-                && let Err(error) = write_output_byte(
-                    &mut stdout,
-                    &source_label,
-                    byte,
-                    colorize,
-                    &mut render_state,
-                )
-                .await
+                && let Err(error) =
+                    write_output_byte(&output, &source_label, byte, colorize, &mut render_state)
+                        .await
             {
                 warn!("failed to write output for {}: {}", process_name, error);
                 output_failed = true;
@@ -306,6 +307,12 @@ async fn forward_output_lines<T>(
 
     if !line_buffer.is_empty() {
         process_output_line(&process_name, &line_buffer, &rules, &state);
+    }
+    if inherit_output
+        && !output_failed
+        && let Err(error) = flush_rendered_output(&output, &mut render_state, false).await
+    {
+        warn!("failed to flush output for {}: {}", process_name, error);
     }
 }
 
@@ -325,6 +332,7 @@ struct OutputRenderState {
     at_line_start: bool,
     last_was_carriage_return: bool,
     ansi_escape_state: AnsiEscapeState,
+    rendered_line: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +348,7 @@ impl OutputRenderState {
             at_line_start: true,
             last_was_carriage_return: false,
             ansi_escape_state: AnsiEscapeState::None,
+            rendered_line: String::new(),
         }
     }
 }
@@ -351,19 +360,17 @@ impl Default for OutputRenderState {
 }
 
 async fn write_output_byte<W>(
-    stdout: &mut W,
+    output: &Arc<Mutex<W>>,
     source_label: &str,
     byte: u8,
     colorize: bool,
     render_state: &mut OutputRenderState,
 ) -> std::io::Result<()>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send,
 {
     if byte == b'\r' {
-        stdout.write_all(b"\n").await?;
-        stdout.flush().await?;
-        render_state.at_line_start = true;
+        flush_rendered_output(output, render_state, true).await?;
         render_state.last_was_carriage_return = true;
         return Ok(());
     }
@@ -373,9 +380,7 @@ where
             render_state.last_was_carriage_return = false;
             return Ok(());
         }
-        stdout.write_all(b"\n").await?;
-        stdout.flush().await?;
-        render_state.at_line_start = true;
+        flush_rendered_output(output, render_state, true).await?;
         return Ok(());
     }
 
@@ -383,12 +388,39 @@ where
 
     if render_state.at_line_start {
         let prefix = format_output_prefix(source_label, colorize);
-        stdout.write_all(prefix.as_bytes()).await?;
+        render_state.rendered_line.push_str(&prefix);
         render_state.at_line_start = false;
     }
 
     let rendered = render_output_byte(byte, colorize, render_state);
-    stdout.write_all(rendered.as_bytes()).await?;
+    render_state.rendered_line.push_str(&rendered);
+    Ok(())
+}
+
+async fn flush_rendered_output<W>(
+    output: &Arc<Mutex<W>>,
+    render_state: &mut OutputRenderState,
+    add_newline: bool,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    if render_state.rendered_line.is_empty() && !add_newline {
+        return Ok(());
+    }
+
+    let mut writer = output.lock().await;
+    if !render_state.rendered_line.is_empty() {
+        writer
+            .write_all(render_state.rendered_line.as_bytes())
+            .await?;
+        render_state.rendered_line.clear();
+    }
+    if add_newline {
+        writer.write_all(b"\n").await?;
+    }
+    writer.flush().await?;
+    render_state.at_line_start = true;
     Ok(())
 }
 
@@ -691,8 +723,10 @@ mod tests {
     use super::*;
     use crate::config::{OutputExtract, ProbeSpec};
     use serde_json::Value;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::AsyncReadExt;
+    use tokio::sync::Mutex;
 
     fn unique_state_path() -> PathBuf {
         let unique = SystemTime::now()
@@ -769,15 +803,17 @@ mod tests {
 
     #[tokio::test]
     async fn write_output_byte_renders_carriage_return_as_visible_newline() {
-        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let (writer, mut reader) = tokio::io::duplex(64);
         let mut render_state = OutputRenderState {
             at_line_start: false,
             last_was_carriage_return: false,
             ansi_escape_state: AnsiEscapeState::None,
+            rendered_line: String::new(),
         };
+        let writer = Arc::new(Mutex::new(writer));
 
         write_output_byte(
-            &mut writer,
+            &writer,
             "css_watch tailwindcss",
             b'\r',
             false,
@@ -801,15 +837,17 @@ mod tests {
 
     #[tokio::test]
     async fn write_output_byte_suppresses_line_feed_after_carriage_return() {
-        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let (writer, mut reader) = tokio::io::duplex(64);
         let mut render_state = OutputRenderState {
             at_line_start: true,
             last_was_carriage_return: true,
             ansi_escape_state: AnsiEscapeState::None,
+            rendered_line: String::new(),
         };
+        let writer = Arc::new(Mutex::new(writer));
 
         write_output_byte(
-            &mut writer,
+            &writer,
             "css_watch tailwindcss",
             b'\n',
             false,
@@ -829,6 +867,29 @@ mod tests {
         assert_eq!(rendered, "");
         assert!(render_state.at_line_start);
         assert!(!render_state.last_was_carriage_return);
+    }
+
+    #[tokio::test]
+    async fn write_output_byte_flushes_complete_line_atomically() {
+        let (writer, mut reader) = tokio::io::duplex(256);
+        let mut render_state = OutputRenderState::new();
+        let writer = Arc::new(Mutex::new(writer));
+
+        for byte in b"alpha\n".iter().copied() {
+            write_output_byte(&writer, "echo python3", byte, false, &mut render_state)
+                .await
+                .expect("write byte");
+        }
+
+        drop(writer);
+
+        let mut rendered = String::new();
+        reader
+            .read_to_string(&mut rendered)
+            .await
+            .expect("read rendered output");
+
+        assert_eq!(rendered, "[echo python3] alpha\n");
     }
 
     #[test]
