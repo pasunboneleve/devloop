@@ -2,3 +2,4 @@
 set -euo pipefail
 
 cargo fmt
+git add -u
