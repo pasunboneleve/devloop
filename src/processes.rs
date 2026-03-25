@@ -13,8 +13,8 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::{
-    Config, HookSpec, OutputBodyStyle, OutputExtract, OutputRule, ProbeSpec, ProcessSpec,
-    RestartPolicy,
+    Config, HookOutputConfig, HookSpec, OutputBodyStyle, OutputExtract, OutputRule, ProbeSpec,
+    ProcessSpec, RestartPolicy,
 };
 use crate::output::{dim_start, format_output_prefix, should_colorize_output, style_reset};
 use crate::state::SessionState;
@@ -118,6 +118,9 @@ impl<'a> ProcessManager<'a> {
             .output()
             .await
             .with_context(|| format!("failed to run hook '{name}'"))?;
+        let source_label = process_output_source_label(name, &spec.command);
+        self.render_hook_output(&source_label, &spec.output, &output.stdout, &output.stderr)
+            .await;
         if !output.status.success() {
             return Err(anyhow!(
                 "hook '{name}' failed with status {}",
@@ -256,6 +259,46 @@ impl<'a> ProcessManager<'a> {
 
     pub fn initiate_shutdown(&mut self) {
         self.shutting_down = true;
+    }
+
+    async fn render_hook_output(
+        &self,
+        source_label: &str,
+        output: &HookOutputConfig,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) {
+        if !output.inherit {
+            return;
+        }
+
+        if let Err(error) = write_captured_output(
+            &OutputSink::Stdout(self.stdout.clone()),
+            source_label,
+            stdout,
+            output.body_style,
+        )
+        .await
+        {
+            warn!(
+                "failed to write hook stdout for {}: {}",
+                source_label, error
+            );
+        }
+
+        if let Err(error) = write_captured_output(
+            &OutputSink::Stderr(self.stderr.clone()),
+            source_label,
+            stderr,
+            output.body_style,
+        )
+        .await
+        {
+            warn!(
+                "failed to write hook stderr for {}: {}",
+                source_label, error
+            );
+        }
     }
 }
 
@@ -446,6 +489,49 @@ async fn flush_rendered_output(
             flush_rendered_output_to_writer(writer, render_state, add_newline).await
         }
     }
+}
+
+async fn write_captured_output(
+    output: &OutputSink,
+    source_label: &str,
+    bytes: &[u8],
+    body_style: OutputBodyStyle,
+) -> std::io::Result<()> {
+    match output {
+        OutputSink::Stdout(writer) => {
+            write_captured_output_to_writer(writer, source_label, bytes, body_style).await
+        }
+        OutputSink::Stderr(writer) => {
+            write_captured_output_to_writer(writer, source_label, bytes, body_style).await
+        }
+    }
+}
+
+async fn write_captured_output_to_writer<W>(
+    writer: &Arc<Mutex<W>>,
+    source_label: &str,
+    bytes: &[u8],
+    body_style: OutputBodyStyle,
+) -> std::io::Result<()>
+where
+    W: AsyncWriteExt + Unpin + Send,
+{
+    let colorize = should_colorize_output();
+    let mut render_state = OutputRenderState::default();
+
+    for &byte in bytes {
+        write_output_byte_to_writer(
+            writer,
+            source_label,
+            byte,
+            colorize,
+            body_style,
+            &mut render_state,
+        )
+        .await?;
+    }
+
+    flush_rendered_output_to_writer(writer, &mut render_state, false).await
 }
 
 async fn write_output_byte_to_writer<W>(
@@ -1160,6 +1246,36 @@ mod tests {
         assert!(rendered.starts_with("\u{1b}[1;"));
         assert!(rendered.contains("[echo python3]"));
         assert!(rendered.ends_with("\u{1b}[2malpha\u{1b}[0m\n"));
+    }
+
+    #[tokio::test]
+    async fn write_captured_output_dims_hook_body_by_default() {
+        let (writer, mut reader) = tokio::io::duplex(256);
+        let writer = Arc::new(Mutex::new(writer));
+
+        write_captured_output_to_writer(
+            &writer,
+            "build_css build-css.sh",
+            b"Done in 73ms\n",
+            OutputBodyStyle::Dim,
+        )
+        .await
+        .expect("write captured output");
+
+        drop(writer);
+
+        let mut rendered = String::new();
+        reader
+            .read_to_string(&mut rendered)
+            .await
+            .expect("read rendered output");
+
+        assert!(rendered.contains("[build_css build-css.sh]"));
+        if should_colorize_output() {
+            assert!(rendered.contains("\u{1b}[2mDone in 73ms\u{1b}[0m"));
+        } else {
+            assert!(rendered.ends_with("Done in 73ms\n"));
+        }
     }
 
     #[test]

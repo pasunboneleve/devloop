@@ -1,5 +1,6 @@
 # Docs
 
+- [Behavior Reference](behavior.md)
 - [Configuration Reference](configuration.md)
 
 This directory holds detailed reference material for `devloop`.

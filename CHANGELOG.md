@@ -4,11 +4,17 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-25
+
 ### Added
 - Source-labeled managed process output so mixed logs show which
   configured process and executable emitted each line.
 - Stable per-process label colors and dimmed managed-process bodies so
   `devloop` workflow and engine logs stand out by contrast.
+- Source-labeled hook stdout and stderr with dimmed bodies by default so
+  short-lived helper commands remain visible without dominating the main
+  process logs.
+- Detailed runtime behavior reference under [`docs/behavior.md`](docs/behavior.md).
 
 ### Fixed
 - Preserved UTF-8 multibyte characters in inherited subprocess output
