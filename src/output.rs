@@ -17,10 +17,6 @@ pub(crate) fn should_colorize_output() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
-pub(crate) fn dim_text(text: &str) -> String {
-    format!("\u{1b}[2m{text}\u{1b}[0m")
-}
-
 pub(crate) fn output_color_code(process_name: &str) -> u8 {
     const PALETTE: [u8; 6] = [31, 32, 33, 34, 36, 37];
     let mut hasher = DefaultHasher::new();
@@ -38,7 +34,7 @@ fn colorize_label(source_label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{dim_text, format_output_prefix, normalize_source_label, output_color_code};
+    use super::{format_output_prefix, normalize_source_label, output_color_code};
 
     #[test]
     fn normalize_source_label_rewrites_module_path() {
@@ -63,11 +59,6 @@ mod tests {
         assert!(rendered.contains("[tunnel cloudflared]"));
         assert!(rendered.starts_with("\u{1b}[1;"));
         assert!(rendered.ends_with(" "));
-    }
-
-    #[test]
-    fn dim_text_wraps_ansi_dim_sequence() {
-        assert_eq!(dim_text("ready"), "\u{1b}[2mready\u{1b}[0m");
     }
 
     #[test]

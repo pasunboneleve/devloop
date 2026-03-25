@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, Stdout};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Stderr, Stdout};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::config::{
     Config, HookSpec, OutputExtract, OutputRule, ProbeSpec, ProcessSpec, RestartPolicy,
 };
-use crate::output::{dim_text, format_output_prefix, should_colorize_output};
+use crate::output::{format_output_prefix, should_colorize_output};
 use crate::state::SessionState;
 
 pub struct ProcessManager<'a> {
@@ -23,7 +23,8 @@ pub struct ProcessManager<'a> {
     children: BTreeMap<String, ManagedProcess>,
     client: reqwest::Client,
     shutting_down: bool,
-    output: Arc<Mutex<Stdout>>,
+    stdout: Arc<Mutex<Stdout>>,
+    stderr: Arc<Mutex<Stderr>>,
 }
 
 struct ManagedProcess {
@@ -38,7 +39,8 @@ impl<'a> ProcessManager<'a> {
             children: BTreeMap::new(),
             client: reqwest::Client::new(),
             shutting_down: false,
-            output: Arc::new(Mutex::new(tokio::io::stdout())),
+            stdout: Arc::new(Mutex::new(tokio::io::stdout())),
+            stderr: Arc::new(Mutex::new(tokio::io::stderr())),
         }
     }
 
@@ -209,10 +211,12 @@ impl<'a> ProcessManager<'a> {
         let source_label = process_output_source_label(name, &spec.command);
         let inherit_output = spec.output.inherit;
         let rules = compile_output_rules(&spec.output.rules)?;
+        let stdout_sink = OutputSink::Stdout(self.stdout.clone());
+        let stderr_sink = OutputSink::Stderr(self.stderr.clone());
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(forward_output_lines(
                 stdout,
-                self.output.clone(),
+                stdout_sink,
                 process_name.clone(),
                 source_label.clone(),
                 inherit_output,
@@ -223,7 +227,7 @@ impl<'a> ProcessManager<'a> {
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(forward_output_lines(
                 stderr,
-                self.output.clone(),
+                stderr_sink,
                 process_name,
                 source_label,
                 inherit_output,
@@ -257,7 +261,7 @@ struct CompiledOutputRule {
 
 async fn forward_output_lines<T>(
     reader: T,
-    output: Arc<Mutex<Stdout>>,
+    output: OutputSink,
     process_name: String,
     source_label: String,
     inherit_output: bool,
@@ -319,12 +323,7 @@ async fn forward_output_lines<T>(
 #[cfg(test)]
 fn format_output_line(source_label: &str, line: &str, colorize: bool) -> String {
     let prefix = format_output_prefix(source_label, colorize);
-    let body = if colorize {
-        dim_text(line)
-    } else {
-        line.to_owned()
-    };
-    format!("{prefix}{body}")
+    format!("{prefix}{line}")
 }
 
 #[derive(Debug)]
@@ -359,18 +358,56 @@ impl Default for OutputRenderState {
     }
 }
 
-async fn write_output_byte<W>(
-    output: &Arc<Mutex<W>>,
+#[derive(Clone)]
+enum OutputSink {
+    Stdout(Arc<Mutex<Stdout>>),
+    Stderr(Arc<Mutex<Stderr>>),
+}
+
+async fn write_output_byte(
+    output: &OutputSink,
+    source_label: &str,
+    byte: u8,
+    colorize: bool,
+    render_state: &mut OutputRenderState,
+) -> std::io::Result<()> {
+    match output {
+        OutputSink::Stdout(writer) => {
+            write_output_byte_to_writer(writer, source_label, byte, colorize, render_state).await
+        }
+        OutputSink::Stderr(writer) => {
+            write_output_byte_to_writer(writer, source_label, byte, colorize, render_state).await
+        }
+    }
+}
+
+async fn flush_rendered_output(
+    output: &OutputSink,
+    render_state: &mut OutputRenderState,
+    add_newline: bool,
+) -> std::io::Result<()> {
+    match output {
+        OutputSink::Stdout(writer) => {
+            flush_rendered_output_to_writer(writer, render_state, add_newline).await
+        }
+        OutputSink::Stderr(writer) => {
+            flush_rendered_output_to_writer(writer, render_state, add_newline).await
+        }
+    }
+}
+
+async fn write_output_byte_to_writer<W>(
+    writer: &Arc<Mutex<W>>,
     source_label: &str,
     byte: u8,
     colorize: bool,
     render_state: &mut OutputRenderState,
 ) -> std::io::Result<()>
 where
-    W: AsyncWrite + Unpin + Send,
+    W: AsyncWriteExt + Unpin + Send,
 {
     if byte == b'\r' {
-        flush_rendered_output(output, render_state, true).await?;
+        flush_rendered_output_to_writer(writer, render_state, true).await?;
         render_state.last_was_carriage_return = true;
         return Ok(());
     }
@@ -380,7 +417,7 @@ where
             render_state.last_was_carriage_return = false;
             return Ok(());
         }
-        flush_rendered_output(output, render_state, true).await?;
+        flush_rendered_output_to_writer(writer, render_state, true).await?;
         return Ok(());
     }
 
@@ -397,19 +434,19 @@ where
     Ok(())
 }
 
-async fn flush_rendered_output<W>(
-    output: &Arc<Mutex<W>>,
+async fn flush_rendered_output_to_writer<W>(
+    writer: &Arc<Mutex<W>>,
     render_state: &mut OutputRenderState,
     add_newline: bool,
 ) -> std::io::Result<()>
 where
-    W: AsyncWrite + Unpin + Send,
+    W: AsyncWriteExt + Unpin + Send,
 {
     if render_state.rendered_line.is_empty() && !add_newline {
         return Ok(());
     }
 
-    let mut writer = output.lock().await;
+    let mut writer = writer.lock().await;
     if !render_state.rendered_line.is_empty() {
         writer
             .write_all(render_state.rendered_line.as_bytes())
@@ -454,7 +491,7 @@ fn render_output_byte(byte: u8, colorize: bool, render_state: &mut OutputRenderS
         return text;
     }
 
-    dim_text(&text)
+    text
 }
 
 fn process_output_byte_for_rules(
@@ -765,7 +802,7 @@ mod tests {
         let rendered = format_output_line("tunnel cloudflared", "INF ready", true);
 
         assert!(rendered.contains("[tunnel cloudflared]"));
-        assert!(rendered.contains("\u{1b}[2mINF ready\u{1b}[0m"));
+        assert!(rendered.ends_with("INF ready"));
         assert!(rendered.starts_with("\u{1b}[1;"));
     }
 
@@ -798,7 +835,7 @@ mod tests {
         ]
         .concat();
 
-        assert_eq!(rendered, "\u{1b}[34m\u{1b}[2mD\u{1b}[0m");
+        assert_eq!(rendered, "\u{1b}[34mD");
     }
 
     #[tokio::test]
@@ -812,7 +849,7 @@ mod tests {
         };
         let writer = Arc::new(Mutex::new(writer));
 
-        write_output_byte(
+        write_output_byte_to_writer(
             &writer,
             "css_watch tailwindcss",
             b'\r',
@@ -846,7 +883,7 @@ mod tests {
         };
         let writer = Arc::new(Mutex::new(writer));
 
-        write_output_byte(
+        write_output_byte_to_writer(
             &writer,
             "css_watch tailwindcss",
             b'\n',
@@ -876,7 +913,7 @@ mod tests {
         let writer = Arc::new(Mutex::new(writer));
 
         for byte in b"alpha\n".iter().copied() {
-            write_output_byte(&writer, "echo python3", byte, false, &mut render_state)
+            write_output_byte_to_writer(&writer, "echo python3", byte, false, &mut render_state)
                 .await
                 .expect("write byte");
         }

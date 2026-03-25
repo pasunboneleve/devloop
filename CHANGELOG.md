@@ -10,6 +10,14 @@ All notable changes to `devloop` will be recorded in this file.
 - Stable per-process label colors and dimmed managed-process bodies so
   `devloop` workflow and engine logs stand out by contrast.
 
+## [0.2.3] - 2026-03-25
+
+### Changed
+- Routed inherited child stdout and stderr to matching sinks instead of
+  collapsing them into a single output stream.
+- Stopped dimming inherited process output bodies so native subprocess
+  colors survive more cleanly.
+
 ## [0.2.2] - 2026-03-25
 
 ### Fixed
