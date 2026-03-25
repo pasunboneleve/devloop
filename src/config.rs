@@ -236,12 +236,21 @@ pub enum RestartPolicy {
     Always,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OutputConfig {
     #[serde(default = "default_true")]
     pub inherit: bool,
     #[serde(default)]
     pub rules: Vec<OutputRule>,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            inherit: true,
+            rules: Vec::new(),
+        }
+    }
 }
 
 impl OutputConfig {
@@ -506,5 +515,14 @@ mod tests {
 
         assert!(config.inherit);
         assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn process_spec_defaults_to_inherited_output_when_output_block_is_omitted() {
+        let process: ProcessSpec =
+            toml::from_str("command = [\"tailwindcss\", \"--watch\"]").expect("parse process");
+
+        assert!(process.output.inherit);
+        assert!(process.output.rules.is_empty());
     }
 }
