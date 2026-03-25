@@ -22,6 +22,10 @@ without hard-coding knowledge of any one repository.
   health checks, event routing, and ordered workflow execution.
 - Client repositories own context: watched path groups, named processes,
   workflows, and hook commands.
+- Terminal-native subprocess UIs are a non-goal. `devloop` is optimized
+  for line-oriented supervised output, source labeling, and output/state
+  extraction through pipes rather than PTY emulation or full-screen
+  terminal behavior.
 - Hooks should be narrow and data-oriented. Prefer stdout or JSON output
   over large shell scripts that orchestrate nested workflows.
 - Dynamic state that changes during a session, such as a tunnel URL,
