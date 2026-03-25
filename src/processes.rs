@@ -358,6 +358,7 @@ struct OutputRenderState {
     at_line_start: bool,
     last_was_carriage_return: bool,
     ansi_escape_state: AnsiEscapeState,
+    utf8_buffer: Vec<u8>,
     body_style: OutputBodyStyle,
     colorize: bool,
     dim_active: bool,
@@ -377,6 +378,7 @@ impl OutputRenderState {
             at_line_start: true,
             last_was_carriage_return: false,
             ansi_escape_state: AnsiEscapeState::None,
+            utf8_buffer: Vec::new(),
             body_style: OutputBodyStyle::Plain,
             colorize: false,
             dim_active: false,
@@ -501,6 +503,8 @@ async fn flush_rendered_output_to_writer<W>(
 where
     W: AsyncWriteExt + Unpin + Send,
 {
+    flush_pending_utf8(render_state);
+
     if render_state.rendered_line.is_empty() && !add_newline {
         return Ok(());
     }
@@ -532,10 +536,10 @@ fn render_output_byte(
     body_style: OutputBodyStyle,
     render_state: &mut OutputRenderState,
 ) -> String {
-    let text = String::from_utf8_lossy(&[byte]).into_owned();
-
     if byte == 0x1b {
+        let mut text = take_utf8_buffer_lossy(render_state);
         render_state.ansi_escape_state = AnsiEscapeState::AfterEsc;
+        text.push(byte as char);
         return text;
     }
 
@@ -546,24 +550,55 @@ fn render_output_byte(
             } else {
                 render_state.ansi_escape_state = AnsiEscapeState::None;
             }
-            return text;
+            return (byte as char).to_string();
         }
         AnsiEscapeState::InCsi => {
             if matches!(byte, 0x40..=0x7e) {
                 render_state.ansi_escape_state = AnsiEscapeState::None;
             }
-            return text;
+            return (byte as char).to_string();
         }
         AnsiEscapeState::None => {}
     }
 
-    if !colorize || byte.is_ascii_control() {
+    if byte.is_ascii_control() {
+        let mut text = take_utf8_buffer_lossy(render_state);
+        text.push(byte as char);
         return text;
     }
 
-    match body_style {
-        OutputBodyStyle::Plain | OutputBodyStyle::Dim => text,
+    let _ = colorize;
+    let _ = body_style;
+
+    render_state.utf8_buffer.push(byte);
+    take_complete_utf8(render_state)
+}
+
+fn take_complete_utf8(render_state: &mut OutputRenderState) -> String {
+    match std::str::from_utf8(&render_state.utf8_buffer) {
+        Ok(text) => {
+            let rendered = text.to_owned();
+            render_state.utf8_buffer.clear();
+            rendered
+        }
+        Err(error) if error.error_len().is_none() => String::new(),
+        Err(_) => take_utf8_buffer_lossy(render_state),
     }
+}
+
+fn flush_pending_utf8(render_state: &mut OutputRenderState) {
+    let pending = take_utf8_buffer_lossy(render_state);
+    render_state.rendered_line.push_str(&pending);
+}
+
+fn take_utf8_buffer_lossy(render_state: &mut OutputRenderState) -> String {
+    if render_state.utf8_buffer.is_empty() {
+        return String::new();
+    }
+
+    let rendered = String::from_utf8_lossy(&render_state.utf8_buffer).into_owned();
+    render_state.utf8_buffer.clear();
+    rendered
 }
 
 fn process_output_byte_for_rules(
@@ -930,6 +965,18 @@ mod tests {
         assert_eq!(rendered, "\u{1b}[34mD");
     }
 
+    #[test]
+    fn render_output_byte_preserves_utf8_multibyte_characters() {
+        let mut render_state = OutputRenderState::new();
+        let rendered = [0xCE_u8, 0xBC_u8, b's']
+            .into_iter()
+            .map(|byte| render_output_byte(byte, false, OutputBodyStyle::Plain, &mut render_state))
+            .collect::<String>();
+
+        assert_eq!(rendered, "\u{3bc}s");
+        assert!(render_state.utf8_buffer.is_empty());
+    }
+
     #[tokio::test]
     async fn write_output_byte_renders_carriage_return_as_visible_newline() {
         let (writer, mut reader) = tokio::io::duplex(64);
@@ -937,6 +984,7 @@ mod tests {
             at_line_start: false,
             last_was_carriage_return: false,
             ansi_escape_state: AnsiEscapeState::None,
+            utf8_buffer: Vec::new(),
             body_style: OutputBodyStyle::Plain,
             colorize: false,
             dim_active: false,
@@ -975,6 +1023,7 @@ mod tests {
             at_line_start: true,
             last_was_carriage_return: true,
             ansi_escape_state: AnsiEscapeState::None,
+            utf8_buffer: Vec::new(),
             body_style: OutputBodyStyle::Plain,
             colorize: false,
             dim_active: false,
@@ -1034,6 +1083,36 @@ mod tests {
             .expect("read rendered output");
 
         assert_eq!(rendered, "[echo python3] alpha\n");
+    }
+
+    #[tokio::test]
+    async fn write_output_byte_preserves_utf8_multibyte_characters() {
+        let (writer, mut reader) = tokio::io::duplex(256);
+        let mut render_state = OutputRenderState::new();
+        let writer = Arc::new(Mutex::new(writer));
+
+        for byte in "Done in 73μs\n".as_bytes().iter().copied() {
+            write_output_byte_to_writer(
+                &writer,
+                "css_watch tailwindcss",
+                byte,
+                false,
+                OutputBodyStyle::Plain,
+                &mut render_state,
+            )
+            .await
+            .expect("write byte");
+        }
+
+        drop(writer);
+
+        let mut rendered = String::new();
+        reader
+            .read_to_string(&mut rendered)
+            .await
+            .expect("read rendered output");
+
+        assert_eq!(rendered, "[css_watch tailwindcss] Done in 73μs\n");
     }
 
     #[tokio::test]

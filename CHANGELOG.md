@@ -10,6 +10,10 @@ All notable changes to `devloop` will be recorded in this file.
 - Stable per-process label colors and dimmed managed-process bodies so
   `devloop` workflow and engine logs stand out by contrast.
 
+### Fixed
+- Preserved UTF-8 multibyte characters in inherited subprocess output
+  so watch tools render units such as `μs` correctly.
+
 ## [0.3.0] - 2026-03-25
 
 ### Added
