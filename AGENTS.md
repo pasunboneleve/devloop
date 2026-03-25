@@ -40,6 +40,9 @@ without hard-coding knowledge of any one repository.
 ## Documentation expectations
 - Keep `README.md` focused on current goals and how to run the tool.
 - Keep `PLAN.md` aligned with the next reviewable milestones.
+- Record new functionality in `CHANGELOG.md` as part of the same change.
+- `devloop` uses semantic versioning. Update versions intentionally to
+  match the scope of delivered changes.
 - Record follow-up work in `bd`, not as free-form TODO comments.
 
 ## Session completion
