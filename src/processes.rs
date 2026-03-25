@@ -272,13 +272,9 @@ impl<'a> ProcessManager<'a> {
             return;
         }
 
-        if let Err(error) = write_captured_output(
-            &OutputSink::Stdout(self.stdout.clone()),
-            source_label,
-            stdout,
-            output.body_style,
-        )
-        .await
+        if let Err(error) =
+            write_captured_output_to_writer(&self.stdout, source_label, stdout, output.body_style)
+                .await
         {
             warn!(
                 "failed to write hook stdout for {}: {}",
@@ -286,13 +282,9 @@ impl<'a> ProcessManager<'a> {
             );
         }
 
-        if let Err(error) = write_captured_output(
-            &OutputSink::Stderr(self.stderr.clone()),
-            source_label,
-            stderr,
-            output.body_style,
-        )
-        .await
+        if let Err(error) =
+            write_captured_output_to_writer(&self.stderr, source_label, stderr, output.body_style)
+                .await
         {
             warn!(
                 "failed to write hook stderr for {}: {}",
@@ -487,22 +479,6 @@ async fn flush_rendered_output(
         }
         OutputSink::Stderr(writer) => {
             flush_rendered_output_to_writer(writer, render_state, add_newline).await
-        }
-    }
-}
-
-async fn write_captured_output(
-    output: &OutputSink,
-    source_label: &str,
-    bytes: &[u8],
-    body_style: OutputBodyStyle,
-) -> std::io::Result<()> {
-    match output {
-        OutputSink::Stdout(writer) => {
-            write_captured_output_to_writer(writer, source_label, bytes, body_style).await
-        }
-        OutputSink::Stderr(writer) => {
-            write_captured_output_to_writer(writer, source_label, bytes, body_style).await
         }
     }
 }
