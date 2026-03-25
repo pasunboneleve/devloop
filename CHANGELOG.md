@@ -2,6 +2,14 @@
 
 All notable changes to `devloop` will be recorded in this file.
 
+## [Unreleased]
+
+### Added
+- Source-labeled managed process output so mixed logs show which
+  configured process and executable emitted each line.
+- Stable per-process label colors and dimmed managed-process bodies so
+  `devloop` workflow and engine logs stand out by contrast.
+
 ## [0.2.0] - 2026-03-24
 
 ### Added

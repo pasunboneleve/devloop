@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -194,24 +196,21 @@ impl<'a> ProcessManager<'a> {
             &[],
             "startup",
         )?;
-        if spec.output.rules.is_empty() {
-            command.stdout(Stdio::inherit());
-            command.stderr(Stdio::inherit());
-        } else {
-            command.stdout(Stdio::piped());
-            command.stderr(Stdio::piped());
-        }
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to start process '{name}'"))?;
         clear_output_state_keys(&spec.output.rules, state)?;
         let process_name = name.to_owned();
+        let source_label = process_output_source_label(name, &spec.command);
         let inherit_output = spec.output.inherit;
         let rules = compile_output_rules(&spec.output.rules)?;
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(forward_output_lines(
                 stdout,
                 process_name.clone(),
+                source_label.clone(),
                 inherit_output,
                 rules.clone(),
                 state.clone(),
@@ -221,6 +220,7 @@ impl<'a> ProcessManager<'a> {
             tokio::spawn(forward_output_lines(
                 stderr,
                 process_name,
+                source_label,
                 inherit_output,
                 rules,
                 state.clone(),
@@ -253,28 +253,206 @@ struct CompiledOutputRule {
 async fn forward_output_lines<T>(
     reader: T,
     process_name: String,
+    source_label: String,
     inherit_output: bool,
     rules: Vec<CompiledOutputRule>,
     state: SessionState,
 ) where
     T: tokio::io::AsyncRead + Unpin,
 {
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if inherit_output {
-            println!("{line}");
-        }
-        for rule in &rules {
-            if let Some(value) = extract_output_value(rule, &line)
-                && let Err(error) = state.set(&rule.state_key, value.into())
-            {
-                warn!(
-                    "failed to persist output state for {} key {}: {}",
-                    process_name, rule.state_key, error
-                );
+    let colorize = should_colorize_output();
+    let mut reader = reader;
+    let mut stdout = tokio::io::stdout();
+    let mut chunk = [0_u8; 4096];
+    let mut line_buffer = Vec::new();
+    let mut at_line_start = true;
+    let mut last_was_carriage_return = false;
+    let mut output_failed = false;
+
+    loop {
+        let bytes_read = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                warn!("failed to read output for {}: {}", process_name, error);
+                break;
             }
+        };
+
+        for &byte in &chunk[..bytes_read] {
+            if inherit_output
+                && !output_failed
+                && let Err(error) = write_output_byte(
+                    &mut stdout,
+                    &process_name,
+                    &source_label,
+                    byte,
+                    colorize,
+                    &mut at_line_start,
+                )
+                .await
+            {
+                warn!("failed to write output for {}: {}", process_name, error);
+                output_failed = true;
+            }
+            process_output_byte_for_rules(
+                &process_name,
+                byte,
+                &mut line_buffer,
+                &mut last_was_carriage_return,
+                &rules,
+                &state,
+            );
         }
     }
+
+    if !line_buffer.is_empty() {
+        process_output_line(&process_name, &line_buffer, &rules, &state);
+    }
+}
+
+#[cfg(test)]
+fn format_output_line(source_label: &str, line: &str, colorize: bool) -> String {
+    if !colorize {
+        return format!("[{source_label}] {line}");
+    }
+
+    let label = colorize_label(source_label);
+    let body = dim_text(line);
+    format!("{label} {body}")
+}
+
+async fn write_output_byte(
+    stdout: &mut tokio::io::Stdout,
+    _process_name: &str,
+    source_label: &str,
+    byte: u8,
+    colorize: bool,
+    at_line_start: &mut bool,
+) -> std::io::Result<()> {
+    if *at_line_start {
+        let prefix = format_output_prefix(source_label, colorize);
+        stdout.write_all(prefix.as_bytes()).await?;
+        *at_line_start = false;
+    }
+
+    let rendered = render_output_byte(byte, colorize);
+    stdout.write_all(rendered.as_bytes()).await?;
+
+    if byte == b'\n' {
+        stdout.flush().await?;
+        *at_line_start = true;
+    } else if byte == b'\r' {
+        stdout.flush().await?;
+    }
+
+    Ok(())
+}
+
+fn format_output_prefix(source_label: &str, colorize: bool) -> String {
+    if !colorize {
+        return format!("[{source_label}] ");
+    }
+
+    format!("{} ", colorize_label(source_label))
+}
+
+fn render_output_byte(byte: u8, colorize: bool) -> String {
+    let text = String::from_utf8_lossy(&[byte]).into_owned();
+    if !colorize || byte.is_ascii_control() {
+        return text;
+    }
+    dim_text(&text)
+}
+
+fn process_output_byte_for_rules(
+    process_name: &str,
+    byte: u8,
+    line_buffer: &mut Vec<u8>,
+    last_was_carriage_return: &mut bool,
+    rules: &[CompiledOutputRule],
+    state: &SessionState,
+) {
+    if byte == b'\r' {
+        process_output_line(process_name, line_buffer, rules, state);
+        line_buffer.clear();
+        *last_was_carriage_return = true;
+        return;
+    }
+
+    if byte == b'\n' {
+        if !*last_was_carriage_return {
+            process_output_line(process_name, line_buffer, rules, state);
+            line_buffer.clear();
+        }
+        *last_was_carriage_return = false;
+        return;
+    }
+
+    *last_was_carriage_return = false;
+    line_buffer.push(byte);
+}
+
+fn process_output_line(
+    process_name: &str,
+    bytes: &[u8],
+    rules: &[CompiledOutputRule],
+    state: &SessionState,
+) {
+    let line = String::from_utf8_lossy(bytes)
+        .trim_end_matches(['\n', '\r'])
+        .to_owned();
+
+    for rule in rules {
+        if let Some(value) = extract_output_value(rule, &line)
+            && let Err(error) = state.set(&rule.state_key, value.into())
+        {
+            warn!(
+                "failed to persist output state for {} key {}: {}",
+                process_name, rule.state_key, error
+            );
+        }
+    }
+}
+
+fn process_output_source_label(name: &str, command: &[String]) -> String {
+    let executable = command
+        .first()
+        .map(|program| executable_display_name(program))
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!("{name} {executable}")
+}
+
+fn executable_display_name(program: &str) -> String {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(program)
+        .to_owned()
+}
+
+fn should_colorize_output() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn colorize_label(source_label: &str) -> String {
+    format!(
+        "\u{1b}[1;{}m[{}]\u{1b}[0m",
+        process_color_code(source_label),
+        source_label
+    )
+}
+
+fn dim_text(text: &str) -> String {
+    format!("\u{1b}[2m{text}\u{1b}[0m")
+}
+
+fn process_color_code(process_name: &str) -> u8 {
+    const PALETTE: [u8; 6] = [31, 32, 33, 34, 36, 37];
+    let mut hasher = DefaultHasher::new();
+    process_name.hash(&mut hasher);
+    PALETTE[(hasher.finish() as usize) % PALETTE.len()]
 }
 
 fn configure_command(
@@ -501,6 +679,125 @@ mod tests {
         );
 
         assert_eq!(value.as_deref(), Some("https://abc.trycloudflare.com"));
+    }
+
+    #[test]
+    fn format_output_line_prefixes_source() {
+        let rendered = format_output_line("tunnel cloudflared", "INF ready", false);
+
+        assert_eq!(rendered, "[tunnel cloudflared] INF ready");
+    }
+
+    #[test]
+    fn format_output_line_colors_label_and_dims_body() {
+        let rendered = format_output_line("tunnel cloudflared", "INF ready", true);
+
+        assert!(rendered.contains("[tunnel cloudflared]"));
+        assert!(rendered.contains("\u{1b}[2mINF ready\u{1b}[0m"));
+        assert!(rendered.starts_with("\u{1b}[1;"));
+    }
+
+    #[test]
+    fn render_output_byte_does_not_dim_newlines() {
+        assert_eq!(render_output_byte(b'\n', true), "\n");
+    }
+
+    #[test]
+    fn render_output_byte_does_not_dim_carriage_returns() {
+        assert_eq!(render_output_byte(b'\r', true), "\r");
+    }
+
+    #[test]
+    fn format_output_prefix_falls_back_without_color() {
+        assert_eq!(
+            format_output_prefix("tunnel cloudflared", false),
+            "[tunnel cloudflared] "
+        );
+    }
+
+    #[test]
+    fn process_output_source_label_uses_process_name_and_executable() {
+        let label = process_output_source_label(
+            "build_css",
+            &["./scripts/build-css.sh".into(), "--watch".into()],
+        );
+
+        assert_eq!(label, "build_css build-css.sh");
+    }
+
+    #[test]
+    fn executable_display_name_handles_plain_programs() {
+        assert_eq!(executable_display_name("cloudflared"), "cloudflared");
+    }
+
+    #[test]
+    fn process_color_code_is_stable_for_same_process() {
+        assert_eq!(process_color_code("tunnel"), process_color_code("tunnel"));
+    }
+
+    #[test]
+    fn process_output_byte_for_rules_handles_carriage_return_and_line_feed() {
+        let state_path = unique_state_path();
+        let state = SessionState::load(state_path.clone()).expect("load state");
+        let rules = vec![CompiledOutputRule {
+            regex: Some(Regex::new(r"(https://\S+)").expect("regex")),
+            state_key: "url".into(),
+            extract: OutputExtract::Regex,
+            capture_group: 1,
+        }];
+        let mut line_buffer = Vec::new();
+        let mut last_was_carriage_return = false;
+
+        for byte in b"https://example.test\r\n".iter().copied() {
+            process_output_byte_for_rules(
+                "tunnel",
+                byte,
+                &mut line_buffer,
+                &mut last_was_carriage_return,
+                &rules,
+                &state,
+            );
+        }
+
+        assert_eq!(
+            state.get_string("url").expect("get url").as_deref(),
+            Some("https://example.test")
+        );
+
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn process_output_byte_for_rules_leaves_incomplete_line_buffered() {
+        let state_path = unique_state_path();
+        let state = SessionState::load(state_path.clone()).expect("load state");
+        let rules = vec![CompiledOutputRule {
+            regex: Some(Regex::new(r"(https://\S+)").expect("regex")),
+            state_key: "url".into(),
+            extract: OutputExtract::Regex,
+            capture_group: 1,
+        }];
+        let mut line_buffer = Vec::new();
+        let mut last_was_carriage_return = false;
+
+        for byte in b"https://example.test".iter().copied() {
+            process_output_byte_for_rules(
+                "tunnel",
+                byte,
+                &mut line_buffer,
+                &mut last_was_carriage_return,
+                &rules,
+                &state,
+            );
+        }
+
+        assert_eq!(state.get_string("url").expect("get url"), None);
+        assert_eq!(
+            String::from_utf8(line_buffer).expect("utf8"),
+            "https://example.test"
+        );
+
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[tokio::test]

@@ -499,4 +499,12 @@ mod tests {
             .expect_err("missing nested workflow should fail");
         assert!(error.to_string().contains("missing workflow 'missing'"));
     }
+
+    #[test]
+    fn output_config_defaults_to_inherited_output() {
+        let config: OutputConfig = toml::from_str("").expect("parse default output config");
+
+        assert!(config.inherit);
+        assert!(config.rules.is_empty());
+    }
 }

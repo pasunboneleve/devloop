@@ -119,6 +119,23 @@ At the same time, the tunnel itself is described as a managed process:
 * the matched tunnel URL is written into session state
 * readiness waits for the state key to be populated
 * restart policy keeps the process alive if it exits
+* inherited process output is source-labeled without wrapper scripts
+
+When you need to identify which managed process emitted a line in mixed
+output, inherited process lines include the configured process name and
+executable automatically. The label is color-coded per process and the
+managed-process line body is dimmed so `devloop` engine output remains
+visually primary:
+
+```toml
+[process.tunnel]
+command = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:18080"]
+output = { inherit = true, rules = [{ state_key = "tunnel_url", extract = "url_token" }] }
+```
+
+That renders inherited lines with the process name and executable, for
+example `[tunnel cloudflared] ...`, using ANSI color when stdout is a
+terminal and `NO_COLOR` is not set.
 
 The client config can then compose derived values with `write_state`
 steps, for example:
