@@ -17,6 +17,28 @@ Most local setups become expensive to change:
 `devloop` keeps everything alive so you can change one thing at a
 time.
 
+## A concrete example
+
+Working on a blog post with a public preview:
+
+- change Rust -> the server rebuilds and restarts
+- the browser reconnects and reloads
+- `cloudflared` restarts -> new public URL
+- the current page path is combined with the new tunnel URL
+- the final URL is printed, ready to paste into LinkedIn validator
+
+One change -> everything updates -> copy and paste once.
+
+Without `devloop`:
+
+- restarting the server does not automatically coordinate the rest of the loop
+- you still need to manage CSS rebuilds separately
+- the tunnel keeps the old URL unless you restart `cloudflared` yourself
+- you rebuild the full public URL by hand every time
+
+The pieces exist.  
+They just don’t know about each other.
+
 ## What it feels like
 
 You are working on a system with multiple processes:
@@ -28,18 +50,15 @@ You start `devloop` once.
 
 Then:
 
-- edit a markdown file → the page updates
-- change Rust code → the server restarts, everything else stays alive
-- update CSS → a one-shot build runs
+- edit a markdown file -> the page updates
+- change Rust code -> the server restarts and the loop stays coordinated
+- update CSS -> a one-shot build runs
 
 No manual restarts.\
 No lost state.\
 No remembering which script to run.
 
-The scripts still exist — but they’re no longer part of your mental loop.
-
-The system still has moving parts.\
-You just don’t have to move them.
+The scripts still exist, but they’re no longer part of your mental loop.
 
 ## Install
 
