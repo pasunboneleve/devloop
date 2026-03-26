@@ -42,6 +42,10 @@ without hard-coding knowledge of any one repository.
   for line-oriented supervised output, source labeling, and output/state
   extraction through pipes rather than PTY emulation or full-screen
   terminal behavior.
+- Silent failure is unacceptable. Every user-visible path should have a
+  corresponding sad path with explicit, observable failure behavior:
+  non-zero exits, surfaced errors, timeouts, logs, or other signals
+  that make the failure diagnosable instead of disappearing quietly.
 - When forwarding inherited process output, prefer visible output over
   suppressing noise. Carriage-return-driven updates should be rendered
   as visible labeled lines; if a tool is too noisy, fix that at the
