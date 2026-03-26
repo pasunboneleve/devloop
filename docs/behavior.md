@@ -102,6 +102,15 @@ Hooks are one-shot commands executed inside workflows.
 - A non-zero hook exit status fails the workflow after any captured
   stdout and stderr have been rendered.
 
+Hooks can also be observed outside workflows.
+
+- If `hook.<name>.observe` is configured, the runtime polls that hook on
+  the configured interval during normal maintenance ticks.
+- If running the hook changes session state, the configured observe
+  workflow is scheduled immediately.
+- If the hook leaves session state unchanged, no follow-up workflow is
+  run.
+
 ## Output rendering
 
 `devloop` uses a line-oriented, pipe-based output model.

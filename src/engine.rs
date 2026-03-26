@@ -45,6 +45,7 @@ trait RuntimeEffectAdapter {
     async fn run_workflow(&mut self, workflow_name: &str, changed_files: &[String]) -> Result<()>;
     async fn start_watching(&mut self) -> Result<()>;
     async fn maintain_processes(&mut self) -> Result<()>;
+    async fn poll_observed_hook(&mut self, hook: &str) -> Result<bool>;
     async fn log_info(&mut self, message: String) -> Result<()>;
     async fn stop_all_processes(&mut self) -> Result<()>;
 }
@@ -84,7 +85,8 @@ impl Engine {
             NotifyConfig::default(),
         )?;
         let mut maintain_tick = tokio::time::interval(Duration::from_secs(1));
-        let mut runtime = RuntimeMachine::new();
+        let mut runtime = RuntimeMachine::new(&self.config);
+        let runtime_start = Instant::now();
         runtime.handle_event(RuntimeEvent::Start {
             root_display: self.config.root.display().to_string(),
             startup_workflows: self.config.startup_workflows.clone(),
@@ -108,7 +110,9 @@ impl Engine {
                     }
                 }
                 _ = maintain_tick.tick() => {
-                    runtime.handle_event(RuntimeEvent::MaintainTick);
+                    runtime.handle_event(RuntimeEvent::MaintainTick {
+                        now_ms: runtime_start.elapsed().as_millis() as u64,
+                    });
                     if execute_runtime_effects(&mut runtime, &mut adapter).await? {
                         return Ok(());
                     }
@@ -210,6 +214,12 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
         self.processes.maintain(self.state).await
     }
 
+    async fn poll_observed_hook(&mut self, hook: &str) -> Result<bool> {
+        self.processes
+            .run_observed_hook(hook, self.state, &[], "observe")
+            .await
+    }
+
     async fn log_info(&mut self, message: String) -> Result<()> {
         info!("{}", message);
         Ok(())
@@ -234,6 +244,14 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
             } => adapter.run_workflow(&workflow_name, &changed_files).await?,
             RuntimeEffect::StartWatching => adapter.start_watching().await?,
             RuntimeEffect::MaintainProcesses => adapter.maintain_processes().await?,
+            RuntimeEffect::PollObservedHook {
+                hook,
+                workflow_name,
+            } => {
+                if adapter.poll_observed_hook(&hook).await? {
+                    runtime.handle_event(RuntimeEvent::ObservedHookChanged { workflow_name });
+                }
+            }
             RuntimeEffect::LogInfo { message } => adapter.log_info(message).await?,
             RuntimeEffect::StopAllProcesses => adapter.stop_all_processes().await?,
             RuntimeEffect::Exit => return Ok(true),
@@ -729,11 +747,15 @@ mod tests {
 
     struct MockRuntimeAdapter {
         calls: Vec<String>,
+        changed_hooks: BTreeMap<String, bool>,
     }
 
     impl MockRuntimeAdapter {
         fn new() -> Self {
-            Self { calls: Vec::new() }
+            Self {
+                calls: Vec::new(),
+                changed_hooks: BTreeMap::new(),
+            }
         }
     }
 
@@ -770,6 +792,11 @@ mod tests {
             Ok(())
         }
 
+        async fn poll_observed_hook(&mut self, hook: &str) -> Result<bool> {
+            self.calls.push(format!("poll:{hook}"));
+            Ok(self.changed_hooks.get(hook).copied().unwrap_or(false))
+        }
+
         async fn log_info(&mut self, message: String) -> Result<()> {
             self.calls.push(format!("log:{message}"));
             Ok(())
@@ -783,7 +810,36 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_machine_can_run_against_mock_adapter() {
-        let mut runtime = RuntimeMachine::new();
+        let mut config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.hook.insert(
+            "current_post_slug".into(),
+            crate::config::HookSpec {
+                command: vec!["./scripts/current-post-slug.sh".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                output: crate::config::HookOutputConfig::default(),
+                capture: Some(crate::config::CaptureMode::Text),
+                state_key: Some("current_post_slug".into()),
+                observe: Some(crate::config::ObservedHookSpec {
+                    workflow: "publish_post_url".into(),
+                    interval_ms: 500,
+                }),
+            },
+        );
+        let mut adapter = MockRuntimeAdapter::new();
+        adapter
+            .changed_hooks
+            .insert("current_post_slug".into(), true);
+        let mut runtime = RuntimeMachine::new(&config);
         runtime.handle_event(RuntimeEvent::Start {
             root_display: "/tmp/example".into(),
             startup_workflows: vec!["startup".into()],
@@ -792,13 +848,18 @@ mod tests {
         let mut workflows = BTreeMap::new();
         workflows.insert("rust".into(), vec!["src/main.rs".into()]);
         runtime.handle_event(RuntimeEvent::WatchChanges { workflows });
-        runtime.handle_event(RuntimeEvent::MaintainTick);
-        runtime.handle_event(RuntimeEvent::CtrlC);
+        runtime.handle_event(RuntimeEvent::MaintainTick { now_ms: 500 });
 
-        let mut adapter = MockRuntimeAdapter::new();
         let exit = execute_runtime_effects(&mut runtime, &mut adapter)
             .await
             .expect("execute runtime effects");
+
+        assert!(!exit);
+
+        runtime.handle_event(RuntimeEvent::CtrlC);
+        let exit = execute_runtime_effects(&mut runtime, &mut adapter)
+            .await
+            .expect("execute runtime effects after ctrl-c");
 
         assert!(exit);
         assert_eq!(
@@ -810,8 +871,64 @@ mod tests {
                 "watch",
                 "workflow:rust:src/main.rs",
                 "maintain",
+                "poll:current_post_slug",
+                "workflow:publish_post_url:",
                 "log:received ctrl-c, shutting down",
                 "stop_all",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_machine_does_not_run_observed_workflow_when_hook_state_is_unchanged() {
+        let mut config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.hook.insert(
+            "current_post_slug".into(),
+            crate::config::HookSpec {
+                command: vec!["./scripts/current-post-slug.sh".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                output: crate::config::HookOutputConfig::default(),
+                capture: Some(crate::config::CaptureMode::Text),
+                state_key: Some("current_post_slug".into()),
+                observe: Some(crate::config::ObservedHookSpec {
+                    workflow: "publish_post_url".into(),
+                    interval_ms: 500,
+                }),
+            },
+        );
+        let mut runtime = RuntimeMachine::new(&config);
+        runtime.handle_event(RuntimeEvent::Start {
+            root_display: "/tmp/example".into(),
+            startup_workflows: vec![],
+        });
+        let mut adapter = MockRuntimeAdapter::new();
+        execute_runtime_effects(&mut runtime, &mut adapter)
+            .await
+            .expect("execute startup effects");
+
+        runtime.handle_event(RuntimeEvent::MaintainTick { now_ms: 500 });
+        execute_runtime_effects(&mut runtime, &mut adapter)
+            .await
+            .expect("execute maintenance effects");
+
+        assert_eq!(
+            adapter.calls,
+            vec![
+                "persist:root",
+                "autostart",
+                "watch",
+                "maintain",
+                "poll:current_post_slug"
             ]
         );
     }

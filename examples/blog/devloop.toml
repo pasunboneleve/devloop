@@ -55,6 +55,7 @@ cwd = "."
 env = { PORT = "18080" }
 capture = "text"
 state_key = "current_post_slug"
+observe = { workflow = "publish_post_url", interval_ms = 1000 }
 
 [workflow.publish_post_url]
 steps = [

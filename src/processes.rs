@@ -138,6 +138,19 @@ impl<'a> ProcessManager<'a> {
         apply_hook_capture(spec, stdout.trim(), state)
     }
 
+    pub async fn run_observed_hook(
+        &self,
+        name: &str,
+        state: &SessionState,
+        changed_files: &[String],
+        workflow: &str,
+    ) -> Result<bool> {
+        let before = state.snapshot()?;
+        self.run_hook(name, state, changed_files, workflow).await?;
+        let after = state.snapshot()?;
+        Ok(before != after)
+    }
+
     pub async fn stop_all(&mut self, state: &SessionState) -> Result<()> {
         self.initiate_shutdown();
         for effect in self.supervisor.on_shutdown() {

@@ -4,6 +4,11 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Added
+- Added observed hooks, allowing a hook to be polled on the runtime
+  maintenance tick and trigger a workflow only when its session-state
+  output changes.
+
 ### Changed
 - Moved workflow progression into a pure state/effect core so ordered
   workflow execution is planned through explicit transition data before

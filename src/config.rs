@@ -74,6 +74,14 @@ impl Config {
         for (name, hook) in &self.hook {
             hook.validate()
                 .with_context(|| format!("invalid hook '{name}'"))?;
+            if let Some(observe) = &hook.observe
+                && !self.workflow.contains_key(&observe.workflow)
+            {
+                return Err(anyhow!(
+                    "hook '{name}' observes missing workflow '{}'",
+                    observe.workflow
+                ));
+            }
         }
         for (name, workflow) in &self.workflow {
             workflow
@@ -314,6 +322,8 @@ pub struct HookSpec {
     pub output: HookOutputConfig,
     pub capture: Option<CaptureMode>,
     pub state_key: Option<String>,
+    #[serde(default)]
+    pub observe: Option<ObservedHookSpec>,
 }
 
 impl HookSpec {
@@ -324,6 +334,30 @@ impl HookSpec {
         self.output.validate()?;
         if matches!(self.capture, Some(CaptureMode::Text)) && self.state_key.is_none() {
             return Err(anyhow!("text capture requires state_key"));
+        }
+        if let Some(observe) = &self.observe {
+            observe.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObservedHookSpec {
+    pub workflow: String,
+    #[serde(default = "default_observe_interval_ms")]
+    pub interval_ms: u64,
+}
+
+impl ObservedHookSpec {
+    fn validate(&self) -> Result<()> {
+        if self.workflow.trim().is_empty() {
+            return Err(anyhow!("observed hook workflow must not be empty"));
+        }
+        if self.interval_ms == 0 {
+            return Err(anyhow!(
+                "observed hook interval_ms must be greater than zero"
+            ));
         }
         Ok(())
     }
@@ -493,6 +527,10 @@ fn default_hook_output_config() -> HookOutputConfig {
     }
 }
 
+fn default_observe_interval_ms() -> u64 {
+    1_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,5 +641,53 @@ mod tests {
             toml::from_str("body_style = \"plain\"").expect("parse hook output config");
 
         assert_eq!(config.body_style, OutputBodyStyle::Plain);
+    }
+
+    #[test]
+    fn hook_observe_defaults_interval() {
+        let observe: ObservedHookSpec =
+            toml::from_str("workflow = \"publish\"").expect("parse observe config");
+
+        assert_eq!(observe.workflow, "publish");
+        assert_eq!(observe.interval_ms, 1_000);
+    }
+
+    #[test]
+    fn validate_rejects_missing_observed_workflow() {
+        let mut config = base_config();
+        config.watch.insert(
+            "content".into(),
+            WatchGroup {
+                paths: vec!["content/**/*.md".into()],
+                workflow: Some("content".into()),
+            },
+        );
+        config.workflow.insert(
+            "content".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "content".into(),
+                    style: LogStyle::Plain,
+                }],
+            },
+        );
+        config.hook.insert(
+            "current_post_slug".into(),
+            HookSpec {
+                command: vec!["./scripts/current-post-slug.sh".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                output: HookOutputConfig::default(),
+                capture: Some(CaptureMode::Text),
+                state_key: Some("current_post_slug".into()),
+                observe: Some(ObservedHookSpec {
+                    workflow: "publish".into(),
+                    interval_ms: 1_000,
+                }),
+            },
+        );
+
+        let error = config.validate().expect_err("validation should fail");
+        assert!(error.to_string().contains("observes missing workflow"));
     }
 }

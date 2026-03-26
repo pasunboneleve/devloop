@@ -138,6 +138,7 @@ cwd = "."
 output = { inherit = true, body_style = "dim" }
 capture = "text"
 state_key = "current_post_slug"
+observe = { workflow = "publish_post_url", interval_ms = 1000 }
 ```
 
 ### Hook keys
@@ -148,6 +149,8 @@ state_key = "current_post_slug"
 - `output`: inherited-output behavior for hook stdout and stderr.
 - `capture`: one of `ignore`, `text`, or `json`.
 - `state_key`: required for `capture = "text"`.
+- `observe`: optional polling behavior that reruns a workflow when the
+  hook changes session state.
 
 ### Hook output config
 
@@ -163,6 +166,22 @@ output = { inherit = true, body_style = "dim" }
 Hooks default to dimmed inherited output because they are typically
 short-lived helper commands whose output is useful context but not the
 primary long-running log stream.
+
+### Observed hooks
+
+```toml
+observe = { workflow = "publish_post_url", interval_ms = 1000 }
+```
+
+- `workflow`: workflow to run when a poll of the hook changes session
+  state. Required.
+- `interval_ms`: poll interval while `devloop` is running. Default:
+  `1000`.
+
+Observed hooks are useful when some external state change is not a file
+watch event, for example browser navigation that is reported back to a
+local development server. `devloop` runs the hook on the maintain tick;
+if the hook updates session state, the configured workflow is run.
 
 ### Hook capture modes
 

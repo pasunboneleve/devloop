@@ -171,6 +171,21 @@ Repeated setup can be factored into helper workflows and reused with
 `run_workflow`, for example a `publish_post_url` workflow that waits for
 the tunnel and then writes the derived URL.
 
+Hooks can also be observed on the runtime tick when external state
+changes are not represented by file edits. For example:
+
+```toml
+[hook.current_post_slug]
+command = ["./scripts/current-post-slug.sh"]
+capture = "text"
+state_key = "current_post_slug"
+observe = { workflow = "publish_post_url", interval_ms = 1000 }
+```
+
+That lets a helper hook refresh session state from something like a
+development server endpoint, and rerun the follow-up workflow only when
+the state actually changes.
+
 ---
 
 ## Known gap

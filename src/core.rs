@@ -56,6 +56,7 @@ pub enum WorkflowEffect {
 pub struct RuntimeMachine {
     phase: RuntimePhase,
     pending_effects: VecDeque<RuntimeEffect>,
+    observed_hooks: BTreeMap<String, ObservedHookRuntimeState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +75,12 @@ pub enum RuntimeEvent {
     WatchChanges {
         workflows: BTreeMap<String, Vec<String>>,
     },
-    MaintainTick,
+    MaintainTick {
+        now_ms: u64,
+    },
+    ObservedHookChanged {
+        workflow_name: String,
+    },
     CtrlC,
 }
 
@@ -91,11 +97,22 @@ pub enum RuntimeEffect {
     },
     StartWatching,
     MaintainProcesses,
+    PollObservedHook {
+        hook: String,
+        workflow_name: String,
+    },
     LogInfo {
         message: String,
     },
     StopAllProcesses,
     Exit,
+}
+
+#[derive(Debug, Clone)]
+struct ObservedHookRuntimeState {
+    workflow_name: String,
+    interval_ms: u64,
+    last_polled_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -250,10 +267,27 @@ impl WorkflowMachine {
 }
 
 impl RuntimeMachine {
-    pub fn new() -> Self {
+    pub fn new(config: &Config) -> Self {
+        let observed_hooks = config
+            .hook
+            .iter()
+            .filter_map(|(name, spec)| {
+                spec.observe.as_ref().map(|observe| {
+                    (
+                        name.clone(),
+                        ObservedHookRuntimeState {
+                            workflow_name: observe.workflow.clone(),
+                            interval_ms: observe.interval_ms,
+                            last_polled_ms: None,
+                        },
+                    )
+                })
+            })
+            .collect();
         Self {
             phase: RuntimePhase::Initializing,
             pending_effects: VecDeque::new(),
+            observed_hooks,
         }
     }
 
@@ -292,11 +326,33 @@ impl RuntimeMachine {
                     });
                 }
             }
-            RuntimeEvent::MaintainTick => {
+            RuntimeEvent::MaintainTick { now_ms } => {
                 if self.phase == RuntimePhase::Running {
                     self.pending_effects
                         .push_back(RuntimeEffect::MaintainProcesses);
+                    for (hook, observed) in &mut self.observed_hooks {
+                        if observed
+                            .last_polled_ms
+                            .is_none_or(|last| now_ms.saturating_sub(last) >= observed.interval_ms)
+                        {
+                            observed.last_polled_ms = Some(now_ms);
+                            self.pending_effects
+                                .push_back(RuntimeEffect::PollObservedHook {
+                                    hook: hook.clone(),
+                                    workflow_name: observed.workflow_name.clone(),
+                                });
+                        }
+                    }
                 }
+            }
+            RuntimeEvent::ObservedHookChanged { workflow_name } => {
+                if self.phase != RuntimePhase::Running {
+                    return;
+                }
+                self.pending_effects.push_front(RuntimeEffect::RunWorkflow {
+                    workflow_name,
+                    changed_files: Vec::new(),
+                });
             }
             RuntimeEvent::CtrlC => {
                 if self.phase == RuntimePhase::Stopped {
@@ -655,7 +711,8 @@ mod tests {
 
     #[test]
     fn runtime_machine_plans_startup_sequence() {
-        let mut runtime = RuntimeMachine::new();
+        let config = base_config();
+        let mut runtime = RuntimeMachine::new(&config);
         runtime.handle_event(RuntimeEvent::Start {
             root_display: "/tmp/example".into(),
             startup_workflows: vec!["startup".into(), "publish".into()],
@@ -692,7 +749,8 @@ mod tests {
 
     #[test]
     fn runtime_machine_plans_watch_tick_and_shutdown() {
-        let mut runtime = RuntimeMachine::new();
+        let config = base_config();
+        let mut runtime = RuntimeMachine::new(&config);
         runtime.handle_event(RuntimeEvent::Start {
             root_display: "/tmp/example".into(),
             startup_workflows: vec![],
@@ -702,7 +760,7 @@ mod tests {
         let mut workflows = BTreeMap::new();
         workflows.insert("rust".into(), vec!["src/main.rs".into()]);
         runtime.handle_event(RuntimeEvent::WatchChanges { workflows });
-        runtime.handle_event(RuntimeEvent::MaintainTick);
+        runtime.handle_event(RuntimeEvent::MaintainTick { now_ms: 1_000 });
         runtime.handle_event(RuntimeEvent::CtrlC);
 
         assert_eq!(
@@ -724,6 +782,68 @@ mod tests {
         );
         assert_eq!(runtime.next_effect(), Some(RuntimeEffect::StopAllProcesses));
         assert_eq!(runtime.next_effect(), Some(RuntimeEffect::Exit));
+        assert_eq!(runtime.next_effect(), None);
+    }
+
+    #[test]
+    fn runtime_machine_polls_observed_hooks_and_runs_workflow_on_change() {
+        let mut config = base_config();
+        config.hook.insert(
+            "current_post_slug".into(),
+            crate::config::HookSpec {
+                command: vec!["./scripts/current-post-slug.sh".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                output: crate::config::HookOutputConfig::default(),
+                capture: Some(crate::config::CaptureMode::Text),
+                state_key: Some("current_post_slug".into()),
+                observe: Some(crate::config::ObservedHookSpec {
+                    workflow: "publish_post_url".into(),
+                    interval_ms: 500,
+                }),
+            },
+        );
+        config.workflow.insert(
+            "publish_post_url".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "announce".into(),
+                    style: LogStyle::Plain,
+                }],
+            },
+        );
+
+        let mut runtime = RuntimeMachine::new(&config);
+        runtime.handle_event(RuntimeEvent::Start {
+            root_display: "/tmp/example".into(),
+            startup_workflows: vec![],
+        });
+        while runtime.next_effect().is_some() {}
+
+        runtime.handle_event(RuntimeEvent::MaintainTick { now_ms: 500 });
+        assert_eq!(
+            runtime.next_effect(),
+            Some(RuntimeEffect::MaintainProcesses)
+        );
+        assert_eq!(
+            runtime.next_effect(),
+            Some(RuntimeEffect::PollObservedHook {
+                hook: "current_post_slug".into(),
+                workflow_name: "publish_post_url".into(),
+            })
+        );
+        assert_eq!(runtime.next_effect(), None);
+
+        runtime.handle_event(RuntimeEvent::ObservedHookChanged {
+            workflow_name: "publish_post_url".into(),
+        });
+        assert_eq!(
+            runtime.next_effect(),
+            Some(RuntimeEffect::RunWorkflow {
+                workflow_name: "publish_post_url".into(),
+                changed_files: Vec::new(),
+            })
+        );
         assert_eq!(runtime.next_effect(), None);
     }
 
