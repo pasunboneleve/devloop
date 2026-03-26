@@ -58,9 +58,7 @@ while time.time() < deadline:
 raise SystemExit("timed out waiting for watcher startup")
 PY
 
-printf 'updated\n' > "${tmp_dir}/watched.txt"
-
-python3 - "$state_path" "$log_path" <<'PY'
+python3 - "$state_path" "$log_path" "${tmp_dir}/watched.txt" <<'PY'
 import json
 import pathlib
 import sys
@@ -68,8 +66,14 @@ import time
 
 state_path = pathlib.Path(sys.argv[1])
 log_path = pathlib.Path(sys.argv[2])
+watched_path = pathlib.Path(sys.argv[3])
 deadline = time.time() + 15
+next_write = 0.0
 while time.time() < deadline:
+    now = time.time()
+    if now >= next_write:
+        watched_path.write_text("updated\n")
+        next_write = now + 0.5
     if state_path.exists():
         data = json.loads(state_path.read_text())
         if (
