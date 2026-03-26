@@ -10,6 +10,9 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
+use pulldown_cmark::{
+    CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Parser as MarkdownParser, Tag, TagEnd,
+};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::FmtContext;
@@ -83,7 +86,7 @@ async fn main() -> Result<()> {
             Engine::new(config).run().await?;
         }
         Command::Docs { topic } => {
-            print!("{}", docs_text(topic));
+            print!("{}", render_docs_text(topic));
         }
     }
     Ok(())
@@ -151,9 +154,192 @@ fn docs_text(topic: DocsTopic) -> &'static str {
     }
 }
 
+fn render_docs_text(topic: DocsTopic) -> String {
+    render_markdown_for_terminal(docs_text(topic))
+}
+
+fn render_markdown_for_terminal(markdown: &str) -> String {
+    #[derive(Default)]
+    struct RenderState {
+        output: String,
+        heading_level: Option<HeadingLevel>,
+        in_code_block: bool,
+        in_link: bool,
+        pending_link_destination: Option<String>,
+        list_depth: usize,
+        in_item: bool,
+        needs_blank_line: bool,
+        at_line_start: bool,
+    }
+
+    impl RenderState {
+        fn ensure_blank_line(&mut self) {
+            if self.output.is_empty() {
+                return;
+            }
+            if !self.output.ends_with("\n\n") {
+                if !self.output.ends_with('\n') {
+                    self.output.push('\n');
+                }
+                self.output.push('\n');
+            }
+            self.at_line_start = true;
+        }
+
+        fn ensure_line_start(&mut self) {
+            if !self.at_line_start {
+                self.output.push('\n');
+                self.at_line_start = true;
+            }
+        }
+
+        fn push_text(&mut self, text: &str) {
+            if text.is_empty() {
+                return;
+            }
+            if self.at_line_start && self.in_item {
+                let indent = "  ".repeat(self.list_depth.saturating_sub(1));
+                self.output.push_str(&indent);
+                self.output.push_str("- ");
+                self.at_line_start = false;
+            }
+            self.output.push_str(text);
+            self.at_line_start = false;
+        }
+    }
+
+    let mut state = RenderState::default();
+
+    for event in MarkdownParser::new(markdown) {
+        match event {
+            MarkdownEvent::Start(Tag::Heading { level, .. }) => {
+                state.ensure_blank_line();
+                state.heading_level = Some(level);
+            }
+            MarkdownEvent::End(TagEnd::Heading(_)) => {
+                state.output.push('\n');
+                state.output.push('\n');
+                state.at_line_start = true;
+                state.heading_level = None;
+            }
+            MarkdownEvent::Start(Tag::Paragraph) => {
+                if state.needs_blank_line {
+                    state.ensure_blank_line();
+                    state.needs_blank_line = false;
+                }
+            }
+            MarkdownEvent::End(TagEnd::Paragraph) => {
+                state.output.push('\n');
+                state.output.push('\n');
+                state.at_line_start = true;
+            }
+            MarkdownEvent::Start(Tag::List(_)) => {
+                state.ensure_blank_line();
+                state.list_depth += 1;
+            }
+            MarkdownEvent::End(TagEnd::List(_)) => {
+                state.list_depth = state.list_depth.saturating_sub(1);
+                state.output.push('\n');
+                state.at_line_start = true;
+            }
+            MarkdownEvent::Start(Tag::Item) => {
+                state.in_item = true;
+            }
+            MarkdownEvent::End(TagEnd::Item) => {
+                state.output.push('\n');
+                state.at_line_start = true;
+                state.in_item = false;
+            }
+            MarkdownEvent::Start(Tag::CodeBlock(kind)) => {
+                state.ensure_blank_line();
+                if let CodeBlockKind::Fenced(info) = kind
+                    && !info.is_empty()
+                {
+                    state.push_text(&format!("[{info}]"));
+                    state.output.push('\n');
+                    state.at_line_start = true;
+                }
+                state.in_code_block = true;
+            }
+            MarkdownEvent::End(TagEnd::CodeBlock) => {
+                state.output.push('\n');
+                state.at_line_start = true;
+                state.in_code_block = false;
+                state.needs_blank_line = true;
+            }
+            MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
+                state.in_link = true;
+                state.pending_link_destination = Some(dest_url.to_string());
+            }
+            MarkdownEvent::End(TagEnd::Link) => {
+                if let Some(dest) = state.pending_link_destination.take() {
+                    state.push_text(&format!(" ({dest})"));
+                }
+                state.in_link = false;
+            }
+            MarkdownEvent::Text(text) => {
+                let rendered = if state.in_code_block {
+                    text.lines()
+                        .map(|line| format!("    {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else if let Some(level) = state.heading_level {
+                    format_heading(&text, level)
+                } else {
+                    text.to_string()
+                };
+                state.push_text(&rendered);
+            }
+            MarkdownEvent::Code(text) => {
+                state.push_text(&format!("`{text}`"));
+            }
+            MarkdownEvent::SoftBreak => {
+                if state.in_code_block {
+                    state.output.push('\n');
+                    state.at_line_start = true;
+                } else {
+                    state.push_text(" ");
+                }
+            }
+            MarkdownEvent::HardBreak => {
+                state.ensure_line_start();
+            }
+            MarkdownEvent::Rule => {
+                state.ensure_blank_line();
+                state.push_text("----------------------------------------");
+                state.output.push('\n');
+                state.output.push('\n');
+                state.at_line_start = true;
+            }
+            MarkdownEvent::Html(_)
+            | MarkdownEvent::InlineHtml(_)
+            | MarkdownEvent::InlineMath(_)
+            | MarkdownEvent::DisplayMath(_)
+            | MarkdownEvent::FootnoteReference(_)
+            | MarkdownEvent::TaskListMarker(_)
+            | MarkdownEvent::Start(_)
+            | MarkdownEvent::End(_) => {}
+        }
+    }
+
+    state.output.trim_end().to_owned() + "\n"
+}
+
+fn format_heading(text: &str, level: HeadingLevel) -> String {
+    match level {
+        HeadingLevel::H1 => text.to_uppercase(),
+        HeadingLevel::H2 => format!("{text}\n{}", "=".repeat(text.len())),
+        HeadingLevel::H3 => format!("{text}\n{}", "-".repeat(text.len())),
+        HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => text.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, DocsTopic, default_rust_log, docs_text, format_tracing_prefix};
+    use super::{
+        Cli, DocsTopic, default_rust_log, docs_text, format_tracing_prefix, render_docs_text,
+        render_markdown_for_terminal,
+    };
     use crate::output::{
         format_output_prefix, normalize_internal_log_label, normalize_source_label,
     };
@@ -229,6 +415,39 @@ mod tests {
 
         assert!(rendered.starts_with("# Configuration Reference"));
         assert!(rendered.contains("startup_workflows"));
+    }
+
+    #[test]
+    fn rendered_docs_drop_markdown_heading_markers() {
+        let rendered = render_docs_text(DocsTopic::Config);
+
+        assert!(rendered.starts_with("CONFIGURATION REFERENCE"));
+        assert!(!rendered.contains("# Configuration Reference"));
+    }
+
+    #[test]
+    fn markdown_renderer_formats_lists_and_code_blocks() {
+        let rendered =
+            render_markdown_for_terminal("# Title\n\n- one\n- two\n\n```bash\ncargo test\n```\n");
+
+        assert!(rendered.contains("TITLE"));
+        assert!(rendered.contains("- one"));
+        assert!(rendered.contains("[bash]"));
+        assert!(rendered.contains("    cargo test"));
+    }
+
+    #[test]
+    fn markdown_renderer_formats_links_inline_code_rules_and_nested_lists() {
+        let rendered = render_markdown_for_terminal(
+            "## Section\n\nParagraph with [link](https://example.com) and `inline`.\n\n- parent\n  - child\n\n---\n",
+        );
+
+        assert!(rendered.contains("Section\n======="));
+        assert!(rendered.contains("link (https://example.com)"));
+        assert!(rendered.contains("`inline`"));
+        assert!(rendered.contains("- parent"));
+        assert!(rendered.contains("  - child"));
+        assert!(rendered.contains("----------------------------------------"));
     }
 
     #[test]

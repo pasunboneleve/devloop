@@ -2,6 +2,12 @@
 
 All notable changes to `devloop` will be recorded in this file.
 
+## [Unreleased]
+
+### Changed
+- Render `devloop docs <topic>` output as terminal-friendly text instead
+  of printing literal Markdown.
+
 ## [0.6.0] - 2026-03-26
 
 ### Added
