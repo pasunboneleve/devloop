@@ -4,6 +4,21 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Changed
+- Moved workflow progression into a pure state/effect core so ordered
+  workflow execution is planned through explicit transition data before
+  the runtime interprets the requested side effects.
+- Moved startup orchestration, watch-triggered workflow scheduling,
+  maintain ticks, shutdown handling, and process-supervision decisions
+  into pure runtime/process cores with explicit effect planning.
+- Added replaceable adapter boundaries for workflow and runtime effect
+  interpretation so orchestration can be tested against mocks instead of
+  live subprocesses and file watchers.
+- Added direct tests for the concrete log-prefix rendering path and
+  mock-based tests for workflow/runtime effect interpreters so output
+  coloring and orchestration changes can be validated without manual
+  runs.
+
 ### Fixed
 - Removed bright white from inherited output label colors and dimmed
   source labels alongside dimmed inherited process bodies.

@@ -7,18 +7,58 @@ use anyhow::{Result, anyhow};
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::signal;
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::{CompiledWatchGroup, Config, LogStyle, WorkflowStep};
+use crate::config::{CompiledWatchGroup, Config, LogStyle};
+use crate::core::{RuntimeEffect, RuntimeEvent, RuntimeMachine, WorkflowEffect, WorkflowMachine};
 use crate::processes::ProcessManager;
 use crate::state::SessionState;
 
 pub struct Engine {
     config: Config,
+}
+
+trait WorkflowEffectAdapter {
+    async fn start_process(&mut self, process: &str) -> Result<()>;
+    async fn stop_process(&mut self, process: &str) -> Result<()>;
+    async fn restart_process(&mut self, process: &str) -> Result<()>;
+    async fn wait_for_process(&mut self, process: &str) -> Result<()>;
+    async fn run_hook(
+        &mut self,
+        hook: &str,
+        changed_files: &[String],
+        workflow_name: &str,
+    ) -> Result<()>;
+    async fn sleep_ms(&mut self, duration_ms: u64) -> Result<()>;
+    async fn persist_state(&mut self, key: String, value: Value) -> Result<()>;
+    async fn log_message(&mut self, style: LogStyle, message: String) -> Result<()>;
+    fn snapshot_state(&self) -> Result<Map<String, Value>>;
+}
+
+trait RuntimeEffectAdapter {
+    async fn persist_state(&mut self, key: String, value: Value) -> Result<()>;
+    async fn start_autostart_processes(&mut self) -> Result<()>;
+    async fn run_workflow(&mut self, workflow_name: &str, changed_files: &[String]) -> Result<()>;
+    async fn start_watching(&mut self) -> Result<()>;
+    async fn maintain_processes(&mut self) -> Result<()>;
+    async fn log_info(&mut self, message: String) -> Result<()>;
+    async fn stop_all_processes(&mut self) -> Result<()>;
+}
+
+struct LiveWorkflowAdapter<'a, 'b> {
+    processes: &'a mut ProcessManager<'b>,
+    state: &'a SessionState,
+}
+
+struct LiveRuntimeAdapter<'a, 'b> {
+    config: &'a Config,
+    processes: &'a mut ProcessManager<'b>,
+    state: &'a SessionState,
+    watcher: &'a mut RecommendedWatcher,
 }
 
 impl Engine {
@@ -33,53 +73,56 @@ impl Engine {
                 .clone()
                 .ok_or_else(|| anyhow!("state file missing after config load"))?,
         )?;
-        state.set(
-            "root",
-            Value::String(self.config.root.display().to_string()),
-        )?;
         let mut processes = ProcessManager::new(&self.config);
-        processes.start_autostart(&state).await?;
-        for workflow_name in &self.config.startup_workflows {
-            run_workflow(&self.config, &mut processes, &state, workflow_name, &[]).await?;
-        }
-
         let watch_groups = self.config.compiled_watchers()?;
         let (tx, rx) = mpsc::channel();
+        let tx_watcher = tx.clone();
         let mut watcher = RecommendedWatcher::new(
             move |result| {
-                let _ = tx.send(result);
+                let _ = tx_watcher.send(result);
             },
             NotifyConfig::default(),
         )?;
-        watcher.watch(&self.config.root, RecursiveMode::Recursive)?;
-        info!("watching {}", self.config.root.display());
         let mut maintain_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut runtime = RuntimeMachine::new();
+        runtime.handle_event(RuntimeEvent::Start {
+            root_display: self.config.root.display().to_string(),
+            startup_workflows: self.config.startup_workflows.clone(),
+        });
+        let mut adapter = LiveRuntimeAdapter {
+            config: &self.config,
+            processes: &mut processes,
+            state: &state,
+            watcher: &mut watcher,
+        };
+        execute_runtime_effects(&mut runtime, &mut adapter).await?;
 
         loop {
             tokio::select! {
                 biased;
                 result = signal::ctrl_c() => {
                     result?;
-                    info!("received ctrl-c, shutting down");
-                    processes.stop_all().await?;
-                    return Ok(());
+                    runtime.handle_event(RuntimeEvent::CtrlC);
+                    if execute_runtime_effects(&mut runtime, &mut adapter).await? {
+                        return Ok(());
+                    }
                 }
                 _ = maintain_tick.tick() => {
-                    processes.maintain(&state).await?;
+                    runtime.handle_event(RuntimeEvent::MaintainTick);
+                    if execute_runtime_effects(&mut runtime, &mut adapter).await? {
+                        return Ok(());
+                    }
                 }
                 batch = next_batch(&rx, self.config.debounce()) => {
                     let Some(events) = batch? else {
                         continue;
                     };
-                    let changes = classify_events(&self.config.root, &watch_groups, &events);
-                    for (workflow_name, changed_files) in changes {
-                        run_workflow(
-                            &self.config,
-                            &mut processes,
-                            &state,
-                            &workflow_name,
-                            &changed_files,
-                        ).await?;
+                    let workflows = classify_events(&self.config.root, &watch_groups, &events);
+                    if !workflows.is_empty() {
+                        runtime.handle_event(RuntimeEvent::WatchChanges { workflows });
+                        if execute_runtime_effects(&mut runtime, &mut adapter).await? {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -87,6 +130,120 @@ impl Engine {
     }
 }
 
+impl WorkflowEffectAdapter for LiveWorkflowAdapter<'_, '_> {
+    async fn start_process(&mut self, process: &str) -> Result<()> {
+        self.processes.start_named(process, self.state).await
+    }
+
+    async fn stop_process(&mut self, process: &str) -> Result<()> {
+        self.processes.stop_named(process).await
+    }
+
+    async fn restart_process(&mut self, process: &str) -> Result<()> {
+        self.processes.restart_named(process, self.state).await
+    }
+
+    async fn wait_for_process(&mut self, process: &str) -> Result<()> {
+        self.processes.wait_for_named(process, self.state).await
+    }
+
+    async fn run_hook(
+        &mut self,
+        hook: &str,
+        changed_files: &[String],
+        workflow_name: &str,
+    ) -> Result<()> {
+        self.processes
+            .run_hook(hook, self.state, changed_files, workflow_name)
+            .await
+    }
+
+    async fn sleep_ms(&mut self, duration_ms: u64) -> Result<()> {
+        sleep(Duration::from_millis(duration_ms)).await;
+        Ok(())
+    }
+
+    async fn persist_state(&mut self, key: String, value: Value) -> Result<()> {
+        self.state.set(key, value)
+    }
+
+    async fn log_message(&mut self, style: LogStyle, message: String) -> Result<()> {
+        log_workflow_message(&style, &message);
+        Ok(())
+    }
+
+    fn snapshot_state(&self) -> Result<Map<String, Value>> {
+        self.state.snapshot()
+    }
+}
+
+impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
+    async fn persist_state(&mut self, key: String, value: Value) -> Result<()> {
+        self.state.set(key, value)
+    }
+
+    async fn start_autostart_processes(&mut self) -> Result<()> {
+        self.processes.start_autostart(self.state).await
+    }
+
+    async fn run_workflow(&mut self, workflow_name: &str, changed_files: &[String]) -> Result<()> {
+        info!("running workflow {}", workflow_name);
+        let Some(_) = self.config.workflow.get(workflow_name) else {
+            warn!("skipping missing workflow {}", workflow_name);
+            return Ok(());
+        };
+        let mut adapter = LiveWorkflowAdapter {
+            processes: self.processes,
+            state: self.state,
+        };
+        run_workflow_machine(self.config, &mut adapter, workflow_name, changed_files).await
+    }
+
+    async fn start_watching(&mut self) -> Result<()> {
+        self.watcher
+            .watch(&self.config.root, RecursiveMode::Recursive)?;
+        info!("watching {}", self.config.root.display());
+        Ok(())
+    }
+
+    async fn maintain_processes(&mut self) -> Result<()> {
+        self.processes.maintain(self.state).await
+    }
+
+    async fn log_info(&mut self, message: String) -> Result<()> {
+        info!("{}", message);
+        Ok(())
+    }
+
+    async fn stop_all_processes(&mut self) -> Result<()> {
+        self.processes.stop_all(self.state).await
+    }
+}
+
+async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
+    runtime: &mut RuntimeMachine,
+    adapter: &mut A,
+) -> Result<bool> {
+    while let Some(effect) = runtime.next_effect() {
+        match effect {
+            RuntimeEffect::PersistState { key, value } => adapter.persist_state(key, value).await?,
+            RuntimeEffect::StartAutostartProcesses => adapter.start_autostart_processes().await?,
+            RuntimeEffect::RunWorkflow {
+                workflow_name,
+                changed_files,
+            } => adapter.run_workflow(&workflow_name, &changed_files).await?,
+            RuntimeEffect::StartWatching => adapter.start_watching().await?,
+            RuntimeEffect::MaintainProcesses => adapter.maintain_processes().await?,
+            RuntimeEffect::LogInfo { message } => adapter.log_info(message).await?,
+            RuntimeEffect::StopAllProcesses => adapter.stop_all_processes().await?,
+            RuntimeEffect::Exit => return Ok(true),
+        }
+    }
+
+    Ok(false)
+}
+
+#[cfg(test)]
 async fn run_workflow(
     config: &Config,
     processes: &mut ProcessManager<'_>,
@@ -94,74 +251,57 @@ async fn run_workflow(
     workflow_name: &str,
     changed_files: &[String],
 ) -> Result<()> {
-    run_workflow_inner(config, processes, state, workflow_name, changed_files, true).await
-}
-
-async fn run_workflow_inner(
-    config: &Config,
-    processes: &mut ProcessManager<'_>,
-    state: &SessionState,
-    workflow_name: &str,
-    changed_files: &[String],
-    record_change_context: bool,
-) -> Result<()> {
-    let Some(workflow) = config.workflow.get(workflow_name) else {
+    info!("running workflow {}", workflow_name);
+    let Some(_) = config.workflow.get(workflow_name) else {
         warn!("skipping missing workflow {}", workflow_name);
         return Ok(());
     };
-    info!("running workflow {}", workflow_name);
-    if record_change_context {
-        state.set("last_workflow", workflow_name.to_owned().into())?;
-        state.set(
-            "last_changed_files",
-            Value::Array(
-                changed_files
-                    .iter()
-                    .map(|file| Value::String(file.clone()))
-                    .collect(),
-            ),
-        )?;
+    let mut adapter = LiveWorkflowAdapter { processes, state };
+    run_workflow_machine(config, &mut adapter, workflow_name, changed_files).await
+}
+
+async fn run_workflow_machine<A: WorkflowEffectAdapter>(
+    config: &Config,
+    adapter: &mut A,
+    workflow_name: &str,
+    changed_files: &[String],
+) -> Result<()> {
+    let mut machine = WorkflowMachine::start(
+        config,
+        adapter.snapshot_state()?,
+        workflow_name,
+        changed_files,
+    )?;
+    while let Some(effect) = machine.next_effect(config)? {
+        execute_workflow_effect(effect, adapter).await?;
+        machine.replace_session(adapter.snapshot_state()?);
     }
-    for step in &workflow.steps {
-        match step {
-            WorkflowStep::StartProcess { process } => processes.start_named(process, state).await?,
-            WorkflowStep::StopProcess { process } => processes.stop_named(process).await?,
-            WorkflowStep::RestartProcess { process } => {
-                processes.restart_named(process, state).await?
-            }
-            WorkflowStep::WaitForProcess { process } => {
-                processes.wait_for_named(process, state).await?
-            }
-            WorkflowStep::RunHook { hook } => {
-                processes
-                    .run_hook(hook, state, changed_files, workflow_name)
-                    .await?
-            }
-            WorkflowStep::RunWorkflow { workflow } => {
-                Box::pin(run_workflow_inner(
-                    config,
-                    processes,
-                    state,
-                    workflow,
-                    changed_files,
-                    false,
-                ))
-                .await?;
-            }
-            WorkflowStep::SleepMs { duration_ms } => {
-                sleep(Duration::from_millis(*duration_ms)).await;
-            }
-            WorkflowStep::WriteState { key, value } => {
-                let rendered = state.render_template(value)?;
-                state.set(key, rendered.into())?;
-            }
-            WorkflowStep::Log { message, style } => {
-                let rendered = state.render_template(message)?;
-                log_workflow_message(style, &rendered);
-            }
-        }
-    }
+
     Ok(())
+}
+
+async fn execute_workflow_effect<A: WorkflowEffectAdapter>(
+    effect: WorkflowEffect,
+    adapter: &mut A,
+) -> Result<()> {
+    match effect {
+        WorkflowEffect::StartProcess { process } => adapter.start_process(&process).await,
+        WorkflowEffect::StopProcess { process } => adapter.stop_process(&process).await,
+        WorkflowEffect::RestartProcess { process } => adapter.restart_process(&process).await,
+        WorkflowEffect::WaitForProcess { process } => adapter.wait_for_process(&process).await,
+        WorkflowEffect::RunHook {
+            hook,
+            workflow_name,
+            changed_files,
+        } => {
+            adapter
+                .run_hook(&hook, &changed_files, &workflow_name)
+                .await
+        }
+        WorkflowEffect::SleepMs { duration_ms } => adapter.sleep_ms(duration_ms).await,
+        WorkflowEffect::PersistState { key, value } => adapter.persist_state(key, value).await,
+        WorkflowEffect::Log { message, style } => adapter.log_message(style, message).await,
+    }
 }
 
 fn log_workflow_message(style: &LogStyle, message: &str) {
@@ -253,6 +393,8 @@ mod tests {
     use super::*;
     use crate::config::{Config, WorkflowSpec, WorkflowStep};
     use notify::{Event, EventKind, event::ModifyKind};
+    use serde_json::Value;
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -461,5 +603,216 @@ mod tests {
         assert_eq!(lines[0], lines[2]);
         assert_eq!(UnicodeWidthStr::width(lines[0].as_str()), 14);
         assert_eq!(UnicodeWidthStr::width(lines[1].as_str()), 14);
+    }
+
+    struct MockWorkflowAdapter {
+        state: Map<String, Value>,
+        calls: Vec<String>,
+        sleeps: VecDeque<u64>,
+    }
+
+    impl MockWorkflowAdapter {
+        fn new(state: Map<String, Value>) -> Self {
+            Self {
+                state,
+                calls: Vec::new(),
+                sleeps: VecDeque::new(),
+            }
+        }
+    }
+
+    impl WorkflowEffectAdapter for MockWorkflowAdapter {
+        async fn start_process(&mut self, process: &str) -> Result<()> {
+            self.calls.push(format!("start:{process}"));
+            Ok(())
+        }
+
+        async fn stop_process(&mut self, process: &str) -> Result<()> {
+            self.calls.push(format!("stop:{process}"));
+            Ok(())
+        }
+
+        async fn restart_process(&mut self, process: &str) -> Result<()> {
+            self.calls.push(format!("restart:{process}"));
+            Ok(())
+        }
+
+        async fn wait_for_process(&mut self, process: &str) -> Result<()> {
+            self.calls.push(format!("wait:{process}"));
+            Ok(())
+        }
+
+        async fn run_hook(
+            &mut self,
+            hook: &str,
+            changed_files: &[String],
+            workflow_name: &str,
+        ) -> Result<()> {
+            self.calls.push(format!(
+                "hook:{hook}:{workflow_name}:{}",
+                changed_files.join(",")
+            ));
+            Ok(())
+        }
+
+        async fn sleep_ms(&mut self, duration_ms: u64) -> Result<()> {
+            self.sleeps.push_back(duration_ms);
+            Ok(())
+        }
+
+        async fn persist_state(&mut self, key: String, value: Value) -> Result<()> {
+            self.calls.push(format!("persist:{key}"));
+            self.state.insert(key, value);
+            Ok(())
+        }
+
+        async fn log_message(&mut self, style: LogStyle, message: String) -> Result<()> {
+            self.calls.push(format!("log:{style:?}:{message}"));
+            Ok(())
+        }
+
+        fn snapshot_state(&self) -> Result<Map<String, Value>> {
+            Ok(self.state.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_machine_can_run_against_mock_adapter() {
+        let mut config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.workflow.insert(
+            "startup".into(),
+            WorkflowSpec {
+                steps: vec![
+                    WorkflowStep::WriteState {
+                        key: "url".into(),
+                        value: "https://example.test/{{slug}}".into(),
+                    },
+                    WorkflowStep::RunHook {
+                        hook: "build_css".into(),
+                    },
+                    WorkflowStep::Log {
+                        message: "ready {{url}}".into(),
+                        style: LogStyle::Plain,
+                    },
+                ],
+            },
+        );
+
+        let mut state = Map::new();
+        state.insert("slug".into(), Value::String("post".into()));
+        let mut adapter = MockWorkflowAdapter::new(state);
+
+        run_workflow_machine(&config, &mut adapter, "startup", &["tailwind.css".into()])
+            .await
+            .expect("run workflow");
+
+        assert_eq!(
+            adapter.calls,
+            vec![
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "persist:url",
+                "hook:build_css:startup:tailwind.css",
+                "log:Plain:ready https://example.test/post",
+            ]
+        );
+    }
+
+    struct MockRuntimeAdapter {
+        calls: Vec<String>,
+    }
+
+    impl MockRuntimeAdapter {
+        fn new() -> Self {
+            Self { calls: Vec::new() }
+        }
+    }
+
+    impl RuntimeEffectAdapter for MockRuntimeAdapter {
+        async fn persist_state(&mut self, key: String, _value: Value) -> Result<()> {
+            self.calls.push(format!("persist:{key}"));
+            Ok(())
+        }
+
+        async fn start_autostart_processes(&mut self) -> Result<()> {
+            self.calls.push("autostart".into());
+            Ok(())
+        }
+
+        async fn run_workflow(
+            &mut self,
+            workflow_name: &str,
+            changed_files: &[String],
+        ) -> Result<()> {
+            self.calls.push(format!(
+                "workflow:{workflow_name}:{}",
+                changed_files.join(",")
+            ));
+            Ok(())
+        }
+
+        async fn start_watching(&mut self) -> Result<()> {
+            self.calls.push("watch".into());
+            Ok(())
+        }
+
+        async fn maintain_processes(&mut self) -> Result<()> {
+            self.calls.push("maintain".into());
+            Ok(())
+        }
+
+        async fn log_info(&mut self, message: String) -> Result<()> {
+            self.calls.push(format!("log:{message}"));
+            Ok(())
+        }
+
+        async fn stop_all_processes(&mut self) -> Result<()> {
+            self.calls.push("stop_all".into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_machine_can_run_against_mock_adapter() {
+        let mut runtime = RuntimeMachine::new();
+        runtime.handle_event(RuntimeEvent::Start {
+            root_display: "/tmp/example".into(),
+            startup_workflows: vec!["startup".into()],
+        });
+
+        let mut workflows = BTreeMap::new();
+        workflows.insert("rust".into(), vec!["src/main.rs".into()]);
+        runtime.handle_event(RuntimeEvent::WatchChanges { workflows });
+        runtime.handle_event(RuntimeEvent::MaintainTick);
+        runtime.handle_event(RuntimeEvent::CtrlC);
+
+        let mut adapter = MockRuntimeAdapter::new();
+        let exit = execute_runtime_effects(&mut runtime, &mut adapter)
+            .await
+            .expect("execute runtime effects");
+
+        assert!(exit);
+        assert_eq!(
+            adapter.calls,
+            vec![
+                "persist:root",
+                "autostart",
+                "workflow:startup:",
+                "watch",
+                "workflow:rust:src/main.rs",
+                "maintain",
+                "log:received ctrl-c, shutting down",
+                "stop_all",
+            ]
+        );
     }
 }

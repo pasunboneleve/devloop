@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
@@ -14,8 +14,9 @@ use tracing::{info, warn};
 
 use crate::config::{
     Config, HookOutputConfig, HookSpec, OutputBodyStyle, OutputExtract, OutputRule, ProbeSpec,
-    ProcessSpec, RestartPolicy,
+    ProcessSpec,
 };
+use crate::core::{ProcessEffect, ProcessSupervisor};
 use crate::output::{
     dim_start, format_output_prefix_with_style, should_colorize_output, style_reset,
 };
@@ -28,11 +29,12 @@ pub struct ProcessManager<'a> {
     shutting_down: bool,
     stdout: Arc<Mutex<Stdout>>,
     stderr: Arc<Mutex<Stderr>>,
+    supervisor: ProcessSupervisor,
+    clock_start: Instant,
 }
 
 struct ManagedProcess {
     child: Child,
-    last_liveness_check: Option<std::time::Instant>,
 }
 
 impl<'a> ProcessManager<'a> {
@@ -44,14 +46,14 @@ impl<'a> ProcessManager<'a> {
             shutting_down: false,
             stdout: Arc::new(Mutex::new(tokio::io::stdout())),
             stderr: Arc::new(Mutex::new(tokio::io::stderr())),
+            supervisor: ProcessSupervisor::new(config),
+            clock_start: Instant::now(),
         }
     }
 
     pub async fn start_autostart(&mut self, state: &SessionState) -> Result<()> {
-        for (name, process) in &self.config.process {
-            if process.autostart {
-                self.start(name, process, state).await?;
-            }
+        for effect in self.supervisor.autostart_effects(self.config) {
+            self.apply_process_effect(effect, state).await?;
         }
         Ok(())
     }
@@ -72,7 +74,9 @@ impl<'a> ProcessManager<'a> {
         let Some(mut child) = self.children.remove(name) else {
             return Ok(());
         };
-        terminate_child(name, &mut child.child).await
+        terminate_child(name, &mut child.child).await?;
+        self.supervisor.on_process_stopped(name);
+        Ok(())
     }
 
     pub async fn restart_named(&mut self, name: &str, state: &SessionState) -> Result<()> {
@@ -134,22 +138,18 @@ impl<'a> ProcessManager<'a> {
         apply_hook_capture(spec, stdout.trim(), state)
     }
 
-    pub async fn stop_all(&mut self) -> Result<()> {
+    pub async fn stop_all(&mut self, state: &SessionState) -> Result<()> {
         self.initiate_shutdown();
-        let names: Vec<String> = self.children.keys().cloned().collect();
-        for name in names {
-            self.stop_named(&name).await?;
+        for effect in self.supervisor.on_shutdown() {
+            self.apply_process_effect(effect, state).await?;
         }
         Ok(())
     }
 
     pub async fn maintain(&mut self, state: &SessionState) -> Result<()> {
         let names: Vec<String> = self.children.keys().cloned().collect();
+        let mut exits = Vec::new();
         for name in names {
-            let Some(spec) = self.config.process.get(&name) else {
-                continue;
-            };
-
             let exited = {
                 let managed = self
                     .children
@@ -161,35 +161,12 @@ impl<'a> ProcessManager<'a> {
             if let Some(status) = exited {
                 warn!("process {} exited with {}", name, status);
                 self.children.remove(&name);
-                if should_restart(spec.restart, status.success(), self.shutting_down) {
-                    self.start_named(&name, state).await?;
-                }
-                continue;
+                exits.push((name, status.success()));
             }
-
-            if let Some(liveness) = &spec.liveness {
-                let should_check = {
-                    let managed = self
-                        .children
-                        .get(&name)
-                        .ok_or_else(|| anyhow!("missing managed process '{name}'"))?;
-                    managed.last_liveness_check.is_none_or(|last| {
-                        last.elapsed() >= Duration::from_millis(liveness.interval())
-                    })
-                };
-                if should_check {
-                    let result = check_probe(&self.client, &name, liveness, state).await;
-                    if let Some(managed) = self.children.get_mut(&name) {
-                        managed.last_liveness_check = Some(std::time::Instant::now());
-                    }
-                    if let Err(error) = result {
-                        warn!("liveness probe failed for {}: {}", name, error);
-                        if spec.restart != RestartPolicy::Never && !self.shutting_down {
-                            self.restart_named(&name, state).await?;
-                        }
-                    }
-                }
-            }
+        }
+        let now_ms = self.clock_start.elapsed().as_millis() as u64;
+        for effect in self.supervisor.on_tick(self.config, now_ms, exits) {
+            self.apply_process_effect(effect, state).await?;
         }
         Ok(())
     }
@@ -248,19 +225,59 @@ impl<'a> ProcessManager<'a> {
                 state.clone(),
             ));
         }
-        self.children.insert(
-            name.to_owned(),
-            ManagedProcess {
-                child,
-                last_liveness_check: None,
-            },
-        );
+        self.children
+            .insert(name.to_owned(), ManagedProcess { child });
+        self.supervisor.on_process_started(name);
         info!("started process {}", name);
         Ok(())
     }
 
     pub fn initiate_shutdown(&mut self) {
         self.shutting_down = true;
+    }
+
+    async fn apply_process_effect(
+        &mut self,
+        effect: ProcessEffect,
+        state: &SessionState,
+    ) -> Result<()> {
+        let mut pending = VecDeque::from([effect]);
+
+        while let Some(effect) = pending.pop_front() {
+            match effect {
+                ProcessEffect::StartProcess { process } => {
+                    self.start_named(&process, state).await?
+                }
+                ProcessEffect::RestartProcess { process } => {
+                    self.restart_named(&process, state).await?
+                }
+                ProcessEffect::StopProcess { process } => self.stop_named(&process).await?,
+                ProcessEffect::CheckLiveness { process } => {
+                    let Some(spec) = self.config.process.get(&process) else {
+                        continue;
+                    };
+                    let Some(liveness) = &spec.liveness else {
+                        continue;
+                    };
+                    let now_ms = self.clock_start.elapsed().as_millis() as u64;
+                    let healthy = match check_probe(&self.client, &process, liveness, state).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            warn!("liveness probe failed for {}: {}", process, error);
+                            false
+                        }
+                    };
+                    for next in
+                        self.supervisor
+                            .on_liveness_result(self.config, &process, healthy, now_ms)
+                    {
+                        pending.push_back(next);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn render_hook_output(
@@ -852,17 +869,6 @@ async fn terminate_child(name: &str, child: &mut Child) -> Result<()> {
     Ok(())
 }
 
-fn should_restart(policy: RestartPolicy, success: bool, shutting_down: bool) -> bool {
-    if shutting_down {
-        return false;
-    }
-    match policy {
-        RestartPolicy::Never => false,
-        RestartPolicy::OnFailure => !success,
-        RestartPolicy::Always => true,
-    }
-}
-
 async fn wait_for_probe(
     client: &reqwest::Client,
     name: &str,
@@ -1444,11 +1450,5 @@ mod tests {
         .expect("probe should succeed");
 
         std::fs::remove_file(state_path).expect("cleanup state file");
-    }
-
-    #[test]
-    fn should_not_restart_while_shutting_down() {
-        assert!(!should_restart(RestartPolicy::Always, true, true));
-        assert!(!should_restart(RestartPolicy::OnFailure, false, true));
     }
 }

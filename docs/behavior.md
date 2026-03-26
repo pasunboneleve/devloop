@@ -3,6 +3,25 @@
 This document describes how `devloop` behaves at runtime beyond the
 schema in [`configuration.md`](configuration.md).
 
+## Core model
+
+`devloop` is moving toward a pure core with an imperative shell.
+
+- workflow progression is modeled as explicit state plus effect
+  requests
+- startup orchestration, watch-triggered workflow scheduling, maintain
+  ticks, shutdown, and process-supervision decisions are also modeled
+  as explicit state plus effect requests
+- the runtime interprets those effect requests to perform process
+  control, hooks, sleeps, logging, and persistence
+- workflow and runtime effect interpreters sit behind replaceable
+  adapter boundaries, so orchestration can be tested against mocks
+  without requiring live subprocesses or file watchers
+
+The remaining imperative shell is now mostly the concrete adapter layer
+that talks to Tokio, `notify`, child processes, HTTP probes, and the
+filesystem.
+
 ## Startup
 
 When `devloop run` starts, it:

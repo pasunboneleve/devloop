@@ -69,17 +69,15 @@ impl SessionState {
             .map(ToOwned::to_owned))
     }
 
+    pub fn snapshot(&self) -> Result<Map<String, Value>> {
+        let values = self.lock_values()?;
+        Ok(values.clone())
+    }
+
+    #[cfg(test)]
     pub fn render_template(&self, template: &str) -> Result<String> {
         let values = self.lock_values()?;
-        let pattern = Regex::new(r"\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}")?;
-        let rendered = pattern.replace_all(template, |captures: &regex::Captures<'_>| {
-            values
-                .get(&captures[1])
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned()
-        });
-        Ok(rendered.into_owned())
+        render_template_values(&values, template)
     }
 
     fn lock_values(&self) -> Result<MutexGuard<'_, Map<String, Value>>> {
@@ -99,6 +97,21 @@ impl SessionState {
             .with_context(|| format!("failed to write state file {}", self.path.display()))?;
         Ok(())
     }
+}
+
+pub(crate) fn render_template_values(
+    values: &Map<String, Value>,
+    template: &str,
+) -> Result<String> {
+    let pattern = Regex::new(r"\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}")?;
+    let rendered = pattern.replace_all(template, |captures: &regex::Captures<'_>| {
+        values
+            .get(&captures[1])
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    });
+    Ok(rendered.into_owned())
 }
 
 #[cfg(test)]

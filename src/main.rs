@@ -1,4 +1,5 @@
 mod config;
+mod core;
 mod engine;
 mod output;
 mod processes;
@@ -76,6 +77,11 @@ fn default_rust_log() -> String {
     std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
 }
 
+fn format_tracing_prefix(target: &str, colorize: bool) -> String {
+    let label = normalize_internal_log_label(target);
+    format_output_prefix(&label, colorize)
+}
+
 #[derive(Debug, Default)]
 struct DevloopLogFormatter {
     timer: SystemTime,
@@ -93,8 +99,10 @@ where
         event: &Event<'_>,
     ) -> std::fmt::Result {
         let metadata = event.metadata();
-        let label = normalize_internal_log_label(metadata.target());
-        writer.write_str(&format_output_prefix(&label, should_colorize_output()))?;
+        writer.write_str(&format_tracing_prefix(
+            metadata.target(),
+            should_colorize_output(),
+        ))?;
         write!(writer, "{} ", metadata.level())?;
         self.timer.format_time(&mut writer)?;
         writer.write_char(' ')?;
@@ -121,7 +129,7 @@ fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_rust_log;
+    use super::{default_rust_log, format_tracing_prefix};
     use crate::output::{
         format_output_prefix, normalize_internal_log_label, normalize_source_label,
     };
@@ -170,5 +178,23 @@ mod tests {
             ),
             "[devloop hyper_util client legacy connect http] "
         );
+    }
+
+    #[test]
+    fn tracing_prefix_colorizes_internal_targets() {
+        let rendered = format_tracing_prefix("devloop::engine", true);
+
+        assert!(rendered.contains("[devloop engine]"));
+        assert!(rendered.starts_with("\u{1b}[1;"));
+        assert!(rendered.ends_with(" "));
+    }
+
+    #[test]
+    fn tracing_prefix_colorizes_dependency_targets_under_devloop() {
+        let rendered = format_tracing_prefix("hyper_util::client::legacy::connect::http", true);
+
+        assert!(rendered.contains("[devloop hyper_util client legacy connect http]"));
+        assert!(rendered.starts_with("\u{1b}[1;"));
+        assert!(rendered.ends_with(" "));
     }
 }

@@ -22,6 +22,15 @@ without hard-coding knowledge of any one repository.
   `cargo clippy --all-targets --all-features -- -D warnings`.
 
 ## Architecture constraints
+- Prefer a pure core with an imperative shell. Runtime behavior should
+  be modeled as explicit state transitions plus effect requests, with
+  side effects interpreted at the edges.
+- Thread real runtime state through explicit data structures rather than
+  hiding behavior inside ambient side effects.
+- New orchestration logic should default to pure functions that can be
+  unit-tested directly. Process control, file watching, timers,
+  logging, and persistence should sit behind replaceable effect
+  adapters or interpreters.
 - The engine owns orchestration: file watching, process supervision,
   health checks, event routing, and ordered workflow execution.
 - Client repositories own context: watched path groups, named processes,
