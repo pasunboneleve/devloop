@@ -49,18 +49,23 @@ timeout_ms = 30000
 command = ["./scripts/build-css.sh"]
 cwd = "."
 
-[hook.current_post_slug]
-command = ["./scripts/current-post-slug.sh"]
+[hook.current_browser_path]
+command = ["./scripts/current-browser-path.sh"]
 cwd = "."
 env = { PORT = "18080" }
 capture = "text"
-state_key = "current_post_slug"
+state_key = "current_browser_path"
+
+[event.browser_path]
+state_key = "current_browser_path"
+workflow = "publish_post_url"
+pattern = "^/(|posts/[a-z0-9-]+)$"
 observe = { workflow = "publish_post_url", interval_ms = 1000 }
 
 [workflow.publish_post_url]
 steps = [
   { action = "wait_for_process", process = "tunnel" },
-  { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}/posts/{{current_post_slug}}" },
+  { action = "write_state", key = "current_post_url", value = "{{tunnel_url}}{{current_browser_path}}" },
   { action = "log", message = "current post url: {{current_post_url}}", style = "boxed" },
 ]
 
@@ -70,7 +75,7 @@ steps = [
   { action = "start_process", process = "server" },
   { action = "wait_for_process", process = "server" },
   { action = "run_hook", hook = "build_css" },
-  { action = "run_hook", hook = "current_post_slug" },
+  { action = "run_hook", hook = "current_browser_path" },
   { action = "start_process", process = "tunnel" },
   { action = "run_workflow", workflow = "publish_post_url" },
 ]
@@ -80,14 +85,14 @@ steps = [
   { action = "restart_process", process = "server" },
   { action = "wait_for_process", process = "server" },
   { action = "run_hook", hook = "build_css" },
-  { action = "run_hook", hook = "current_post_slug" },
+  { action = "run_hook", hook = "current_browser_path" },
   { action = "restart_process", process = "tunnel" },
   { action = "run_workflow", workflow = "publish_post_url" },
 ]
 
 [workflow.content]
 steps = [
-  { action = "run_hook", hook = "current_post_slug" },
+  { action = "run_hook", hook = "current_browser_path" },
   { action = "restart_process", process = "tunnel" },
   { action = "run_workflow", workflow = "publish_post_url" },
 ]

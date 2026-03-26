@@ -17,6 +17,7 @@ use crate::config::{
     ProcessSpec,
 };
 use crate::core::{ProcessEffect, ProcessSupervisor};
+use crate::external_events::{ExternalEventEnvironment, apply_external_event_env};
 use crate::output::{
     dim_start, format_output_prefix_with_style, should_colorize_output, style_reset,
 };
@@ -31,10 +32,20 @@ pub struct ProcessManager<'a> {
     stderr: Arc<Mutex<Stderr>>,
     supervisor: ProcessSupervisor,
     clock_start: Instant,
+    external_event_env: Option<ExternalEventEnvironment>,
 }
 
 struct ManagedProcess {
     child: Child,
+}
+
+struct CommandContext<'a> {
+    env: &'a BTreeMap<String, String>,
+    external_event_env: Option<&'a ExternalEventEnvironment>,
+    root: &'a Path,
+    state_path: &'a Path,
+    changed_files: &'a [String],
+    workflow: &'a str,
 }
 
 impl<'a> ProcessManager<'a> {
@@ -48,7 +59,12 @@ impl<'a> ProcessManager<'a> {
             stderr: Arc::new(Mutex::new(tokio::io::stderr())),
             supervisor: ProcessSupervisor::new(config),
             clock_start: Instant::now(),
+            external_event_env: None,
         }
+    }
+
+    pub fn set_external_event_env(&mut self, external_event_env: Option<ExternalEventEnvironment>) {
+        self.external_event_env = external_event_env;
     }
 
     pub async fn start_autostart(&mut self, state: &SessionState) -> Result<()> {
@@ -114,11 +130,14 @@ impl<'a> ProcessManager<'a> {
         let mut command = configure_command(
             &spec.command,
             resolve_cwd(&self.config.root, spec.cwd.as_deref()),
-            &spec.env,
-            &self.config.root,
-            state.path(),
-            changed_files,
-            workflow,
+            CommandContext {
+                env: &spec.env,
+                external_event_env: self.external_event_env.as_ref(),
+                root: &self.config.root,
+                state_path: state.path(),
+                changed_files,
+                workflow,
+            },
         )?;
         let output = command
             .output()
@@ -191,11 +210,14 @@ impl<'a> ProcessManager<'a> {
         let mut command = configure_command(
             &spec.command,
             resolve_cwd(&self.config.root, spec.cwd.as_deref()),
-            &spec.env,
-            &self.config.root,
-            state.path(),
-            &[],
-            "startup",
+            CommandContext {
+                env: &spec.env,
+                external_event_env: self.external_event_env.as_ref(),
+                root: &self.config.root,
+                state_path: state.path(),
+                changed_files: &[],
+                workflow: "startup",
+            },
         )?;
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -769,26 +791,24 @@ fn executable_display_name(program: &str) -> String {
 fn configure_command(
     command: &[String],
     cwd: PathBuf,
-    env: &BTreeMap<String, String>,
-    root: &Path,
-    state_path: &Path,
-    changed_files: &[String],
-    workflow: &str,
+    context: CommandContext<'_>,
 ) -> Result<Command> {
     let Some(program) = command.first() else {
         return Err(anyhow!("command must not be empty"));
     };
-    let program = resolve_program(root, program);
+    let program = resolve_program(context.root, program);
     let mut cmd = Command::new(program);
     cmd.args(&command[1..]);
     cmd.current_dir(cwd);
-    cmd.envs(env);
-    cmd.env("DEVLOOP_ROOT", root);
-    cmd.env("DEVLOOP_STATE", state_path);
-    cmd.env("DEVLOOP_WORKFLOW", workflow);
+    let mut full_env = context.env.clone();
+    apply_external_event_env(&mut full_env, context.external_event_env);
+    cmd.envs(full_env);
+    cmd.env("DEVLOOP_ROOT", context.root);
+    cmd.env("DEVLOOP_STATE", context.state_path);
+    cmd.env("DEVLOOP_WORKFLOW", context.workflow);
     cmd.env(
         "DEVLOOP_CHANGED_FILES_JSON",
-        serde_json::to_string(changed_files)?,
+        serde_json::to_string(context.changed_files)?,
     );
     Ok(cmd)
 }
@@ -1300,11 +1320,14 @@ mod tests {
         let command = configure_command(
             &["cargo".into(), "run".into()],
             PathBuf::from("/tmp"),
-            &BTreeMap::new(),
-            Path::new("/tmp"),
-            Path::new("/tmp/state.json"),
-            &[],
-            "startup",
+            CommandContext {
+                env: &BTreeMap::new(),
+                external_event_env: None,
+                root: Path::new("/tmp"),
+                state_path: Path::new("/tmp/state.json"),
+                changed_files: &[],
+                workflow: "startup",
+            },
         )
         .expect("configure command");
 
@@ -1334,11 +1357,14 @@ mod tests {
         let command = configure_command(
             &["cargo".into(), "run".into()],
             PathBuf::from("/tmp"),
-            &env,
-            Path::new("/tmp"),
-            Path::new("/tmp/state.json"),
-            &[],
-            "startup",
+            CommandContext {
+                env: &env,
+                external_event_env: None,
+                root: Path::new("/tmp"),
+                state_path: Path::new("/tmp/state.json"),
+                changed_files: &[],
+                workflow: "startup",
+            },
         )
         .expect("configure command");
 
@@ -1352,6 +1378,46 @@ mod tests {
         assert_eq!(rust_log, "info,gcp_rust_blog=debug");
 
         restore_rust_log(original);
+    }
+
+    #[test]
+    fn configure_command_injects_external_event_environment() {
+        let env = BTreeMap::new();
+        let external_event_env = ExternalEventEnvironment {
+            base_url: "http://127.0.0.1:12345".into(),
+            token: "secret".into(),
+            event_urls: BTreeMap::from([(
+                "browser_path".into(),
+                "http://127.0.0.1:12345/events/browser_path".into(),
+            )]),
+        };
+
+        let command = configure_command(
+            &["cargo".into(), "run".into()],
+            PathBuf::from("/tmp"),
+            CommandContext {
+                env: &env,
+                external_event_env: Some(&external_event_env),
+                root: Path::new("/tmp"),
+                state_path: Path::new("/tmp/state.json"),
+                changed_files: &[],
+                workflow: "startup",
+            },
+        )
+        .expect("configure command");
+
+        let envs = command.as_std().get_envs().collect::<Vec<_>>();
+        assert!(envs.iter().any(|(key, value)| {
+            *key == std::ffi::OsStr::new("DEVLOOP_EVENTS_TOKEN")
+                && *value == Some(std::ffi::OsStr::new("secret"))
+        }));
+        assert!(envs.iter().any(|(key, value)| {
+            *key == std::ffi::OsStr::new("DEVLOOP_EVENT_BROWSER_PATH_URL")
+                && *value
+                    == Some(std::ffi::OsStr::new(
+                        "http://127.0.0.1:12345/events/browser_path",
+                    ))
+        }));
     }
 
     fn restore_rust_log(original: Option<std::ffi::OsString>) {

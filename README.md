@@ -148,6 +148,9 @@ For the runtime behavior reference, see
 For the full configuration reference, see
 [`docs/configuration.md`](docs/configuration.md).
 
+For the external-event trust model and push-versus-polling tradeoffs,
+see [`docs/security.md`](docs/security.md).
+
 The client config can then compose derived values with `write_state`
 steps, for example:
 
@@ -185,6 +188,13 @@ observe = { workflow = "publish_post_url", interval_ms = 1000 }
 That lets a helper hook refresh session state from something like a
 development server endpoint, and rerun the follow-up workflow only when
 the state actually changes.
+
+For more precise local event flows, `devloop` can also accept
+capability-scoped pushed events over a localhost HTTP server. A trusted
+client process can post a value to a configured event, `devloop`
+updates the mapped session-state key, and then runs the mapped workflow
+if the value changed. This is the preferred model for things like
+browser-path updates, while observed hooks remain a simpler fallback.
 
 ---
 

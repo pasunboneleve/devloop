@@ -8,6 +8,12 @@ All notable changes to `devloop` will be recorded in this file.
 - Added observed hooks, allowing a hook to be polled on the runtime
   maintenance tick and trigger a workflow only when its session-state
   output changes.
+- Added localhost external events with per-run bearer tokens, fixed
+  event-to-state/workflow mappings, and child-process environment
+  injection so trusted local clients can push state changes into
+  `devloop` without polling.
+- Added dedicated security documentation for external events and the
+  push-versus-polling tradeoffs in [`docs/security.md`](docs/security.md).
 
 ### Changed
 - Moved workflow progression into a pure state/effect core so ordered

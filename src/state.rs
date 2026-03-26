@@ -33,15 +33,20 @@ impl SessionState {
     }
 
     pub fn set(&self, key: impl Into<String>, value: Value) -> Result<()> {
+        self.set_if_changed(key, value).map(|_| ())
+    }
+
+    pub fn set_if_changed(&self, key: impl Into<String>, value: Value) -> Result<bool> {
         let mut values = self.lock_values()?;
         let key = key.into();
         if values.get(&key) == Some(&value) {
-            return Ok(());
+            return Ok(false);
         }
         values.insert(key, value);
         let snapshot = values.clone();
         drop(values);
-        self.save_snapshot(&snapshot)
+        self.save_snapshot(&snapshot)?;
+        Ok(true)
     }
 
     pub fn merge_json_object(&self, object: Map<String, Value>) -> Result<()> {

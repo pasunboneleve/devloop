@@ -57,6 +57,7 @@ pub struct RuntimeMachine {
     phase: RuntimePhase,
     pending_effects: VecDeque<RuntimeEffect>,
     observed_hooks: BTreeMap<String, ObservedHookRuntimeState>,
+    has_external_events: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +79,7 @@ pub enum RuntimeEvent {
     MaintainTick {
         now_ms: u64,
     },
-    ObservedHookChanged {
+    WorkflowTrigger {
         workflow_name: String,
     },
     CtrlC,
@@ -90,6 +91,7 @@ pub enum RuntimeEffect {
         key: String,
         value: Value,
     },
+    StartExternalEventServer,
     StartAutostartProcesses,
     RunWorkflow {
         workflow_name: String,
@@ -288,6 +290,7 @@ impl RuntimeMachine {
             phase: RuntimePhase::Initializing,
             pending_effects: VecDeque::new(),
             observed_hooks,
+            has_external_events: config.has_external_events(),
         }
     }
 
@@ -304,6 +307,10 @@ impl RuntimeMachine {
                     key: "root".into(),
                     value: Value::String(root_display),
                 });
+                if self.has_external_events {
+                    self.pending_effects
+                        .push_back(RuntimeEffect::StartExternalEventServer);
+                }
                 self.pending_effects
                     .push_back(RuntimeEffect::StartAutostartProcesses);
                 for workflow_name in startup_workflows {
@@ -345,7 +352,7 @@ impl RuntimeMachine {
                     }
                 }
             }
-            RuntimeEvent::ObservedHookChanged { workflow_name } => {
+            RuntimeEvent::WorkflowTrigger { workflow_name } => {
                 if self.phase != RuntimePhase::Running {
                     return;
                 }
@@ -555,6 +562,8 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         }
     }
@@ -834,7 +843,7 @@ mod tests {
         );
         assert_eq!(runtime.next_effect(), None);
 
-        runtime.handle_event(RuntimeEvent::ObservedHookChanged {
+        runtime.handle_event(RuntimeEvent::WorkflowTrigger {
             workflow_name: "publish_post_url".into(),
         });
         assert_eq!(

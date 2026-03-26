@@ -31,6 +31,9 @@ without hard-coding knowledge of any one repository.
   unit-tested directly. Process control, file watching, timers,
   logging, and persistence should sit behind replaceable effect
   adapters or interpreters.
+- Prefer explicit pushed events over polling when external state changes
+  need to drive workflows precisely. Polling is acceptable as a simpler
+  fallback when integration cost or security surface must stay lower.
 - The engine owns orchestration: file watching, process supervision,
   health checks, event routing, and ordered workflow execution.
 - Client repositories own context: watched path groups, named processes,
@@ -49,9 +52,15 @@ without hard-coding knowledge of any one repository.
 - Dynamic state that changes during a session, such as a tunnel URL,
   should have a stable interface such as a state file rather than a
   startup-only environment variable.
+- External control surfaces must be capability-scoped. Prefer localhost
+  listeners with per-run tokens and fixed config-declared event-to-state
+  mappings over generic endpoints that can trigger arbitrary workflows
+  or state writes.
 
 ## Documentation expectations
 - Keep `README.md` focused on current goals and how to run the tool.
+- Record security-sensitive design constraints in dedicated docs under
+  `docs/`, not just in code comments or commit messages.
 - Keep `PLAN.md` aligned with the next reviewable milestones.
 - User-visible functionality changes and behavior changes must update
   `CHANGELOG.md` as part of the same change before commit.

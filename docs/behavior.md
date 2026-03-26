@@ -30,9 +30,10 @@ When `devloop run` starts, it:
 2. resolves `root`, `state_file`, command paths, and relative working
    directories
 3. loads the session state file into memory
-4. starts any processes with `autostart = true`
-5. runs each workflow named in `startup_workflows` in order
-6. starts watching the configured `root`
+4. if external events are configured, starts a localhost event server
+5. starts any processes with `autostart = true`
+6. runs each workflow named in `startup_workflows` in order
+7. starts watching the configured `root`
 
 The in-memory session state is authoritative for the running process.
 Edits made directly to the JSON file while `devloop` is running are not
@@ -110,6 +111,25 @@ Hooks can also be observed outside workflows.
   workflow is scheduled immediately.
 - If the hook leaves session state unchanged, no follow-up workflow is
   run.
+
+Observed hooks remain useful as a cheap fallback when push integration
+is not worth the extra control surface. For lower-latency and less
+noisy event flows, prefer external events instead.
+
+## External events
+
+If `event.*` config is present, `devloop` starts a localhost HTTP server
+for constrained event ingestion.
+
+- Each configured event maps to one fixed session-state key and one
+  fixed workflow.
+- Child processes receive the event URLs and bearer token in their
+  environment.
+- Posting the same value again does not rerun the workflow.
+- Posting a new accepted value updates session state first, then
+  schedules the configured workflow immediately.
+- Invalid tokens are rejected.
+- Values that fail the configured regex pattern are rejected.
 
 ## Output rendering
 

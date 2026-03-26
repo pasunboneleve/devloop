@@ -183,6 +183,53 @@ watch event, for example browser navigation that is reported back to a
 local development server. `devloop` runs the hook on the maintain tick;
 if the hook updates session state, the configured workflow is run.
 
+## External events
+
+External events let trusted local client processes push constrained
+state changes into `devloop` without polling.
+
+```toml
+[event_server]
+bind = "127.0.0.1:0"
+
+[event.browser_path]
+state_key = "current_browser_path"
+workflow = "publish_post_url"
+pattern = "^/(|posts/[a-z0-9-]+)$"
+```
+
+### Event server keys
+
+- `bind`: local socket address for the event listener. Default:
+  `127.0.0.1:0`, which chooses an ephemeral local port.
+
+### Event keys
+
+- `state_key`: session-state key to update from the pushed value.
+  Required.
+- `workflow`: workflow to run when the value changes. Required.
+- `pattern`: optional regex that the pushed value must match before
+  `devloop` accepts it.
+
+When `devloop` starts an event server, supervised processes and hooks
+receive:
+
+- `DEVLOOP_EVENTS_BASE_URL`
+- `DEVLOOP_EVENTS_TOKEN`
+- `DEVLOOP_EVENT_<EVENT_NAME>_URL` for each configured event
+
+For example, an event named `browser_path` becomes
+`DEVLOOP_EVENT_BROWSER_PATH_URL`.
+
+Event ingestion is capability-scoped:
+
+- clients can only post to configured event names
+- each event may update only its configured `state_key`
+- each event may trigger only its configured `workflow`
+
+See [`security.md`](security.md) for the trust model and the tradeoff
+against observed-hook polling.
+
 ### Hook capture modes
 
 - `ignore`: discard stdout.

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,6 +22,10 @@ pub struct Config {
     pub process: BTreeMap<String, ProcessSpec>,
     #[serde(default)]
     pub hook: BTreeMap<String, HookSpec>,
+    #[serde(default)]
+    pub event_server: EventServerConfig,
+    #[serde(default)]
+    pub event: BTreeMap<String, EventSpec>,
     #[serde(default)]
     pub workflow: BTreeMap<String, WorkflowSpec>,
 }
@@ -83,6 +88,18 @@ impl Config {
                 ));
             }
         }
+        self.event_server.validate()?;
+        for (name, event) in &self.event {
+            event
+                .validate()
+                .with_context(|| format!("invalid event '{name}'"))?;
+            if !self.workflow.contains_key(&event.workflow) {
+                return Err(anyhow!(
+                    "event '{name}' references missing workflow '{}'",
+                    event.workflow
+                ));
+            }
+        }
         for (name, workflow) in &self.workflow {
             workflow
                 .validate(self)
@@ -107,6 +124,10 @@ impl Config {
             .iter()
             .map(|(name, group)| group.compile(name))
             .collect()
+    }
+
+    pub fn has_external_events(&self) -> bool {
+        !self.event.is_empty()
     }
 }
 
@@ -326,6 +347,56 @@ pub struct HookSpec {
     pub observe: Option<ObservedHookSpec>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventServerConfig {
+    #[serde(default = "default_event_server_bind")]
+    pub bind: String,
+}
+
+impl Default for EventServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_event_server_bind(),
+        }
+    }
+}
+
+impl EventServerConfig {
+    fn validate(&self) -> Result<()> {
+        self.bind
+            .parse::<SocketAddr>()
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "event_server bind '{}' is not a valid socket address",
+                    self.bind
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventSpec {
+    pub state_key: String,
+    pub workflow: String,
+    pub pattern: Option<String>,
+}
+
+impl EventSpec {
+    fn validate(&self) -> Result<()> {
+        if self.state_key.trim().is_empty() {
+            return Err(anyhow!("event state_key must not be empty"));
+        }
+        if self.workflow.trim().is_empty() {
+            return Err(anyhow!("event workflow must not be empty"));
+        }
+        if let Some(pattern) = &self.pattern {
+            Regex::new(pattern).with_context(|| format!("invalid event regex '{}'", pattern))?;
+        }
+        Ok(())
+    }
+}
+
 impl HookSpec {
     fn validate(&self) -> Result<()> {
         if self.command.is_empty() {
@@ -531,6 +602,10 @@ fn default_observe_interval_ms() -> u64 {
     1_000
 }
 
+fn default_event_server_bind() -> String {
+    "127.0.0.1:0".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +619,8 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            event_server: EventServerConfig::default(),
+            event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         }
     }
@@ -689,5 +766,44 @@ mod tests {
 
         let error = config.validate().expect_err("validation should fail");
         assert!(error.to_string().contains("observes missing workflow"));
+    }
+
+    #[test]
+    fn event_server_defaults_to_local_ephemeral_bind() {
+        let config: EventServerConfig = toml::from_str("").expect("parse event server config");
+
+        assert_eq!(config.bind, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn validate_rejects_missing_event_workflow() {
+        let mut config = base_config();
+        config.watch.insert(
+            "content".into(),
+            WatchGroup {
+                paths: vec!["content/**/*.md".into()],
+                workflow: Some("content".into()),
+            },
+        );
+        config.workflow.insert(
+            "content".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "content".into(),
+                    style: LogStyle::Plain,
+                }],
+            },
+        );
+        config.event.insert(
+            "browser_path".into(),
+            EventSpec {
+                state_key: "current_browser_path".into(),
+                workflow: "publish_post_url".into(),
+                pattern: Some("^/".into()),
+            },
+        );
+
+        let error = config.validate().expect_err("validation should fail");
+        assert!(error.to_string().contains("references missing workflow"));
     }
 }

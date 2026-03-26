@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::{CompiledWatchGroup, Config, LogStyle};
 use crate::core::{RuntimeEffect, RuntimeEvent, RuntimeMachine, WorkflowEffect, WorkflowMachine};
+use crate::external_events::{ExternalEventMessage, ExternalEventServer};
 use crate::processes::ProcessManager;
 use crate::state::SessionState;
 
@@ -41,6 +42,7 @@ trait WorkflowEffectAdapter {
 
 trait RuntimeEffectAdapter {
     async fn persist_state(&mut self, key: String, value: Value) -> Result<()>;
+    async fn start_external_event_server(&mut self) -> Result<()>;
     async fn start_autostart_processes(&mut self) -> Result<()>;
     async fn run_workflow(&mut self, workflow_name: &str, changed_files: &[String]) -> Result<()>;
     async fn start_watching(&mut self) -> Result<()>;
@@ -60,6 +62,8 @@ struct LiveRuntimeAdapter<'a, 'b> {
     processes: &'a mut ProcessManager<'b>,
     state: &'a SessionState,
     watcher: &'a mut RecommendedWatcher,
+    external_event_tx: tokio::sync::mpsc::UnboundedSender<ExternalEventMessage>,
+    external_event_server: Option<ExternalEventServer>,
 }
 
 impl Engine {
@@ -77,6 +81,7 @@ impl Engine {
         let mut processes = ProcessManager::new(&self.config);
         let watch_groups = self.config.compiled_watchers()?;
         let (tx, rx) = mpsc::channel();
+        let (external_event_tx, mut external_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_watcher = tx.clone();
         let mut watcher = RecommendedWatcher::new(
             move |result| {
@@ -96,6 +101,8 @@ impl Engine {
             processes: &mut processes,
             state: &state,
             watcher: &mut watcher,
+            external_event_tx,
+            external_event_server: None,
         };
         execute_runtime_effects(&mut runtime, &mut adapter).await?;
 
@@ -127,6 +134,14 @@ impl Engine {
                         if execute_runtime_effects(&mut runtime, &mut adapter).await? {
                             return Ok(());
                         }
+                    }
+                }
+                Some(event) = external_event_rx.recv() => {
+                    runtime.handle_event(RuntimeEvent::WorkflowTrigger {
+                        workflow_name: event.workflow_name,
+                    });
+                    if execute_runtime_effects(&mut runtime, &mut adapter).await? {
+                        return Ok(());
                     }
                 }
             }
@@ -186,6 +201,24 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
         self.state.set(key, value)
     }
 
+    async fn start_external_event_server(&mut self) -> Result<()> {
+        if self.external_event_server.is_some() {
+            return Ok(());
+        }
+        if let Some(server) = ExternalEventServer::start(
+            self.config,
+            self.state.clone(),
+            self.external_event_tx.clone(),
+        )
+        .await?
+        {
+            self.processes
+                .set_external_event_env(Some(server.environment().clone()));
+            self.external_event_server = Some(server);
+        }
+        Ok(())
+    }
+
     async fn start_autostart_processes(&mut self) -> Result<()> {
         self.processes.start_autostart(self.state).await
     }
@@ -237,6 +270,9 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
     while let Some(effect) = runtime.next_effect() {
         match effect {
             RuntimeEffect::PersistState { key, value } => adapter.persist_state(key, value).await?,
+            RuntimeEffect::StartExternalEventServer => {
+                adapter.start_external_event_server().await?
+            }
             RuntimeEffect::StartAutostartProcesses => adapter.start_autostart_processes().await?,
             RuntimeEffect::RunWorkflow {
                 workflow_name,
@@ -249,7 +285,7 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
                 workflow_name,
             } => {
                 if adapter.poll_observed_hook(&hook).await? {
-                    runtime.handle_event(RuntimeEvent::ObservedHookChanged { workflow_name });
+                    runtime.handle_event(RuntimeEvent::WorkflowTrigger { workflow_name });
                 }
             }
             RuntimeEffect::LogInfo { message } => adapter.log_info(message).await?,
@@ -471,6 +507,8 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
         config.workflow.insert(
@@ -522,6 +560,8 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
         config.workflow.insert(
@@ -585,6 +625,8 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
         config.workflow.insert(
@@ -704,6 +746,8 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
         config.workflow.insert(
@@ -765,6 +809,11 @@ mod tests {
             Ok(())
         }
 
+        async fn start_external_event_server(&mut self) -> Result<()> {
+            self.calls.push("event_server".into());
+            Ok(())
+        }
+
         async fn start_autostart_processes(&mut self) -> Result<()> {
             self.calls.push("autostart".into());
             Ok(())
@@ -818,6 +867,8 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
         config.hook.insert(
@@ -833,6 +884,14 @@ mod tests {
                     workflow: "publish_post_url".into(),
                     interval_ms: 500,
                 }),
+            },
+        );
+        config.event.insert(
+            "browser_path".into(),
+            crate::config::EventSpec {
+                state_key: "current_browser_path".into(),
+                workflow: "publish_post_url".into(),
+                pattern: Some("^/posts/[a-z0-9-]+$".into()),
             },
         );
         let mut adapter = MockRuntimeAdapter::new();
@@ -866,6 +925,7 @@ mod tests {
             adapter.calls,
             vec![
                 "persist:root",
+                "event_server",
                 "autostart",
                 "workflow:startup:",
                 "watch",
@@ -889,6 +949,15 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::from([(
+                "browser_path".into(),
+                crate::config::EventSpec {
+                    state_key: "current_browser_path".into(),
+                    workflow: "publish_post_url".into(),
+                    pattern: Some("^/posts/[a-z0-9-]+$".into()),
+                },
+            )]),
             workflow: BTreeMap::new(),
         };
         config.hook.insert(
@@ -925,10 +994,61 @@ mod tests {
             adapter.calls,
             vec![
                 "persist:root",
+                "event_server",
                 "autostart",
                 "watch",
                 "maintain",
                 "poll:current_post_slug"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_machine_runs_workflow_for_external_trigger() {
+        let config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::from([(
+                "browser_path".into(),
+                crate::config::EventSpec {
+                    state_key: "current_browser_path".into(),
+                    workflow: "publish_post_url".into(),
+                    pattern: Some("^/posts/[a-z0-9-]+$".into()),
+                },
+            )]),
+            workflow: BTreeMap::new(),
+        };
+        let mut runtime = RuntimeMachine::new(&config);
+        runtime.handle_event(RuntimeEvent::Start {
+            root_display: "/tmp/example".into(),
+            startup_workflows: vec![],
+        });
+        let mut adapter = MockRuntimeAdapter::new();
+        execute_runtime_effects(&mut runtime, &mut adapter)
+            .await
+            .expect("execute startup effects");
+
+        runtime.handle_event(RuntimeEvent::WorkflowTrigger {
+            workflow_name: "publish_post_url".into(),
+        });
+        execute_runtime_effects(&mut runtime, &mut adapter)
+            .await
+            .expect("execute external trigger");
+
+        assert_eq!(
+            adapter.calls,
+            vec![
+                "persist:root",
+                "event_server",
+                "autostart",
+                "watch",
+                "workflow:publish_post_url:",
             ]
         );
     }

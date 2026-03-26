@@ -1,6 +1,7 @@
 mod config;
 mod core;
 mod engine;
+mod external_events;
 mod output;
 mod processes;
 mod state;
