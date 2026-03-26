@@ -409,7 +409,7 @@ fn classify_events(
             continue;
         }
         for path in &event.paths {
-            let Ok(relative) = path.strip_prefix(root) else {
+            let Some(relative) = relativize_event_path(root, path) else {
                 continue;
             };
             for group in watch_groups {
@@ -426,6 +426,17 @@ fn classify_events(
         .into_iter()
         .map(|(workflow, files)| (workflow, files.into_iter().collect()))
         .collect()
+}
+
+fn relativize_event_path<'a>(root: &'a Path, path: &'a Path) -> Option<&'a Path> {
+    path.strip_prefix(root)
+        .ok()
+        .or_else(|| strip_private_prefix_variant(root, path))
+}
+
+fn strip_private_prefix_variant<'a>(root: &'a Path, path: &'a Path) -> Option<&'a Path> {
+    let private_root = Path::new("/private").join(root.strip_prefix("/").ok()?);
+    path.strip_prefix(&private_root).ok()
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -482,6 +493,24 @@ mod tests {
         let grouped = classify_events(&root, &groups, &events);
         assert_eq!(grouped["server"], vec!["src/main.rs"]);
         assert_eq!(grouped["content"], vec!["content/posts/example.md"]);
+    }
+
+    #[test]
+    fn classify_changes_by_workflow_accepts_private_var_event_paths() {
+        let root = PathBuf::from("/var/folders/example/tmp");
+        let groups =
+            vec![CompiledWatchGroup::for_test(&["watched.txt"], "content").expect("watch group")];
+        let events = vec![Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![PathBuf::from(
+                "/private/var/folders/example/tmp/watched.txt",
+            )],
+            attrs: Default::default(),
+        }];
+
+        let grouped = classify_events(&root, &groups, &events);
+
+        assert_eq!(grouped["content"], vec!["watched.txt"]);
     }
 
     #[tokio::test]

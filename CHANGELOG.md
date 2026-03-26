@@ -5,6 +5,9 @@ All notable changes to `devloop` will be recorded in this file.
 ## [Unreleased]
 
 ### Fixed
+- Accepted macOS `notify` event paths reported under `/private/...`
+  for watched roots configured under `/var/...`, so file changes in
+  temp directories are no longer dropped by the watch classifier.
 - Made the CI smoke test wait for file watching to start before editing
   the watched fixture file, and retry the watched write until the state
   change is observed, avoiding startup races on macOS runners.
