@@ -4,30 +4,19 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-03-26
+
 ### Fixed
-- Runtime requests for missing workflows now fail explicitly instead of
-  being logged and skipped, and external events return `503` if their
-  workflow trigger cannot be dispatched.
-- Watcher callback delivery failures are now surfaced as errors instead
-  of being dropped silently.
-- Unexpected watcher and external-event channel disconnects now fail the
-  engine explicitly instead of silently disabling those input paths.
-- Accepted macOS `notify` event paths reported under `/private/...`
-  for watched roots configured under `/var/...`, so file changes in
-  temp directories are no longer dropped by the watch classifier.
-- Made the CI smoke test wait for file watching to start before editing
-  the watched fixture file, and retry the watched write until the state
-  change is observed, avoiding startup races on macOS runners.
-- Added a hard wall-clock timeout and bounded shutdown to the CI smoke
-  harness so failed runs die loudly instead of hanging in CI.
+- Runtime requests for missing workflows now fail explicitly instead of being logged and skipped, and external events return `503` if their workflow trigger cannot be dispatched.
+- Watcher callback delivery failures are now surfaced as errors instead of being dropped silently.
+- Unexpected watcher and external-event channel disconnects now fail the engine explicitly instead of silently disabling those input paths.
+- Accepted macOS `notify` event paths reported under `/private/...` for watched roots configured under `/var/...`, so file changes in temp directories are no longer dropped by the watch classifier.
+- Made the CI smoke test wait for file watching to start before editing the watched fixture file, and retry the watched write until the state change is observed, avoiding startup races on macOS runners.
+- Added a hard wall-clock timeout and bounded shutdown to the CI smoke harness so failed runs die loudly instead of hanging in CI.
 
 ### Changed
-- Split Linux and macOS CI into separate badgeable workflows backed by
-  one reusable workflow definition, and limited release archives to the
-  supported Linux x86_64 and macOS Apple Silicon targets.
-- Split release publishing into separate Linux and macOS workflows
-  backed by one reusable workflow definition so each platform publishes
-  its asset independently.
+- Split Linux and macOS CI into separate badgeable workflows backed by one reusable workflow definition, and limited release archives to the supported Linux x86_64 and macOS Apple Silicon targets.
+- Split release publishing into separate Linux and macOS workflows backed by one reusable workflow definition so each platform publishes its asset independently.
 
 ## [0.6.1] - 2026-03-26
 
