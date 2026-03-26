@@ -4,19 +4,67 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture_src="${repo_root}/fixtures/ci-smoke"
 tmp_dir="$(mktemp -d)"
-cleanup() {
-  if [[ -n "${devloop_pid:-}" ]] && kill -0 "${devloop_pid}" 2>/dev/null; then
-    kill -INT "${devloop_pid}" 2>/dev/null || true
-    wait "${devloop_pid}" || true
+parent_pid="$$"
+smoke_timeout_seconds="${CI_SMOKE_TIMEOUT_SECONDS:-120}"
+shutdown_grace_seconds="${CI_SMOKE_SHUTDOWN_GRACE_SECONDS:-10}"
+log_path="${tmp_dir}/devloop.log"
+
+dump_log() {
+  if [[ -n "${log_path}" && -f "${log_path}" ]]; then
+    echo "----- devloop ci-smoke log -----" >&2
+    cat "${log_path}" >&2
+    echo "----- end devloop ci-smoke log -----" >&2
   fi
+}
+
+stop_devloop() {
+  if [[ -z "${devloop_pid:-}" ]] || ! kill -0 "${devloop_pid}" 2>/dev/null; then
+    return
+  fi
+
+  kill -INT "${devloop_pid}" 2>/dev/null || true
+  local deadline=$((SECONDS + shutdown_grace_seconds))
+  while kill -0 "${devloop_pid}" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      echo "timed out waiting for devloop to exit; forcing kill" >&2
+      kill -KILL "${devloop_pid}" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+  done
+  wait "${devloop_pid}" || true
+}
+
+start_watchdog() {
+  (
+    sleep "${smoke_timeout_seconds}"
+    echo "ci-smoke.sh exceeded ${smoke_timeout_seconds}s timeout" >&2
+    dump_log
+    if [[ -n "${devloop_pid:-}" ]] && kill -0 "${devloop_pid}" 2>/dev/null; then
+      kill -TERM "${devloop_pid}" 2>/dev/null || true
+      sleep 2
+      kill -KILL "${devloop_pid}" 2>/dev/null || true
+    fi
+    kill -TERM "${parent_pid}" 2>/dev/null || true
+    sleep 2
+    kill -KILL "${parent_pid}" 2>/dev/null || true
+  ) &
+  watchdog_pid=$!
+}
+
+cleanup() {
+  if [[ -n "${watchdog_pid:-}" ]] && kill -0 "${watchdog_pid}" 2>/dev/null; then
+    kill "${watchdog_pid}" 2>/dev/null || true
+  fi
+  stop_devloop
   rm -rf "${tmp_dir}"
 }
 trap cleanup EXIT
+trap dump_log ERR
 
 cp -R "${fixture_src}/." "${tmp_dir}/"
 chmod +x "${tmp_dir}/scripts/read-watched.sh"
 
-log_path="${tmp_dir}/devloop.log"
 state_path="${tmp_dir}/.devloop/state.json"
 devloop_bin="${repo_root}/target/debug/devloop"
 
@@ -26,6 +74,7 @@ fi
 
 "${devloop_bin}" run --config "${tmp_dir}/devloop.toml" >"${log_path}" 2>&1 &
 devloop_pid=$!
+start_watchdog
 
 python3 - "$state_path" <<'PY'
 import json
@@ -87,5 +136,4 @@ print(log_path.read_text(), file=sys.stderr)
 raise SystemExit("timed out waiting for changed state")
 PY
 
-kill -INT "${devloop_pid}"
-wait "${devloop_pid}"
+stop_devloop

@@ -8,6 +8,8 @@ All notable changes to `devloop` will be recorded in this file.
 - Made the CI smoke test wait for file watching to start before editing
   the watched fixture file, and retry the watched write until the state
   change is observed, avoiding startup races on macOS runners.
+- Added a hard wall-clock timeout and bounded shutdown to the CI smoke
+  harness so failed runs die loudly instead of hanging in CI.
 
 ### Changed
 - Split Linux and macOS CI into separate badgeable workflows backed by
