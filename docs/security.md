@@ -3,6 +3,12 @@
 This document describes the trust model and security tradeoffs for
 `devloop` features that accept input from outside the core watch loop.
 
+This reference is also available in the CLI with:
+
+```bash
+devloop docs security
+```
+
 ## Threat model
 
 `devloop` supervises local processes, runs hooks, persists session

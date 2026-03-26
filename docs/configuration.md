@@ -3,6 +3,12 @@
 `devloop` is configured with a TOML file, typically `devloop.toml` in
 the client repository root.
 
+This reference is also available in the CLI with:
+
+```bash
+devloop docs config
+```
+
 ## Top-level keys
 
 ```toml

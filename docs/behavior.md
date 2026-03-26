@@ -3,6 +3,12 @@
 This document describes how `devloop` behaves at runtime beyond the
 schema in [`configuration.md`](configuration.md).
 
+This reference is also available in the CLI with:
+
+```bash
+devloop docs behavior
+```
+
 ## Core model
 
 `devloop` is moving toward a pure core with an imperative shell.

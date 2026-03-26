@@ -14,6 +14,9 @@ All notable changes to `devloop` will be recorded in this file.
   `devloop` without polling.
 - Added dedicated security documentation for external events and the
   push-versus-polling tradeoffs in [`docs/security.md`](docs/security.md).
+- Added `devloop docs <topic>` so the configuration, behavior, and
+  security references can be read directly from the CLI without
+  duplicating the source material.
 
 ### Changed
 - Moved workflow progression into a pure state/effect core so ordered

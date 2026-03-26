@@ -9,7 +9,7 @@ mod state;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::FmtContext;
@@ -47,6 +47,18 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Print built-in reference documentation.
+    Docs {
+        #[arg(value_enum)]
+        topic: DocsTopic,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DocsTopic {
+    Config,
+    Behavior,
+    Security,
 }
 
 #[tokio::main]
@@ -69,6 +81,9 @@ async fn main() -> Result<()> {
             let config = Config::load(&config)?;
             config.validate()?;
             Engine::new(config).run().await?;
+        }
+        Command::Docs { topic } => {
+            print!("{}", docs_text(topic));
         }
     }
     Ok(())
@@ -128,12 +143,21 @@ fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+fn docs_text(topic: DocsTopic) -> &'static str {
+    match topic {
+        DocsTopic::Config => include_str!("../docs/configuration.md"),
+        DocsTopic::Behavior => include_str!("../docs/behavior.md"),
+        DocsTopic::Security => include_str!("../docs/security.md"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{default_rust_log, format_tracing_prefix};
+    use super::{Cli, DocsTopic, default_rust_log, docs_text, format_tracing_prefix};
     use crate::output::{
         format_output_prefix, normalize_internal_log_label, normalize_source_label,
     };
+    use clap::Parser;
     use std::sync::{Mutex, OnceLock};
 
     fn rust_log_lock() -> &'static Mutex<()> {
@@ -197,5 +221,23 @@ mod tests {
         assert!(rendered.contains("[devloop hyper_util client legacy connect http]"));
         assert!(rendered.starts_with("\u{1b}[1;"));
         assert!(rendered.ends_with(" "));
+    }
+
+    #[test]
+    fn docs_text_uses_embedded_configuration_reference() {
+        let rendered = docs_text(DocsTopic::Config);
+
+        assert!(rendered.starts_with("# Configuration Reference"));
+        assert!(rendered.contains("startup_workflows"));
+    }
+
+    #[test]
+    fn cli_parses_docs_subcommand() {
+        let cli = Cli::try_parse_from(["devloop", "docs", "security"]).expect("parse cli");
+
+        match cli.command {
+            super::Command::Docs { topic } => assert!(matches!(topic, DocsTopic::Security)),
+            _ => panic!("expected docs subcommand"),
+        }
     }
 }
