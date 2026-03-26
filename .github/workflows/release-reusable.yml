@@ -12,6 +12,9 @@ on:
       archive_name:
         required: true
         type: string
+      generate_release_notes:
+        required: true
+        type: boolean
 
 permissions:
   contents: write
@@ -57,5 +60,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ inputs.archive_name }}
-          generate_release_notes: true
+          generate_release_notes: ${{ inputs.generate_release_notes }}
           fail_on_unmatched_files: true

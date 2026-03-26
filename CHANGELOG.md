@@ -4,6 +4,9 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Platform-specific release workflows no longer duplicate GitHub release notes when both assets are published to the same tag.
+
 ## [0.6.2] - 2026-03-26
 
 ### Fixed
