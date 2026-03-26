@@ -1,0 +1,17 @@
+name: macOS Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-reusable.yml
+    with:
+      runner: macos-14
+      target: aarch64-apple-darwin
+      archive_name: devloop-aarch64-apple-darwin.tar.gz

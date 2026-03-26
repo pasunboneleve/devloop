@@ -50,6 +50,9 @@ cargo install --git https://github.com/pasunboneleve/devloop.git
 
 Tagged releases are also published automatically on GitHub with
 prebuilt release archives for Linux x86_64 and macOS Apple Silicon.
+Each supported platform publishes its release asset independently, so a
+failure on one platform does not block the other asset from being
+attached to the GitHub release.
 
 Supported prebuilt release targets:
 
