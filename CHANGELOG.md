@@ -4,6 +4,11 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Made the CI smoke test wait for file watching to start before editing
+  the watched fixture file, avoiding a startup race that could time out
+  on macOS runners.
+
 ## [0.6.1] - 2026-03-26
 
 ### Changed

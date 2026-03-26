@@ -44,6 +44,20 @@ while time.time() < deadline:
 raise SystemExit("timed out waiting for startup state")
 PY
 
+python3 - "$log_path" <<'PY'
+import pathlib
+import sys
+import time
+
+log_path = pathlib.Path(sys.argv[1])
+deadline = time.time() + 15
+while time.time() < deadline:
+    if log_path.exists() and "watching " in log_path.read_text():
+        sys.exit(0)
+    time.sleep(0.1)
+raise SystemExit("timed out waiting for watcher startup")
+PY
+
 printf 'updated\n' > "${tmp_dir}/watched.txt"
 
 python3 - "$state_path" "$log_path" <<'PY'
@@ -65,6 +79,7 @@ while time.time() < deadline:
             if "changed value: updated" in log_path.read_text():
                 sys.exit(0)
     time.sleep(0.1)
+print(log_path.read_text(), file=sys.stderr)
 raise SystemExit("timed out waiting for changed state")
 PY
 
