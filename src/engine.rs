@@ -10,7 +10,7 @@ use notify::{
 use serde_json::{Map, Value};
 use tokio::signal;
 use tokio::time::{Instant, sleep};
-use tracing::{info, warn};
+use tracing::{error, info};
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::{CompiledWatchGroup, Config, LogStyle};
@@ -85,7 +85,12 @@ impl Engine {
         let tx_watcher = tx.clone();
         let mut watcher = RecommendedWatcher::new(
             move |result| {
-                let _ = tx_watcher.send(result);
+                if let Err(error) = tx_watcher.send(result) {
+                    error!(
+                        "failed to forward watcher event into runtime loop: {}",
+                        error
+                    );
+                }
             },
             NotifyConfig::default(),
         )?;
@@ -125,9 +130,7 @@ impl Engine {
                     }
                 }
                 batch = next_batch(&rx, self.config.debounce()) => {
-                    let Some(events) = batch? else {
-                        continue;
-                    };
+                    let events = batch?;
                     let workflows = classify_events(&self.config.root, &watch_groups, &events);
                     if !workflows.is_empty() {
                         runtime.handle_event(RuntimeEvent::WatchChanges { workflows });
@@ -136,12 +139,17 @@ impl Engine {
                         }
                     }
                 }
-                Some(event) = external_event_rx.recv() => {
-                    runtime.handle_event(RuntimeEvent::WorkflowTrigger {
-                        workflow_name: event.workflow_name,
-                    });
-                    if execute_runtime_effects(&mut runtime, &mut adapter).await? {
-                        return Ok(());
+                event = external_event_rx.recv() => {
+                    match event {
+                        Some(event) => {
+                            runtime.handle_event(RuntimeEvent::WorkflowTrigger {
+                                workflow_name: event.workflow_name,
+                            });
+                            if execute_runtime_effects(&mut runtime, &mut adapter).await? {
+                                return Ok(());
+                            }
+                        }
+                        None => return Err(anyhow!("external event channel disconnected")),
                     }
                 }
             }
@@ -225,10 +233,10 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
 
     async fn run_workflow(&mut self, workflow_name: &str, changed_files: &[String]) -> Result<()> {
         info!("running workflow {}", workflow_name);
-        let Some(_) = self.config.workflow.get(workflow_name) else {
-            warn!("skipping missing workflow {}", workflow_name);
-            return Ok(());
-        };
+        self.config
+            .workflow
+            .get(workflow_name)
+            .ok_or_else(|| anyhow!("runtime requested missing workflow '{workflow_name}'"))?;
         let mut adapter = LiveWorkflowAdapter {
             processes: self.processes,
             state: self.state,
@@ -306,10 +314,10 @@ async fn run_workflow(
     changed_files: &[String],
 ) -> Result<()> {
     info!("running workflow {}", workflow_name);
-    let Some(_) = config.workflow.get(workflow_name) else {
-        warn!("skipping missing workflow {}", workflow_name);
-        return Ok(());
-    };
+    config
+        .workflow
+        .get(workflow_name)
+        .ok_or_else(|| anyhow!("runtime requested missing workflow '{workflow_name}'"))?;
     let mut adapter = LiveWorkflowAdapter { processes, state };
     run_workflow_machine(config, &mut adapter, workflow_name, changed_files).await
 }
@@ -381,10 +389,10 @@ fn boxed_banner_lines(message: &str) -> [String; 3] {
 async fn next_batch(
     rx: &mpsc::Receiver<notify::Result<Event>>,
     debounce: Duration,
-) -> Result<Option<Vec<Event>>> {
+) -> Result<Vec<Event>> {
     let first = match rx.recv() {
         Ok(result) => result?,
-        Err(_) => return Ok(None),
+        Err(_) => return Err(anyhow!("watcher event channel disconnected")),
     };
     let start = Instant::now();
     let mut events = vec![first];
@@ -395,7 +403,7 @@ async fn next_batch(
             Err(mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    Ok(Some(events))
+    Ok(events)
 }
 
 fn classify_events(
@@ -493,6 +501,22 @@ mod tests {
         let grouped = classify_events(&root, &groups, &events);
         assert_eq!(grouped["server"], vec!["src/main.rs"]);
         assert_eq!(grouped["content"], vec!["content/posts/example.md"]);
+    }
+
+    #[tokio::test]
+    async fn next_batch_errors_when_watcher_channel_disconnects() {
+        let (_tx, rx) = mpsc::channel();
+        drop(_tx);
+
+        let error = next_batch(&rx, Duration::from_millis(10))
+            .await
+            .expect_err("channel disconnect should error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("watcher event channel disconnected")
+        );
     }
 
     #[test]
@@ -1080,5 +1104,35 @@ mod tests {
                 "workflow:publish_post_url:",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_workflow_returns_error() {
+        let config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        let state_path = unique_state_path();
+        let state = SessionState::load(state_path.clone()).expect("load state");
+        let mut processes = ProcessManager::new(&config);
+
+        let error = run_workflow(&config, &mut processes, &state, "missing", &[])
+            .await
+            .expect_err("missing workflow should error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("runtime requested missing workflow 'missing'")
+        );
+        let _ = std::fs::remove_file(state_path);
     }
 }

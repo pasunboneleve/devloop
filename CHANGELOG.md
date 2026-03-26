@@ -5,6 +5,13 @@ All notable changes to `devloop` will be recorded in this file.
 ## [Unreleased]
 
 ### Fixed
+- Runtime requests for missing workflows now fail explicitly instead of
+  being logged and skipped, and external events return `503` if their
+  workflow trigger cannot be dispatched.
+- Watcher callback delivery failures are now surfaced as errors instead
+  of being dropped silently.
+- Unexpected watcher and external-event channel disconnects now fail the
+  engine explicitly instead of silently disabling those input paths.
 - Accepted macOS `notify` event paths reported under `/private/...`
   for watched roots configured under `/var/...`, so file changes in
   temp directories are no longer dropped by the watch classifier.

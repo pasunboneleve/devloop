@@ -75,7 +75,7 @@ impl ExternalEventServer {
             .with_state(Arc::new(app_state));
         let task = tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
-                info!("external event server stopped: {}", error);
+                error!("external event server stopped unexpectedly: {}", error);
             }
         });
 
@@ -137,10 +137,18 @@ async fn handle_event(
         .set_if_changed(&spec.state_key, Value::String(payload.value))
     {
         Ok(true) => {
-            let _ = state.sender.send(ExternalEventMessage {
+            match state.sender.send(ExternalEventMessage {
                 workflow_name: spec.workflow.clone(),
-            });
-            StatusCode::NO_CONTENT
+            }) {
+                Ok(()) => StatusCode::NO_CONTENT,
+                Err(error) => {
+                    error!(
+                        "failed to dispatch external event '{}' to workflow '{}': {}",
+                        name, spec.workflow, error
+                    );
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
         }
         Ok(false) => StatusCode::NO_CONTENT,
         Err(err) => {
@@ -465,6 +473,65 @@ mod tests {
             None
         );
         assert!(receiver.try_recv().is_err());
+
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn event_server_fails_loudly_when_workflow_dispatch_is_unavailable() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "publish_post_url".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "ok".into(),
+                    style: crate::config::LogStyle::Plain,
+                }],
+            },
+        );
+        config.event.insert(
+            "browser_path".into(),
+            EventSpec {
+                state_key: "current_browser_path".into(),
+                workflow: "publish_post_url".into(),
+                pattern: None,
+            },
+        );
+        let state_path = std::env::temp_dir().join(format!(
+            "devloop-external-events-dispatch-{}.json",
+            std::process::id()
+        ));
+        let state = SessionState::load(state_path.clone()).expect("load state");
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let server = ExternalEventServer::start(&config, state.clone(), sender)
+            .await
+            .expect("start external event server")
+            .expect("event server");
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(
+                server
+                    .environment()
+                    .event_urls
+                    .get("browser_path")
+                    .expect("browser path url"),
+            )
+            .bearer_auth(&server.environment().token)
+            .json(&serde_json::json!({ "value": "/posts/example-post" }))
+            .send()
+            .await
+            .expect("send request");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state
+                .get_string("current_browser_path")
+                .expect("get current_browser_path")
+                .as_deref(),
+            Some("/posts/example-post")
+        );
 
         let _ = std::fs::remove_file(state_path);
     }
