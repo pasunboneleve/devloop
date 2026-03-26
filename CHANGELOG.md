@@ -2,7 +2,7 @@
 
 All notable changes to `devloop` will be recorded in this file.
 
-## [Unreleased]
+## [0.6.0] - 2026-03-26
 
 ### Added
 - Added observed hooks, allowing a hook to be polled on the runtime
