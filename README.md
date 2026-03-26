@@ -1,6 +1,7 @@
 # devloop
 
-[![CI](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml/badge.svg)](https://github.com/pasunboneleve/devloop/actions/workflows/ci.yml)
+[![Linux CI](https://github.com/pasunboneleve/devloop/actions/workflows/linux-ci.yml/badge.svg)](https://github.com/pasunboneleve/devloop/actions/workflows/linux-ci.yml)
+[![macOS CI](https://github.com/pasunboneleve/devloop/actions/workflows/macos-ci.yml/badge.svg)](https://github.com/pasunboneleve/devloop/actions/workflows/macos-ci.yml)
 
 **Keep the local loop cheap.**
 
@@ -48,7 +49,12 @@ cargo install --git https://github.com/pasunboneleve/devloop.git
 ```
 
 Tagged releases are also published automatically on GitHub with
-prebuilt release archives for Linux and macOS.
+prebuilt release archives for Linux x86_64 and macOS Apple Silicon.
+
+Supported prebuilt release targets:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-apple-darwin`
 
 For local development from a checkout:
 

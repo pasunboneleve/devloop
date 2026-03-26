@@ -1,21 +1,18 @@
-name: CI
+name: Rust CI Reusable
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   rust:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ inputs.runner }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6

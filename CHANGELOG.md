@@ -9,6 +9,11 @@ All notable changes to `devloop` will be recorded in this file.
   the watched fixture file, avoiding a startup race that could time out
   on macOS runners.
 
+### Changed
+- Split Linux and macOS CI into separate badgeable workflows backed by
+  one reusable workflow definition, and limited release archives to the
+  supported Linux x86_64 and macOS Apple Silicon targets.
+
 ## [0.6.1] - 2026-03-26
 
 ### Changed

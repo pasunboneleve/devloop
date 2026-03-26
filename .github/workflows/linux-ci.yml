@@ -1,0 +1,16 @@
+name: Linux CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    uses: ./.github/workflows/rust-ci-reusable.yml
+    with:
+      runner: ubuntu-latest
