@@ -60,7 +60,6 @@ state_key = "current_browser_path"
 state_key = "current_browser_path"
 workflow = "publish_post_url"
 pattern = "^/(|posts/[a-z0-9-]+)$"
-observe = { workflow = "publish_post_url", interval_ms = 1000 }
 
 [workflow.publish_post_url]
 steps = [
