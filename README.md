@@ -47,6 +47,9 @@ Install the latest published `main` branch directly from GitHub:
 cargo install --git https://github.com/pasunboneleve/devloop.git
 ```
 
+Tagged releases are also published automatically on GitHub with
+prebuilt release archives for Linux and macOS.
+
 For local development from a checkout:
 
 ```bash

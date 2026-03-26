@@ -17,6 +17,9 @@ All notable changes to `devloop` will be recorded in this file.
 - Added `devloop docs <topic>` so the configuration, behavior, and
   security references can be read directly from the CLI without
   duplicating the source material.
+- Added a tag-driven GitHub release workflow that verifies the Cargo
+  version, builds release archives for Linux and macOS, and publishes
+  them as GitHub Release assets.
 
 ### Changed
 - Moved workflow progression into a pure state/effect core so ordered
