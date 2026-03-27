@@ -4,6 +4,8 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-03-27
+
 ### Added
 - Added a browser reload event server and a `notify_reload` workflow
   action so workflows can explicitly tell downstream browser listeners
@@ -25,6 +27,11 @@ All notable changes to `devloop` will be recorded in this file.
 - Trigger-overlap validation now walks the full execution tree, so
   nested trigger graphs cannot schedule the same workflow once as a
   trigger target and again through an inline `run_workflow` path.
+- Fixed a false positive in that validator so inline workflows with
+  independent trigger targets are allowed.
+- Added regression coverage for both the allowed independent-trigger
+  case and the rejected case where a parent workflow and an inline child
+  share the same trigger target.
 - Platform-specific release workflows no longer duplicate GitHub release notes when both assets are published to the same tag.
 
 ## [0.6.2] - 2026-03-26
