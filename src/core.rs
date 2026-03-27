@@ -50,6 +50,7 @@ pub enum WorkflowEffect {
         message: String,
         style: LogStyle,
     },
+    NotifyReload,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +59,7 @@ pub struct RuntimeMachine {
     pending_effects: VecDeque<RuntimeEffect>,
     observed_hooks: BTreeMap<String, ObservedHookRuntimeState>,
     has_external_events: bool,
+    has_browser_reload_notifications: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +94,7 @@ pub enum RuntimeEffect {
         value: Value,
     },
     StartExternalEventServer,
+    StartBrowserReloadServer,
     StartAutostartProcesses,
     RunWorkflow {
         workflow_name: String,
@@ -263,6 +266,7 @@ impl WorkflowMachine {
                         style,
                     }));
                 }
+                WorkflowStep::NotifyReload => return Ok(Some(WorkflowEffect::NotifyReload)),
             }
         }
     }
@@ -291,6 +295,7 @@ impl RuntimeMachine {
             pending_effects: VecDeque::new(),
             observed_hooks,
             has_external_events: config.has_external_events(),
+            has_browser_reload_notifications: config.has_browser_reload_notifications(),
         }
     }
 
@@ -310,6 +315,10 @@ impl RuntimeMachine {
                 if self.has_external_events {
                     self.pending_effects
                         .push_back(RuntimeEffect::StartExternalEventServer);
+                }
+                if self.has_browser_reload_notifications {
+                    self.pending_effects
+                        .push_back(RuntimeEffect::StartBrowserReloadServer);
                 }
                 self.pending_effects
                     .push_back(RuntimeEffect::StartAutostartProcesses);
@@ -563,6 +572,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         }
@@ -719,6 +729,28 @@ mod tests {
     }
 
     #[test]
+    fn machine_emits_notify_reload_effect() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "rust".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+            },
+        );
+
+        let mut machine =
+            WorkflowMachine::start(&config, Map::new(), "rust", &[]).expect("start machine");
+        let _ = machine.next_effect(&config).expect("change context");
+        let _ = machine.next_effect(&config).expect("change context");
+
+        assert_eq!(
+            machine.next_effect(&config).expect("effect"),
+            Some(WorkflowEffect::NotifyReload)
+        );
+        assert_eq!(machine.next_effect(&config).expect("effect"), None);
+    }
+
+    #[test]
     fn runtime_machine_plans_startup_sequence() {
         let config = base_config();
         let mut runtime = RuntimeMachine::new(&config);
@@ -754,6 +786,34 @@ mod tests {
         );
         assert_eq!(runtime.next_effect(), Some(RuntimeEffect::StartWatching));
         assert_eq!(runtime.next_effect(), None);
+    }
+
+    #[test]
+    fn runtime_machine_starts_browser_reload_server_when_workflows_use_notify_reload() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "rust".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+            },
+        );
+        let mut runtime = RuntimeMachine::new(&config);
+        runtime.handle_event(RuntimeEvent::Start {
+            root_display: "/tmp/example".into(),
+            startup_workflows: vec![],
+        });
+
+        assert_eq!(
+            runtime.next_effect(),
+            Some(RuntimeEffect::PersistState {
+                key: "root".into(),
+                value: Value::String("/tmp/example".into())
+            })
+        );
+        assert_eq!(
+            runtime.next_effect(),
+            Some(RuntimeEffect::StartBrowserReloadServer)
+        );
     }
 
     #[test]

@@ -194,6 +194,18 @@ Repeated setup can be factored into helper workflows and reused with
 `run_workflow`, for example a `publish_post_url` workflow that waits for
 the tunnel and then writes the derived URL.
 
+Workflows can also trigger a generic browser refresh after successful
+rebuild/restart steps:
+
+```toml
+step = { action = "notify_reload" }
+```
+
+If any workflow uses `notify_reload`, `devloop` starts a localhost SSE
+endpoint and exposes its URL to child processes as
+`DEVLOOP_BROWSER_EVENTS_URL` so client repositories can attach a tiny
+browser-side `EventSource` listener.
+
 Hooks can also be observed on the runtime tick when external state
 changes are not represented by file edits. For example:
 

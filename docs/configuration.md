@@ -26,6 +26,16 @@ startup_workflows = ["startup"]
 - `startup_workflows`: workflows to run after autostart processes have
   been started.
 
+Optional browser reload server config:
+
+```toml
+[browser_reload_server]
+bind = "127.0.0.1:0"
+```
+
+- `browser_reload_server.bind`: local socket address for the browser
+  reload SSE listener. Default: `127.0.0.1:0`.
+
 ## Watch groups
 
 Watch groups map file patterns to workflows.
@@ -236,6 +246,24 @@ Event ingestion is capability-scoped:
 See [`security.md`](security.md) for the trust model and the tradeoff
 against observed-hook polling.
 
+## Browser reload events
+
+If any workflow uses `notify_reload`, `devloop` starts a localhost SSE
+server for browser listeners.
+
+```toml
+[browser_reload_server]
+bind = "127.0.0.1:0"
+```
+
+Child processes and hooks receive:
+
+- `DEVLOOP_BROWSER_EVENTS_URL`
+
+The client repository can expose that URL to a tiny browser-side
+listener which subscribes with `EventSource` and reloads the page when
+it receives `reload`.
+
 ### Hook capture modes
 
 - `ignore`: discard stdout.
@@ -276,6 +304,7 @@ steps = [
 - `sleep_ms`
 - `write_state`
 - `log`
+- `notify_reload`
 
 ### `write_state`
 
@@ -294,6 +323,15 @@ state.
 
 - `message`: rendered with session-state interpolation.
 - `style`: `plain` or `boxed`.
+
+### `notify_reload`
+
+```toml
+{ action = "notify_reload" }
+```
+
+Broadcasts a single `reload` event to all browser listeners connected to
+the `DEVLOOP_BROWSER_EVENTS_URL` SSE endpoint.
 
 ## Session state
 
@@ -336,5 +374,6 @@ steps = [
 steps = [
   { action = "restart_process", process = "server" },
   { action = "wait_for_process", process = "server" },
+  { action = "notify_reload" },
 ]
 ```

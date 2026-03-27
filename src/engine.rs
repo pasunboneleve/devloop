@@ -13,6 +13,7 @@ use tokio::time::{Instant, sleep};
 use tracing::{error, info};
 use unicode_width::UnicodeWidthStr;
 
+use crate::browser_reload::{BrowserReloadSender, BrowserReloadServer, notify_browser_reload};
 use crate::config::{CompiledWatchGroup, Config, LogStyle};
 use crate::core::{RuntimeEffect, RuntimeEvent, RuntimeMachine, WorkflowEffect, WorkflowMachine};
 use crate::external_events::{ExternalEventMessage, ExternalEventServer};
@@ -34,6 +35,7 @@ trait WorkflowEffectAdapter {
         changed_files: &[String],
         workflow_name: &str,
     ) -> Result<()>;
+    async fn notify_reload(&mut self) -> Result<()>;
     async fn sleep_ms(&mut self, duration_ms: u64) -> Result<()>;
     async fn persist_state(&mut self, key: String, value: Value) -> Result<()>;
     async fn log_message(&mut self, style: LogStyle, message: String) -> Result<()>;
@@ -43,6 +45,7 @@ trait WorkflowEffectAdapter {
 trait RuntimeEffectAdapter {
     async fn persist_state(&mut self, key: String, value: Value) -> Result<()>;
     async fn start_external_event_server(&mut self) -> Result<()>;
+    async fn start_browser_reload_server(&mut self) -> Result<()>;
     async fn start_autostart_processes(&mut self) -> Result<()>;
     async fn run_workflow(&mut self, workflow_name: &str, changed_files: &[String]) -> Result<()>;
     async fn start_watching(&mut self) -> Result<()>;
@@ -55,6 +58,7 @@ trait RuntimeEffectAdapter {
 struct LiveWorkflowAdapter<'a, 'b> {
     processes: &'a mut ProcessManager<'b>,
     state: &'a SessionState,
+    browser_reload_sender: Option<BrowserReloadSender>,
 }
 
 struct LiveRuntimeAdapter<'a, 'b> {
@@ -64,6 +68,7 @@ struct LiveRuntimeAdapter<'a, 'b> {
     watcher: &'a mut RecommendedWatcher,
     external_event_tx: tokio::sync::mpsc::UnboundedSender<ExternalEventMessage>,
     external_event_server: Option<ExternalEventServer>,
+    browser_reload_server: Option<BrowserReloadServer>,
 }
 
 impl Engine {
@@ -108,6 +113,7 @@ impl Engine {
             watcher: &mut watcher,
             external_event_tx,
             external_event_server: None,
+            browser_reload_server: None,
         };
         execute_runtime_effects(&mut runtime, &mut adapter).await?;
 
@@ -185,6 +191,13 @@ impl WorkflowEffectAdapter for LiveWorkflowAdapter<'_, '_> {
             .await
     }
 
+    async fn notify_reload(&mut self) -> Result<()> {
+        if let Some(sender) = &self.browser_reload_sender {
+            notify_browser_reload(sender);
+        }
+        Ok(())
+    }
+
     async fn sleep_ms(&mut self, duration_ms: u64) -> Result<()> {
         sleep(Duration::from_millis(duration_ms)).await;
         Ok(())
@@ -227,6 +240,18 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
         Ok(())
     }
 
+    async fn start_browser_reload_server(&mut self) -> Result<()> {
+        if self.browser_reload_server.is_some() {
+            return Ok(());
+        }
+        if let Some(server) = BrowserReloadServer::start(self.config).await? {
+            self.processes
+                .set_browser_reload_env(Some(server.environment().clone()));
+            self.browser_reload_server = Some(server);
+        }
+        Ok(())
+    }
+
     async fn start_autostart_processes(&mut self) -> Result<()> {
         self.processes.start_autostart(self.state).await
     }
@@ -240,6 +265,10 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
         let mut adapter = LiveWorkflowAdapter {
             processes: self.processes,
             state: self.state,
+            browser_reload_sender: self
+                .browser_reload_server
+                .as_ref()
+                .map(BrowserReloadServer::sender),
         };
         run_workflow_machine(self.config, &mut adapter, workflow_name, changed_files).await
     }
@@ -281,6 +310,9 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
             RuntimeEffect::StartExternalEventServer => {
                 adapter.start_external_event_server().await?
             }
+            RuntimeEffect::StartBrowserReloadServer => {
+                adapter.start_browser_reload_server().await?
+            }
             RuntimeEffect::StartAutostartProcesses => adapter.start_autostart_processes().await?,
             RuntimeEffect::RunWorkflow {
                 workflow_name,
@@ -318,6 +350,7 @@ async fn run_workflow(
     config: &Config,
     processes: &mut ProcessManager<'_>,
     state: &SessionState,
+    browser_reload_sender: Option<BrowserReloadSender>,
     workflow_name: &str,
     changed_files: &[String],
 ) -> Result<()> {
@@ -326,7 +359,11 @@ async fn run_workflow(
         .workflow
         .get(workflow_name)
         .ok_or_else(|| anyhow!("runtime requested missing workflow '{workflow_name}'"))?;
-    let mut adapter = LiveWorkflowAdapter { processes, state };
+    let mut adapter = LiveWorkflowAdapter {
+        processes,
+        state,
+        browser_reload_sender,
+    };
     run_workflow_machine(config, &mut adapter, workflow_name, changed_files).await
 }
 
@@ -368,6 +405,7 @@ async fn execute_workflow_effect<A: WorkflowEffectAdapter>(
                 .run_hook(&hook, &changed_files, &workflow_name)
                 .await
         }
+        WorkflowEffect::NotifyReload => adapter.notify_reload().await,
         WorkflowEffect::SleepMs { duration_ms } => adapter.sleep_ms(duration_ms).await,
         WorkflowEffect::PersistState { key, value } => adapter.persist_state(key, value).await,
         WorkflowEffect::Log { message, style } => adapter.log_message(style, message).await,
@@ -569,6 +607,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
@@ -583,7 +622,7 @@ mod tests {
         );
 
         let mut processes = ProcessManager::new(&config);
-        run_workflow(&config, &mut processes, &state, "compose", &[])
+        run_workflow(&config, &mut processes, &state, None, "compose", &[])
             .await
             .expect("run workflow");
 
@@ -622,6 +661,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
@@ -644,7 +684,7 @@ mod tests {
         );
 
         let mut processes = ProcessManager::new(&config);
-        run_workflow(&config, &mut processes, &state, "content", &[])
+        run_workflow(&config, &mut processes, &state, None, "content", &[])
             .await
             .expect("run workflow");
 
@@ -687,6 +727,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
@@ -701,7 +742,7 @@ mod tests {
         );
 
         let mut processes = ProcessManager::new(&config);
-        run_workflow(&config, &mut processes, &state, "announce", &[])
+        run_workflow(&config, &mut processes, &state, None, "announce", &[])
             .await
             .expect("run workflow");
 
@@ -776,6 +817,11 @@ mod tests {
             Ok(())
         }
 
+        async fn notify_reload(&mut self) -> Result<()> {
+            self.calls.push("notify_reload".into());
+            Ok(())
+        }
+
         async fn sleep_ms(&mut self, duration_ms: u64) -> Result<()> {
             self.sleeps.push_back(duration_ms);
             Ok(())
@@ -808,6 +854,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
@@ -826,6 +873,7 @@ mod tests {
                         message: "ready {{url}}".into(),
                         style: LogStyle::Plain,
                     },
+                    WorkflowStep::NotifyReload,
                 ],
             },
         );
@@ -846,6 +894,7 @@ mod tests {
                 "persist:url",
                 "hook:build_css:startup:tailwind.css",
                 "log:Plain:ready https://example.test/post",
+                "notify_reload",
             ]
         );
     }
@@ -874,6 +923,11 @@ mod tests {
 
         async fn start_external_event_server(&mut self) -> Result<()> {
             self.calls.push("event_server".into());
+            Ok(())
+        }
+
+        async fn start_browser_reload_server(&mut self) -> Result<()> {
+            self.calls.push("browser_reload_server".into());
             Ok(())
         }
 
@@ -934,6 +988,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
@@ -1016,6 +1071,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::from([(
                 "browser_path".into(),
                 crate::config::EventSpec {
@@ -1080,6 +1136,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::from([(
                 "browser_path".into(),
                 crate::config::EventSpec {
@@ -1130,6 +1187,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
@@ -1163,6 +1221,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         };
@@ -1170,7 +1229,7 @@ mod tests {
         let state = SessionState::load(state_path.clone()).expect("load state");
         let mut processes = ProcessManager::new(&config);
 
-        let error = run_workflow(&config, &mut processes, &state, "missing", &[])
+        let error = run_workflow(&config, &mut processes, &state, None, "missing", &[])
             .await
             .expect_err("missing workflow should error");
 

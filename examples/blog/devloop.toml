@@ -87,6 +87,7 @@ steps = [
   { action = "run_hook", hook = "current_browser_path" },
   { action = "restart_process", process = "tunnel" },
   { action = "run_workflow", workflow = "publish_post_url" },
+  { action = "notify_reload" },
 ]
 
 [workflow.content]
@@ -94,4 +95,5 @@ steps = [
   { action = "run_hook", hook = "current_browser_path" },
   { action = "restart_process", process = "tunnel" },
   { action = "run_workflow", workflow = "publish_post_url" },
+  { action = "notify_reload" },
 ]

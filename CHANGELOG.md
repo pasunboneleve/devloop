@@ -4,6 +4,11 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Added
+- Added a browser reload event server and a `notify_reload` workflow
+  action so workflows can explicitly tell downstream browser listeners
+  to refresh after successful rebuild/restart steps.
+
 ### Fixed
 - Workflow failures such as process-readiness timeouts now log loudly
   but do not terminate `devloop`, so the watcher stays alive and the

@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+use crate::browser_reload::{BrowserReloadEnvironment, apply_browser_reload_env};
 use crate::config::{
     Config, HookOutputConfig, HookSpec, OutputBodyStyle, OutputExtract, OutputRule, ProbeSpec,
     ProcessSpec,
@@ -33,6 +34,7 @@ pub struct ProcessManager<'a> {
     supervisor: ProcessSupervisor,
     clock_start: Instant,
     external_event_env: Option<ExternalEventEnvironment>,
+    browser_reload_env: Option<BrowserReloadEnvironment>,
 }
 
 struct ManagedProcess {
@@ -42,6 +44,7 @@ struct ManagedProcess {
 struct CommandContext<'a> {
     env: &'a BTreeMap<String, String>,
     external_event_env: Option<&'a ExternalEventEnvironment>,
+    browser_reload_env: Option<&'a BrowserReloadEnvironment>,
     root: &'a Path,
     state_path: &'a Path,
     changed_files: &'a [String],
@@ -60,11 +63,16 @@ impl<'a> ProcessManager<'a> {
             supervisor: ProcessSupervisor::new(config),
             clock_start: Instant::now(),
             external_event_env: None,
+            browser_reload_env: None,
         }
     }
 
     pub fn set_external_event_env(&mut self, external_event_env: Option<ExternalEventEnvironment>) {
         self.external_event_env = external_event_env;
+    }
+
+    pub fn set_browser_reload_env(&mut self, browser_reload_env: Option<BrowserReloadEnvironment>) {
+        self.browser_reload_env = browser_reload_env;
     }
 
     pub async fn start_autostart(&mut self, state: &SessionState) -> Result<()> {
@@ -133,6 +141,7 @@ impl<'a> ProcessManager<'a> {
             CommandContext {
                 env: &spec.env,
                 external_event_env: self.external_event_env.as_ref(),
+                browser_reload_env: self.browser_reload_env.as_ref(),
                 root: &self.config.root,
                 state_path: state.path(),
                 changed_files,
@@ -213,6 +222,7 @@ impl<'a> ProcessManager<'a> {
             CommandContext {
                 env: &spec.env,
                 external_event_env: self.external_event_env.as_ref(),
+                browser_reload_env: self.browser_reload_env.as_ref(),
                 root: &self.config.root,
                 state_path: state.path(),
                 changed_files: &[],
@@ -802,6 +812,7 @@ fn configure_command(
     cmd.current_dir(cwd);
     let mut full_env = context.env.clone();
     apply_external_event_env(&mut full_env, context.external_event_env);
+    apply_browser_reload_env(&mut full_env, context.browser_reload_env);
     cmd.envs(full_env);
     cmd.env("DEVLOOP_ROOT", context.root);
     cmd.env("DEVLOOP_STATE", context.state_path);
@@ -1323,6 +1334,7 @@ mod tests {
             CommandContext {
                 env: &BTreeMap::new(),
                 external_event_env: None,
+                browser_reload_env: None,
                 root: Path::new("/tmp"),
                 state_path: Path::new("/tmp/state.json"),
                 changed_files: &[],
@@ -1360,6 +1372,7 @@ mod tests {
             CommandContext {
                 env: &env,
                 external_event_env: None,
+                browser_reload_env: None,
                 root: Path::new("/tmp"),
                 state_path: Path::new("/tmp/state.json"),
                 changed_files: &[],
@@ -1398,6 +1411,7 @@ mod tests {
             CommandContext {
                 env: &env,
                 external_event_env: Some(&external_event_env),
+                browser_reload_env: None,
                 root: Path::new("/tmp"),
                 state_path: Path::new("/tmp/state.json"),
                 changed_files: &[],
@@ -1417,6 +1431,35 @@ mod tests {
                     == Some(std::ffi::OsStr::new(
                         "http://127.0.0.1:12345/events/browser_path",
                     ))
+        }));
+    }
+
+    #[test]
+    fn configure_command_injects_browser_reload_environment() {
+        let env = BTreeMap::new();
+        let browser_reload_env = BrowserReloadEnvironment {
+            events_url: "http://127.0.0.1:4455/browser-events".into(),
+        };
+
+        let command = configure_command(
+            &["cargo".into(), "run".into()],
+            PathBuf::from("/tmp"),
+            CommandContext {
+                env: &env,
+                external_event_env: None,
+                browser_reload_env: Some(&browser_reload_env),
+                root: Path::new("/tmp"),
+                state_path: Path::new("/tmp/state.json"),
+                changed_files: &[],
+                workflow: "startup",
+            },
+        )
+        .expect("configure command");
+
+        let envs = command.as_std().get_envs().collect::<Vec<_>>();
+        assert!(envs.iter().any(|(key, value)| {
+            *key == std::ffi::OsStr::new("DEVLOOP_BROWSER_EVENTS_URL")
+                && *value == Some(std::ffi::OsStr::new("http://127.0.0.1:4455/browser-events"))
         }));
     }
 

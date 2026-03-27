@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub event_server: EventServerConfig,
     #[serde(default)]
+    pub browser_reload_server: BrowserReloadServerConfig,
+    #[serde(default)]
     pub event: BTreeMap<String, EventSpec>,
     #[serde(default)]
     pub workflow: BTreeMap<String, WorkflowSpec>,
@@ -89,6 +91,7 @@ impl Config {
             }
         }
         self.event_server.validate()?;
+        self.browser_reload_server.validate()?;
         for (name, event) in &self.event {
             event
                 .validate()
@@ -128,6 +131,32 @@ impl Config {
 
     pub fn has_external_events(&self) -> bool {
         !self.event.is_empty()
+    }
+
+    pub fn has_browser_reload_notifications(&self) -> bool {
+        self.workflow
+            .keys()
+            .any(|name| self.workflow_uses_notify_reload(name, &mut Vec::new()))
+    }
+
+    fn workflow_uses_notify_reload(&self, workflow_name: &str, stack: &mut Vec<String>) -> bool {
+        let Some(workflow) = self.workflow.get(workflow_name) else {
+            return false;
+        };
+        if stack.iter().any(|name| name == workflow_name) {
+            return false;
+        }
+
+        stack.push(workflow_name.to_string());
+        let found = workflow.steps.iter().any(|step| match step {
+            WorkflowStep::NotifyReload => true,
+            WorkflowStep::RunWorkflow { workflow } => {
+                self.workflow_uses_notify_reload(workflow, stack)
+            }
+            _ => false,
+        });
+        stack.pop();
+        found
     }
 }
 
@@ -376,6 +405,34 @@ impl EventServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct BrowserReloadServerConfig {
+    #[serde(default = "default_browser_reload_server_bind")]
+    pub bind: String,
+}
+
+impl Default for BrowserReloadServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_browser_reload_server_bind(),
+        }
+    }
+}
+
+impl BrowserReloadServerConfig {
+    fn validate(&self) -> Result<()> {
+        self.bind
+            .parse::<SocketAddr>()
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "browser_reload_server bind '{}' is not a valid socket address",
+                    self.bind
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct EventSpec {
     pub state_key: String,
     pub workflow: String,
@@ -509,7 +566,8 @@ impl WorkflowSpec {
                 }
                 WorkflowStep::SleepMs { .. }
                 | WorkflowStep::WriteState { .. }
-                | WorkflowStep::Log { .. } => {}
+                | WorkflowStep::Log { .. }
+                | WorkflowStep::NotifyReload => {}
             }
         }
         Ok(())
@@ -549,6 +607,7 @@ pub enum WorkflowStep {
         #[serde(default)]
         style: LogStyle,
     },
+    NotifyReload,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -606,6 +665,10 @@ fn default_event_server_bind() -> String {
     "127.0.0.1:0".to_string()
 }
 
+fn default_browser_reload_server_bind() -> String {
+    "127.0.0.1:0".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +683,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: EventServerConfig::default(),
+            browser_reload_server: BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         }
@@ -773,6 +837,35 @@ mod tests {
         let config: EventServerConfig = toml::from_str("").expect("parse event server config");
 
         assert_eq!(config.bind, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn browser_reload_server_defaults_to_local_ephemeral_bind() {
+        let config: BrowserReloadServerConfig =
+            toml::from_str("").expect("parse browser reload server config");
+
+        assert_eq!(config.bind, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn config_detects_notify_reload_in_nested_workflow() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "child".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+            },
+        );
+        config.workflow.insert(
+            "parent".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "child".into(),
+                }],
+            },
+        );
+
+        assert!(config.has_browser_reload_notifications());
     }
 
     #[test]

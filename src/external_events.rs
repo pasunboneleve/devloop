@@ -246,6 +246,7 @@ mod tests {
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
             event_server: EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         }

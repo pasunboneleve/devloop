@@ -37,9 +37,11 @@ When `devloop run` starts, it:
    directories
 3. loads the session state file into memory
 4. if external events are configured, starts a localhost event server
-5. starts any processes with `autostart = true`
-6. runs each workflow named in `startup_workflows` in order
-7. starts watching the configured `root`
+5. if any workflow uses `notify_reload`, starts a localhost browser
+   reload event server
+6. starts any processes with `autostart = true`
+7. runs each workflow named in `startup_workflows` in order
+8. starts watching the configured `root`
 
 The in-memory session state is authoritative for the running process.
 Edits made directly to the JSON file while `devloop` is running are not
@@ -69,6 +71,8 @@ Workflows run step by step, in order.
   in-memory session state.
 - `log` also renders templates against the current session state before
   emitting output.
+- `notify_reload` broadcasts a generic `reload` event to browser
+  listeners connected to `devloop`'s browser reload event stream.
 
 If any step fails, that workflow fails immediately and logs the error
 loudly, but `devloop` itself keeps running so later file changes or
@@ -138,6 +142,19 @@ for constrained event ingestion.
   schedules the configured workflow immediately.
 - Invalid tokens are rejected.
 - Values that fail the configured regex pattern are rejected.
+
+## Browser reload events
+
+If any workflow uses `notify_reload`, `devloop` starts a localhost SSE
+server for browser listeners.
+
+- Child processes and hooks receive `DEVLOOP_BROWSER_EVENTS_URL` in
+  their environment.
+- `notify_reload` broadcasts a single `reload` message to all connected
+  listeners.
+- In phase 1, client repositories still need a tiny dev-only listener
+  script that subscribes to the SSE stream and calls
+  `window.location.reload()` when asked.
 
 ## Output rendering
 

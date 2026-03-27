@@ -1,3 +1,4 @@
+mod browser_reload;
 mod config;
 mod core;
 mod engine;
