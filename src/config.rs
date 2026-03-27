@@ -624,7 +624,9 @@ fn execution_tree_overlap_sets(
             }
         }
         for trigger in &workflow.triggers {
-            trigger_targets.insert(trigger.clone());
+            if !used_inline {
+                trigger_targets.insert(trigger.clone());
+            }
             stack.push((trigger.clone(), used_inline));
         }
     }
@@ -985,6 +987,48 @@ mod tests {
                 "workflow 'd' is reachable both as a trigger target and via run_workflow"
             )
         );
+    }
+
+    #[test]
+    fn validate_allows_inline_workflow_with_independent_triggers() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "c".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "d".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "b".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "b".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["d".into()],
+            },
+        );
+        config.workflow.insert(
+            "a".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "b".into(),
+                }],
+                triggers: vec!["c".into()],
+            },
+        );
+
+        config.workflow["a"]
+            .validate(&config, "a")
+            .expect("independent inline triggers should be allowed");
     }
 
     #[test]
