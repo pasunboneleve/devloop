@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -52,6 +54,7 @@ trait RuntimeEffectAdapter {
     async fn maintain_processes(&mut self) -> Result<()>;
     async fn poll_observed_hook(&mut self, hook: &str) -> Result<bool>;
     async fn log_info(&mut self, message: String) -> Result<()>;
+    async fn stop_watching(&mut self) -> Result<()>;
     async fn stop_all_processes(&mut self) -> Result<()>;
 }
 
@@ -66,6 +69,7 @@ struct LiveRuntimeAdapter<'a, 'b> {
     processes: &'a mut ProcessManager<'b>,
     state: &'a SessionState,
     watcher: &'a mut RecommendedWatcher,
+    watcher_shutdown: Arc<AtomicBool>,
     external_event_tx: tokio::sync::mpsc::UnboundedSender<ExternalEventMessage>,
     external_event_server: Option<ExternalEventServer>,
     browser_reload_server: Option<BrowserReloadServer>,
@@ -88,14 +92,11 @@ impl Engine {
         let (tx, rx) = mpsc::channel();
         let (external_event_tx, mut external_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_watcher = tx.clone();
+        let watcher_shutdown = Arc::new(AtomicBool::new(false));
+        let watcher_shutdown_callback = watcher_shutdown.clone();
         let mut watcher = RecommendedWatcher::new(
             move |result| {
-                if let Err(error) = tx_watcher.send(result) {
-                    error!(
-                        "failed to forward watcher event into runtime loop: {}",
-                        error
-                    );
-                }
+                forward_watcher_event(&tx_watcher, &watcher_shutdown_callback, result);
             },
             NotifyConfig::default(),
         )?;
@@ -111,6 +112,7 @@ impl Engine {
             processes: &mut processes,
             state: &state,
             watcher: &mut watcher,
+            watcher_shutdown,
             external_event_tx,
             external_event_server: None,
             browser_reload_server: None,
@@ -295,6 +297,12 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
         Ok(())
     }
 
+    async fn stop_watching(&mut self) -> Result<()> {
+        self.watcher_shutdown.store(true, Ordering::Relaxed);
+        self.watcher.unwatch(&self.config.root)?;
+        Ok(())
+    }
+
     async fn stop_all_processes(&mut self) -> Result<()> {
         self.processes.stop_all(self.state).await
     }
@@ -337,12 +345,28 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
                 }
             }
             RuntimeEffect::LogInfo { message } => adapter.log_info(message).await?,
+            RuntimeEffect::StopWatching => adapter.stop_watching().await?,
             RuntimeEffect::StopAllProcesses => adapter.stop_all_processes().await?,
             RuntimeEffect::Exit => return Ok(true),
         }
     }
 
     Ok(false)
+}
+
+fn forward_watcher_event(
+    tx: &mpsc::Sender<notify::Result<Event>>,
+    shutting_down: &AtomicBool,
+    result: notify::Result<Event>,
+) {
+    if let Err(error) = tx.send(result)
+        && !shutting_down.load(Ordering::Relaxed)
+    {
+        error!(
+            "failed to forward watcher event into runtime loop: {}",
+            error
+        );
+    }
 }
 
 #[cfg(test)]
@@ -903,6 +927,7 @@ mod tests {
         calls: Vec<String>,
         changed_hooks: BTreeMap<String, bool>,
         workflow_errors: BTreeMap<String, String>,
+        watching: bool,
     }
 
     impl MockRuntimeAdapter {
@@ -911,6 +936,7 @@ mod tests {
                 calls: Vec::new(),
                 changed_hooks: BTreeMap::new(),
                 workflow_errors: BTreeMap::new(),
+                watching: false,
             }
         }
     }
@@ -953,6 +979,7 @@ mod tests {
 
         async fn start_watching(&mut self) -> Result<()> {
             self.calls.push("watch".into());
+            self.watching = true;
             Ok(())
         }
 
@@ -968,6 +995,12 @@ mod tests {
 
         async fn log_info(&mut self, message: String) -> Result<()> {
             self.calls.push(format!("log:{message}"));
+            Ok(())
+        }
+
+        async fn stop_watching(&mut self) -> Result<()> {
+            self.calls.push("stop_watch".into());
+            self.watching = false;
             Ok(())
         }
 
@@ -1055,8 +1088,26 @@ mod tests {
                 "poll:current_post_slug",
                 "workflow:publish_post_url:",
                 "log:received ctrl-c, shutting down",
+                "stop_watch",
                 "stop_all",
             ]
+        );
+    }
+
+    #[test]
+    fn forward_watcher_event_ignores_send_failures_after_shutdown() {
+        let (tx, rx) = mpsc::channel();
+        let shutdown = AtomicBool::new(true);
+        drop(rx);
+
+        forward_watcher_event(
+            &tx,
+            &shutdown,
+            Ok(Event {
+                kind: EventKind::Any,
+                paths: vec![PathBuf::from("content/layout.html")],
+                attrs: Default::default(),
+            }),
         );
     }
 

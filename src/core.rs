@@ -109,6 +109,7 @@ pub enum RuntimeEffect {
     LogInfo {
         message: String,
     },
+    StopWatching,
     StopAllProcesses,
     Exit,
 }
@@ -377,6 +378,7 @@ impl RuntimeMachine {
                 self.pending_effects.push_back(RuntimeEffect::LogInfo {
                     message: "received ctrl-c, shutting down".into(),
                 });
+                self.pending_effects.push_back(RuntimeEffect::StopWatching);
                 self.pending_effects
                     .push_back(RuntimeEffect::StopAllProcesses);
                 self.pending_effects.push_back(RuntimeEffect::Exit);
@@ -849,6 +851,7 @@ mod tests {
                 message: "received ctrl-c, shutting down".into()
             })
         );
+        assert_eq!(runtime.next_effect(), Some(RuntimeEffect::StopWatching));
         assert_eq!(runtime.next_effect(), Some(RuntimeEffect::StopAllProcesses));
         assert_eq!(runtime.next_effect(), Some(RuntimeEffect::Exit));
         assert_eq!(runtime.next_effect(), None);
