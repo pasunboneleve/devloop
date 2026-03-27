@@ -223,6 +223,12 @@ endpoint and exposes its URL to child processes as
 `DEVLOOP_BROWSER_EVENTS_URL` so client repositories can attach a tiny
 browser-side `EventSource` listener.
 
+Triggered workflows are deduplicated within one execution. If two
+trigger paths both reach the same workflow, `devloop` runs it once from
+the first path that reaches it. Config validation also rejects graphs
+where a direct trigger target is separately reachable through
+`run_workflow`, because that would make ordering ambiguous.
+
 Hooks can also be observed on the runtime tick when external state
 changes are not represented by file edits. For example:
 

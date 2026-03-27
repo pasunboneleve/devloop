@@ -8,11 +8,20 @@ All notable changes to `devloop` will be recorded in this file.
 - Added a browser reload event server and a `notify_reload` workflow
   action so workflows can explicitly tell downstream browser listeners
   to refresh after successful rebuild/restart steps.
+- Added declarative workflow `triggers` so downstream orchestration can
+  be expressed directly in config instead of being inferred through
+  secondary file watches.
 
 ### Fixed
 - Workflow failures such as process-readiness timeouts now log loudly
   but do not terminate `devloop`, so the watcher stays alive and the
   next successful edit can recover a broken local build.
+- Triggered workflows now run as part of the same execution tree,
+  including when their parent workflow was reached via `run_workflow`.
+- Config validation now rejects ambiguous trigger graphs where a direct
+  trigger target is also reachable through `run_workflow`, and
+  triggered workflows are documented as single-run deduplicated within
+  one execution.
 - Platform-specific release workflows no longer duplicate GitHub release notes when both assets are published to the same tag.
 
 ## [0.6.2] - 2026-03-26

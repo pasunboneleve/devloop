@@ -67,7 +67,13 @@ Workflows run step by step, in order.
 - A step must finish successfully before the next one begins.
 - `run_workflow` executes another named workflow inline.
 - `triggers` run downstream workflows after the workflow succeeds.
+- Triggered workflows are deduplicated across one execution tree. If two
+  trigger paths reach the same workflow, it runs once from the first
+  path that reaches it.
 - Recursive workflow graphs are rejected at config-validation time.
+- Config validation also rejects graphs where a direct trigger target is
+  separately reachable through `run_workflow`, because that would make
+  ordering and duplication ambiguous.
 - `write_state` renders `{{state_key}}` templates against the current
   in-memory session state.
 - `log` also renders templates against the current session state before
