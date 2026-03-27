@@ -22,6 +22,9 @@ All notable changes to `devloop` will be recorded in this file.
   trigger target is also reachable through `run_workflow`, and
   triggered workflows are documented as single-run deduplicated within
   one execution.
+- Trigger-overlap validation now walks the full execution tree, so
+  nested trigger graphs cannot schedule the same workflow once as a
+  trigger target and again through an inline `run_workflow` path.
 - Platform-specific release workflows no longer duplicate GitHub release notes when both assets are published to the same tag.
 
 ## [0.6.2] - 2026-03-26

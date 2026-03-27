@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -105,7 +105,7 @@ impl Config {
         }
         for (name, workflow) in &self.workflow {
             workflow
-                .validate(self)
+                .validate(self, name)
                 .with_context(|| format!("invalid workflow '{name}'"))?;
         }
         for workflow in &self.startup_workflows {
@@ -530,15 +530,19 @@ pub struct WorkflowSpec {
 }
 
 impl WorkflowSpec {
-    fn validate(&self, config: &Config) -> Result<()> {
-        self.validate_inner(config, &mut Vec::new())
+    fn validate(&self, config: &Config, workflow_name: &str) -> Result<()> {
+        self.validate_inner(config, workflow_name, &mut Vec::new())
     }
 
-    fn validate_inner(&self, config: &Config, stack: &mut Vec<String>) -> Result<()> {
+    fn validate_inner(
+        &self,
+        config: &Config,
+        workflow_name: &str,
+        stack: &mut Vec<String>,
+    ) -> Result<()> {
         if self.steps.is_empty() {
             return Err(anyhow!("workflow must contain at least one step"));
         }
-        let mut inline_workflows = HashSet::new();
         for step in &self.steps {
             match step {
                 WorkflowStep::StartProcess { process }
@@ -555,7 +559,6 @@ impl WorkflowSpec {
                     }
                 }
                 WorkflowStep::RunWorkflow { workflow } => {
-                    inline_workflows.insert(workflow.clone());
                     validate_nested_workflow(config, stack, workflow)?;
                 }
                 WorkflowStep::SleepMs { .. }
@@ -565,53 +568,38 @@ impl WorkflowSpec {
             }
         }
         for workflow in &self.triggers {
-            if inline_workflows.contains(workflow) {
-                return Err(anyhow!(
-                    "workflow cannot both run_workflow and trigger '{workflow}'"
-                ));
-            }
             validate_nested_workflow(config, stack, workflow)?;
         }
-        if !self.triggers.is_empty() && (!inline_workflows.is_empty() || self.triggers.len() > 1) {
-            validate_trigger_inline_overlap(config, &inline_workflows, &self.triggers)?;
+        if !self.triggers.is_empty() {
+            validate_execution_tree_overlap(config, workflow_name)?;
         }
         Ok(())
     }
 }
 
-fn validate_trigger_inline_overlap(
-    config: &Config,
-    inline_workflows: &HashSet<String>,
-    triggers: &[String],
-) -> Result<()> {
-    let mut sorted_inline_workflows = inline_workflows.iter().collect::<Vec<_>>();
-    sorted_inline_workflows.sort();
-    for trigger in triggers {
-        for inline_workflow in &sorted_inline_workflows {
-            if workflow_reaches_via_inline_execution(config, inline_workflow, trigger) {
-                return Err(anyhow!(
-                    "workflow trigger '{trigger}' is also reachable via run_workflow from '{inline_workflow}'"
-                ));
-            }
-        }
-        for sibling_trigger in triggers {
-            if sibling_trigger == trigger {
-                continue;
-            }
-            if workflow_reaches_via_inline_execution(config, sibling_trigger, trigger) {
-                return Err(anyhow!(
-                    "workflow trigger '{trigger}' is also reachable via run_workflow from sibling trigger '{sibling_trigger}'"
-                ));
-            }
+fn validate_execution_tree_overlap(config: &Config, workflow_name: &str) -> Result<()> {
+    let (trigger_targets, inline_reachable) = execution_tree_overlap_sets(config, workflow_name);
+
+    for workflow in trigger_targets {
+        if inline_reachable.contains(&workflow) {
+            return Err(anyhow!(
+                "workflow '{workflow}' is reachable both as a trigger target and via run_workflow in the same execution tree"
+            ));
         }
     }
+
     Ok(())
 }
 
-fn workflow_reaches_via_inline_execution(config: &Config, start: &str, target: &str) -> bool {
-    let mut stack = vec![(start.to_string(), false)];
+fn execution_tree_overlap_sets(
+    config: &Config,
+    workflow_name: &str,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut stack = vec![(workflow_name.to_string(), false)];
     let mut seen_plain = HashSet::new();
     let mut seen_inline = HashSet::new();
+    let mut trigger_targets = BTreeSet::new();
+    let mut inline_reachable = BTreeSet::new();
 
     while let Some((workflow_name, used_inline)) = stack.pop() {
         let seen_set = if used_inline {
@@ -622,8 +610,8 @@ fn workflow_reaches_via_inline_execution(config: &Config, start: &str, target: &
         if !seen_set.insert(workflow_name.clone()) {
             continue;
         }
-        if workflow_name == target && used_inline {
-            return true;
+        if used_inline {
+            inline_reachable.insert(workflow_name.clone());
         }
 
         let Some(workflow) = config.workflow.get(&workflow_name) else {
@@ -636,11 +624,12 @@ fn workflow_reaches_via_inline_execution(config: &Config, start: &str, target: &
             }
         }
         for trigger in &workflow.triggers {
+            trigger_targets.insert(trigger.clone());
             stack.push((trigger.clone(), used_inline));
         }
     }
 
-    false
+    (trigger_targets, inline_reachable)
 }
 
 fn validate_nested_workflow(
@@ -661,7 +650,7 @@ fn validate_nested_workflow(
         .get(workflow)
         .ok_or_else(|| anyhow!("workflow references missing workflow '{workflow}'"))?;
     stack.push(workflow.to_string());
-    nested.validate_inner(config, stack)?;
+    nested.validate_inner(config, workflow, stack)?;
     stack.pop();
     Ok(())
 }
@@ -804,7 +793,7 @@ mod tests {
         );
 
         let error = config.workflow["outer"]
-            .validate(&config)
+            .validate(&config, "outer")
             .expect_err("recursive workflow should fail");
         assert!(error.to_string().contains("workflow recursion detected"));
     }
@@ -834,7 +823,7 @@ mod tests {
         );
 
         let error = config.workflow["outer"]
-            .validate(&config)
+            .validate(&config, "outer")
             .expect_err("recursive trigger workflow should fail");
         assert!(error.to_string().contains("workflow recursion detected"));
     }
@@ -853,7 +842,7 @@ mod tests {
         );
 
         let error = config.workflow["outer"]
-            .validate(&config)
+            .validate(&config, "outer")
             .expect_err("missing nested workflow should fail");
         assert!(error.to_string().contains("missing workflow 'missing'"));
     }
@@ -873,7 +862,7 @@ mod tests {
         );
 
         let error = config.workflow["outer"]
-            .validate(&config)
+            .validate(&config, "outer")
             .expect_err("missing trigger workflow should fail");
         assert!(error.to_string().contains("missing workflow 'missing'"));
     }
@@ -899,12 +888,12 @@ mod tests {
         );
 
         let error = config.workflow["css"]
-            .validate(&config)
+            .validate(&config, "css")
             .expect_err("overlapping trigger and inline workflow should fail");
         assert!(
             error
                 .to_string()
-                .contains("workflow cannot both run_workflow and trigger 'browser_reload'")
+                .contains("reachable both as a trigger target and via run_workflow")
         );
     }
 
@@ -939,11 +928,63 @@ mod tests {
         );
 
         let error = config.workflow["a"]
-            .validate(&config)
+            .validate(&config, "a")
             .expect_err("sibling trigger overlap should fail");
-        assert!(error.to_string().contains(
-            "workflow trigger 'c' is also reachable via run_workflow from sibling trigger 'b'"
-        ));
+        assert!(
+            error.to_string().contains(
+                "workflow 'c' is reachable both as a trigger target and via run_workflow"
+            )
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nested_trigger_reachable_via_inline_path() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "d".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "b".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "b".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["d".into()],
+            },
+        );
+        config.workflow.insert(
+            "c".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "d".into(),
+                }],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "a".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "a".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["b".into(), "c".into()],
+            },
+        );
+
+        let error = config.workflow["a"]
+            .validate(&config, "a")
+            .expect_err("nested trigger overlap should fail");
+        assert!(
+            error.to_string().contains(
+                "workflow 'd' is reachable both as a trigger target and via run_workflow"
+            )
+        );
     }
 
     #[test]
