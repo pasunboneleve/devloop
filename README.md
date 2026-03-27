@@ -194,6 +194,23 @@ Repeated setup can be factored into helper workflows and reused with
 `run_workflow`, for example a `publish_post_url` workflow that waits for
 the tunnel and then writes the derived URL.
 
+Downstream orchestration should usually be declared with workflow
+`triggers`, so users can read directly what a successful workflow
+causes next:
+
+```toml
+[workflow.css]
+steps = [
+  { action = "run_hook", hook = "build_css" },
+]
+triggers = ["browser_reload"]
+
+[workflow.browser_reload]
+steps = [
+  { action = "notify_reload" },
+]
+```
+
 Workflows can also trigger a generic browser refresh after successful
 rebuild/restart steps:
 

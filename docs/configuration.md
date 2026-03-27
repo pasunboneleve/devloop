@@ -293,6 +293,36 @@ steps = [
 ]
 ```
 
+### Workflow triggers
+
+`triggers` declares downstream workflows to run after the workflow's own
+`steps` complete successfully.
+
+```toml
+[workflow.css]
+steps = [
+  { action = "run_hook", hook = "build_css" },
+]
+triggers = ["browser_reload"]
+
+[workflow.browser_reload]
+steps = [
+  { action = "notify_reload" },
+]
+```
+
+Use `triggers` for orchestration that should happen after a workflow
+finishes. Keep `run_workflow` for inline control flow inside a workflow's
+own steps.
+
+Triggered workflows are deduplicated across a single execution. If the
+same workflow is reached through two trigger paths, `devloop` runs it
+once, from the first path that reaches it.
+
+`devloop` rejects configs where a direct trigger target is also reachable
+through a `run_workflow` path in the same execution tree, because that
+would make ordering and duplication ambiguous.
+
 ### Workflow actions
 
 - `start_process`
@@ -305,6 +335,11 @@ steps = [
 - `write_state`
 - `log`
 - `notify_reload`
+
+### Workflow fields
+
+- `steps`: ordered actions to execute for the workflow itself
+- `triggers`: downstream workflows to run after `steps` succeed
 
 ### `write_state`
 
@@ -374,6 +409,11 @@ steps = [
 steps = [
   { action = "restart_process", process = "server" },
   { action = "wait_for_process", process = "server" },
+]
+triggers = ["browser_reload"]
+
+[workflow.browser_reload]
+steps = [
   { action = "notify_reload" },
 ]
 ```

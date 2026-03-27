@@ -261,10 +261,6 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
 
     async fn run_workflow(&mut self, workflow_name: &str, changed_files: &[String]) -> Result<()> {
         info!("running workflow {}", workflow_name);
-        self.config
-            .workflow
-            .get(workflow_name)
-            .ok_or_else(|| anyhow!("runtime requested missing workflow '{workflow_name}'"))?;
         let mut adapter = LiveWorkflowAdapter {
             processes: self.processes,
             state: self.state,
@@ -273,7 +269,7 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
                 .as_ref()
                 .map(BrowserReloadServer::sender),
         };
-        run_workflow_machine(self.config, &mut adapter, workflow_name, changed_files).await
+        execute_workflow(self.config, &mut adapter, workflow_name, changed_files).await
     }
 
     async fn start_watching(&mut self) -> Result<()> {
@@ -380,16 +376,25 @@ async fn run_workflow(
     changed_files: &[String],
 ) -> Result<()> {
     info!("running workflow {}", workflow_name);
-    config
-        .workflow
-        .get(workflow_name)
-        .ok_or_else(|| anyhow!("runtime requested missing workflow '{workflow_name}'"))?;
     let mut adapter = LiveWorkflowAdapter {
         processes,
         state,
         browser_reload_sender,
     };
-    run_workflow_machine(config, &mut adapter, workflow_name, changed_files).await
+    execute_workflow(config, &mut adapter, workflow_name, changed_files).await
+}
+
+async fn execute_workflow<A: WorkflowEffectAdapter>(
+    config: &Config,
+    adapter: &mut A,
+    workflow_name: &str,
+    changed_files: &[String],
+) -> Result<()> {
+    config
+        .workflow
+        .get(workflow_name)
+        .ok_or_else(|| anyhow!("runtime requested missing workflow '{workflow_name}'"))?;
+    run_workflow_machine(config, adapter, workflow_name, changed_files).await
 }
 
 async fn run_workflow_machine<A: WorkflowEffectAdapter>(
@@ -695,6 +700,7 @@ mod tests {
                     key: "current_post_url".into(),
                     value: "{{tunnel_url}}/posts/{{current_post_slug}}".into(),
                 }],
+                triggers: vec![],
             },
         );
 
@@ -749,6 +755,7 @@ mod tests {
                     key: "current_post_url".into(),
                     value: "{{tunnel_url}}/posts/{{current_post_slug}}".into(),
                 }],
+                triggers: vec![],
             },
         );
         config.workflow.insert(
@@ -757,6 +764,7 @@ mod tests {
                 steps: vec![WorkflowStep::RunWorkflow {
                     workflow: "publish_post_url".into(),
                 }],
+                triggers: vec![],
             },
         );
 
@@ -815,6 +823,7 @@ mod tests {
                     message: "current post url: {{current_post_url}}".into(),
                     style: LogStyle::Plain,
                 }],
+                triggers: vec![],
             },
         );
 
@@ -848,6 +857,7 @@ mod tests {
         state: Map<String, Value>,
         calls: Vec<String>,
         sleeps: VecDeque<u64>,
+        fail_reload: bool,
     }
 
     impl MockWorkflowAdapter {
@@ -856,6 +866,7 @@ mod tests {
                 state,
                 calls: Vec::new(),
                 sleeps: VecDeque::new(),
+                fail_reload: false,
             }
         }
     }
@@ -896,6 +907,9 @@ mod tests {
 
         async fn notify_reload(&mut self) -> Result<()> {
             self.calls.push("notify_reload".into());
+            if self.fail_reload {
+                return Err(anyhow!("reload failed"));
+            }
             Ok(())
         }
 
@@ -952,6 +966,7 @@ mod tests {
                     },
                     WorkflowStep::NotifyReload,
                 ],
+                triggers: vec![],
             },
         );
 
@@ -971,6 +986,244 @@ mod tests {
                 "persist:url",
                 "hook:build_css:startup:tailwind.css",
                 "log:Plain:ready https://example.test/post",
+                "notify_reload",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_triggers_run_after_parent_workflow_succeeds() {
+        let mut config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
+            event: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.workflow.insert(
+            "browser_reload".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "css".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunHook {
+                    hook: "build_css".into(),
+                }],
+                triggers: vec!["browser_reload".into()],
+            },
+        );
+
+        let mut adapter = MockWorkflowAdapter::new(Map::new());
+        run_workflow_machine(&config, &mut adapter, "css", &["tailwind.css".into()])
+            .await
+            .expect("run workflow");
+
+        assert_eq!(
+            adapter.calls,
+            vec![
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "hook:build_css:css:tailwind.css",
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "notify_reload",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_triggers_deduplicate_diamond_graphs() {
+        let mut config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
+            event: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.workflow.insert(
+            "d".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "b".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "b".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["d".into()],
+            },
+        );
+        config.workflow.insert(
+            "c".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "c".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["d".into()],
+            },
+        );
+        config.workflow.insert(
+            "a".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "a".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["b".into(), "c".into()],
+            },
+        );
+
+        let mut adapter = MockWorkflowAdapter::new(Map::new());
+        run_workflow_machine(&config, &mut adapter, "a", &[])
+            .await
+            .expect("run workflow");
+
+        assert_eq!(
+            adapter.calls,
+            vec![
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "log:Plain:a",
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "log:Plain:b",
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "notify_reload",
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "log:Plain:c",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_run_workflow_executes_child_triggers() {
+        let mut config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
+            event: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.workflow.insert(
+            "browser_reload".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "css".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunHook {
+                    hook: "build_css".into(),
+                }],
+                triggers: vec!["browser_reload".into()],
+            },
+        );
+        config.workflow.insert(
+            "startup".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "css".into(),
+                }],
+                triggers: vec![],
+            },
+        );
+
+        let mut adapter = MockWorkflowAdapter::new(Map::new());
+        run_workflow_machine(&config, &mut adapter, "startup", &["tailwind.css".into()])
+            .await
+            .expect("run workflow");
+
+        assert_eq!(
+            adapter.calls,
+            vec![
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "hook:build_css:css:tailwind.css",
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "notify_reload",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn triggered_workflow_failure_fails_parent_execution() {
+        let mut config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
+            event: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        config.workflow.insert(
+            "browser_reload".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "css".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunHook {
+                    hook: "build_css".into(),
+                }],
+                triggers: vec!["browser_reload".into()],
+            },
+        );
+
+        let mut adapter = MockWorkflowAdapter::new(Map::new());
+        adapter.fail_reload = true;
+        let error = run_workflow_machine(&config, &mut adapter, "css", &["tailwind.css".into()])
+            .await
+            .expect_err("trigger failure should fail workflow");
+
+        assert!(error.to_string().contains("reload failed"));
+        assert_eq!(
+            adapter.calls,
+            vec![
+                "persist:last_workflow",
+                "persist:last_changed_files",
+                "hook:build_css:css:tailwind.css",
+                "persist:last_workflow",
+                "persist:last_changed_files",
                 "notify_reload",
             ]
         );

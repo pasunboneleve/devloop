@@ -291,6 +291,7 @@ mod tests {
                     message: "ok".into(),
                     style: crate::config::LogStyle::Plain,
                 }],
+                triggers: vec![],
             },
         );
         config.event.insert(
@@ -372,6 +373,7 @@ mod tests {
                     message: "ok".into(),
                     style: crate::config::LogStyle::Plain,
                 }],
+                triggers: vec![],
             },
         );
         config.event.insert(
@@ -430,6 +432,7 @@ mod tests {
                     message: "ok".into(),
                     style: crate::config::LogStyle::Plain,
                 }],
+                triggers: vec![],
             },
         );
         config.event.insert(
@@ -488,6 +491,7 @@ mod tests {
                     message: "ok".into(),
                     style: crate::config::LogStyle::Plain,
                 }],
+                triggers: vec![],
             },
         );
         config.event.insert(

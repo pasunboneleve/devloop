@@ -169,6 +169,7 @@ mod tests {
             "rust".into(),
             WorkflowSpec {
                 steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
             },
         );
 

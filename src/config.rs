@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -154,7 +154,10 @@ impl Config {
                 self.workflow_uses_notify_reload(workflow, stack)
             }
             _ => false,
-        });
+        }) || workflow
+            .triggers
+            .iter()
+            .any(|trigger| self.workflow_uses_notify_reload(trigger, stack));
         stack.pop();
         found
     }
@@ -522,6 +525,8 @@ pub enum CaptureMode {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowSpec {
     pub steps: Vec<WorkflowStep>,
+    #[serde(default)]
+    pub triggers: Vec<String>,
 }
 
 impl WorkflowSpec {
@@ -533,6 +538,7 @@ impl WorkflowSpec {
         if self.steps.is_empty() {
             return Err(anyhow!("workflow must contain at least one step"));
         }
+        let mut inline_workflows = HashSet::new();
         for step in &self.steps {
             match step {
                 WorkflowStep::StartProcess { process }
@@ -549,20 +555,8 @@ impl WorkflowSpec {
                     }
                 }
                 WorkflowStep::RunWorkflow { workflow } => {
-                    if stack.iter().any(|name| name == workflow) {
-                        let mut cycle = stack.clone();
-                        cycle.push(workflow.clone());
-                        return Err(anyhow!(
-                            "workflow recursion detected: {}",
-                            cycle.join(" -> ")
-                        ));
-                    }
-                    let nested = config.workflow.get(workflow).ok_or_else(|| {
-                        anyhow!("workflow references missing workflow '{workflow}'")
-                    })?;
-                    stack.push(workflow.clone());
-                    nested.validate_inner(config, stack)?;
-                    stack.pop();
+                    inline_workflows.insert(workflow.clone());
+                    validate_nested_workflow(config, stack, workflow)?;
                 }
                 WorkflowStep::SleepMs { .. }
                 | WorkflowStep::WriteState { .. }
@@ -570,8 +564,106 @@ impl WorkflowSpec {
                 | WorkflowStep::NotifyReload => {}
             }
         }
+        for workflow in &self.triggers {
+            if inline_workflows.contains(workflow) {
+                return Err(anyhow!(
+                    "workflow cannot both run_workflow and trigger '{workflow}'"
+                ));
+            }
+            validate_nested_workflow(config, stack, workflow)?;
+        }
+        if !self.triggers.is_empty() && (!inline_workflows.is_empty() || self.triggers.len() > 1) {
+            validate_trigger_inline_overlap(config, &inline_workflows, &self.triggers)?;
+        }
         Ok(())
     }
+}
+
+fn validate_trigger_inline_overlap(
+    config: &Config,
+    inline_workflows: &HashSet<String>,
+    triggers: &[String],
+) -> Result<()> {
+    let mut sorted_inline_workflows = inline_workflows.iter().collect::<Vec<_>>();
+    sorted_inline_workflows.sort();
+    for trigger in triggers {
+        for inline_workflow in &sorted_inline_workflows {
+            if workflow_reaches_via_inline_execution(config, inline_workflow, trigger) {
+                return Err(anyhow!(
+                    "workflow trigger '{trigger}' is also reachable via run_workflow from '{inline_workflow}'"
+                ));
+            }
+        }
+        for sibling_trigger in triggers {
+            if sibling_trigger == trigger {
+                continue;
+            }
+            if workflow_reaches_via_inline_execution(config, sibling_trigger, trigger) {
+                return Err(anyhow!(
+                    "workflow trigger '{trigger}' is also reachable via run_workflow from sibling trigger '{sibling_trigger}'"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn workflow_reaches_via_inline_execution(config: &Config, start: &str, target: &str) -> bool {
+    let mut stack = vec![(start.to_string(), false)];
+    let mut seen_plain = HashSet::new();
+    let mut seen_inline = HashSet::new();
+
+    while let Some((workflow_name, used_inline)) = stack.pop() {
+        let seen_set = if used_inline {
+            &mut seen_inline
+        } else {
+            &mut seen_plain
+        };
+        if !seen_set.insert(workflow_name.clone()) {
+            continue;
+        }
+        if workflow_name == target && used_inline {
+            return true;
+        }
+
+        let Some(workflow) = config.workflow.get(&workflow_name) else {
+            continue;
+        };
+
+        for step in &workflow.steps {
+            if let WorkflowStep::RunWorkflow { workflow } = step {
+                stack.push((workflow.clone(), true));
+            }
+        }
+        for trigger in &workflow.triggers {
+            stack.push((trigger.clone(), used_inline));
+        }
+    }
+
+    false
+}
+
+fn validate_nested_workflow(
+    config: &Config,
+    stack: &mut Vec<String>,
+    workflow: &str,
+) -> Result<()> {
+    if stack.iter().any(|name| name == workflow) {
+        let mut cycle = stack.clone();
+        cycle.push(workflow.to_string());
+        return Err(anyhow!(
+            "workflow recursion detected: {}",
+            cycle.join(" -> ")
+        ));
+    }
+    let nested = config
+        .workflow
+        .get(workflow)
+        .ok_or_else(|| anyhow!("workflow references missing workflow '{workflow}'"))?;
+    stack.push(workflow.to_string());
+    nested.validate_inner(config, stack)?;
+    stack.pop();
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -698,6 +790,7 @@ mod tests {
                 steps: vec![WorkflowStep::RunWorkflow {
                     workflow: "inner".into(),
                 }],
+                triggers: vec![],
             },
         );
         config.workflow.insert(
@@ -706,12 +799,43 @@ mod tests {
                 steps: vec![WorkflowStep::RunWorkflow {
                     workflow: "outer".into(),
                 }],
+                triggers: vec![],
             },
         );
 
         let error = config.workflow["outer"]
             .validate(&config)
             .expect_err("recursive workflow should fail");
+        assert!(error.to_string().contains("workflow recursion detected"));
+    }
+
+    #[test]
+    fn validate_rejects_recursive_trigger_workflows() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "outer".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "outer".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["inner".into()],
+            },
+        );
+        config.workflow.insert(
+            "inner".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "inner".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["outer".into()],
+            },
+        );
+
+        let error = config.workflow["outer"]
+            .validate(&config)
+            .expect_err("recursive trigger workflow should fail");
         assert!(error.to_string().contains("workflow recursion detected"));
     }
 
@@ -724,6 +848,7 @@ mod tests {
                 steps: vec![WorkflowStep::RunWorkflow {
                     workflow: "missing".into(),
                 }],
+                triggers: vec![],
             },
         );
 
@@ -731,6 +856,94 @@ mod tests {
             .validate(&config)
             .expect_err("missing nested workflow should fail");
         assert!(error.to_string().contains("missing workflow 'missing'"));
+    }
+
+    #[test]
+    fn validate_rejects_missing_trigger_workflow() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "outer".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "outer".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["missing".into()],
+            },
+        );
+
+        let error = config.workflow["outer"]
+            .validate(&config)
+            .expect_err("missing trigger workflow should fail");
+        assert!(error.to_string().contains("missing workflow 'missing'"));
+    }
+
+    #[test]
+    fn validate_rejects_overlap_between_inline_and_triggered_workflows() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "browser_reload".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "css".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "browser_reload".into(),
+                }],
+                triggers: vec!["browser_reload".into()],
+            },
+        );
+
+        let error = config.workflow["css"]
+            .validate(&config)
+            .expect_err("overlapping trigger and inline workflow should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow cannot both run_workflow and trigger 'browser_reload'")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_trigger_reachable_via_inline_from_sibling_trigger() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "c".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "b".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "c".into(),
+                }],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "a".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "a".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["b".into(), "c".into()],
+            },
+        );
+
+        let error = config.workflow["a"]
+            .validate(&config)
+            .expect_err("sibling trigger overlap should fail");
+        assert!(error.to_string().contains(
+            "workflow trigger 'c' is also reachable via run_workflow from sibling trigger 'b'"
+        ));
     }
 
     #[test]
@@ -810,6 +1023,7 @@ mod tests {
                     message: "content".into(),
                     style: LogStyle::Plain,
                 }],
+                triggers: vec![],
             },
         );
         config.hook.insert(
@@ -854,6 +1068,7 @@ mod tests {
             "child".into(),
             WorkflowSpec {
                 steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
             },
         );
         config.workflow.insert(
@@ -862,6 +1077,31 @@ mod tests {
                 steps: vec![WorkflowStep::RunWorkflow {
                     workflow: "child".into(),
                 }],
+                triggers: vec![],
+            },
+        );
+
+        assert!(config.has_browser_reload_notifications());
+    }
+
+    #[test]
+    fn config_detects_notify_reload_in_triggered_workflow() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "reload".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "css".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "css".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["reload".into()],
             },
         );
 
@@ -885,6 +1125,7 @@ mod tests {
                     message: "content".into(),
                     style: LogStyle::Plain,
                 }],
+                triggers: vec![],
             },
         );
         config.event.insert(

@@ -14,10 +14,9 @@ workflow = "rust"
 paths = ["content/**/*.md", "content/**/*.html"]
 workflow = "content"
 
-[process.css_watch]
-command = ["tailwindcss", "-i", "tailwind.css", "-o", "content/static/tailwind.css", "--watch=always"]
-cwd = "."
-autostart = false
+[watch.css]
+paths = ["tailwind.css"]
+workflow = "css"
 
 [process.server]
 command = ["cargo", "run"]
@@ -70,10 +69,9 @@ steps = [
 
 [workflow.startup]
 steps = [
-  { action = "start_process", process = "css_watch" },
+  { action = "run_hook", hook = "build_css" },
   { action = "start_process", process = "server" },
   { action = "wait_for_process", process = "server" },
-  { action = "run_hook", hook = "build_css" },
   { action = "run_hook", hook = "current_browser_path" },
   { action = "start_process", process = "tunnel" },
   { action = "run_workflow", workflow = "publish_post_url" },
@@ -87,13 +85,24 @@ steps = [
   { action = "run_hook", hook = "current_browser_path" },
   { action = "restart_process", process = "tunnel" },
   { action = "run_workflow", workflow = "publish_post_url" },
-  { action = "notify_reload" },
 ]
+triggers = ["browser_reload"]
 
 [workflow.content]
 steps = [
   { action = "run_hook", hook = "current_browser_path" },
   { action = "restart_process", process = "tunnel" },
   { action = "run_workflow", workflow = "publish_post_url" },
+]
+triggers = ["browser_reload"]
+
+[workflow.css]
+steps = [
+  { action = "run_hook", hook = "build_css" },
+]
+triggers = ["browser_reload"]
+
+[workflow.browser_reload]
+steps = [
   { action = "notify_reload" },
 ]

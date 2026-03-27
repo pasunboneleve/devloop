@@ -66,6 +66,7 @@ Workflows run step by step, in order.
 
 - A step must finish successfully before the next one begins.
 - `run_workflow` executes another named workflow inline.
+- `triggers` run downstream workflows after the workflow succeeds.
 - Recursive workflow graphs are rejected at config-validation time.
 - `write_state` renders `{{state_key}}` templates against the current
   in-memory session state.
@@ -233,6 +234,7 @@ output-derived updates.
   workflow runs triggered by watches or startup execution.
 - Nested `run_workflow` calls reuse the same session state without
   overwriting the top-level change context.
+- Triggered workflows inherit that same top-level change context.
 
 ## Shutdown
 

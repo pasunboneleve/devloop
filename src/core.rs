@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use anyhow::{Result, anyhow};
 use serde_json::{Map, Value};
@@ -10,6 +10,7 @@ use crate::state::render_template_values;
 pub struct WorkflowMachine {
     session: Map<String, Value>,
     stack: Vec<WorkflowFrame>,
+    triggered_workflows: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +160,7 @@ impl WorkflowMachine {
                 changed_files.to_vec(),
                 true,
             )],
+            triggered_workflows: HashSet::new(),
         })
     }
 
@@ -203,6 +205,7 @@ impl WorkflowMachine {
 
             if next_step >= workflow.steps.len() {
                 self.stack.pop();
+                self.push_triggered_workflows(config, workflow, changed_files)?;
                 continue;
             }
 
@@ -270,6 +273,47 @@ impl WorkflowMachine {
                 WorkflowStep::NotifyReload => return Ok(Some(WorkflowEffect::NotifyReload)),
             }
         }
+    }
+
+    fn push_triggered_workflows(
+        &mut self,
+        config: &Config,
+        workflow: &crate::config::WorkflowSpec,
+        changed_files: Vec<String>,
+    ) -> Result<()> {
+        let mut pending = Vec::new();
+        for trigger in &workflow.triggers {
+            if !self.triggered_workflows.insert(trigger.clone()) {
+                continue;
+            }
+            if self
+                .stack
+                .iter()
+                .any(|frame| frame.workflow_name == *trigger)
+            {
+                let mut cycle = self
+                    .stack
+                    .iter()
+                    .map(|frame| frame.workflow_name.clone())
+                    .collect::<Vec<_>>();
+                cycle.push(trigger.clone());
+                return Err(anyhow!(
+                    "workflow recursion detected at runtime: {}",
+                    cycle.join(" -> ")
+                ));
+            }
+            if !config.workflow.contains_key(trigger) {
+                return Err(anyhow!("unknown workflow '{}'", trigger));
+            }
+            pending.push(trigger.clone());
+        }
+
+        for trigger in pending.into_iter().rev() {
+            self.stack
+                .push(WorkflowFrame::new(trigger, changed_files.clone(), true));
+        }
+
+        Ok(())
     }
 }
 
@@ -589,6 +633,7 @@ mod tests {
                 steps: vec![WorkflowStep::RestartProcess {
                     process: "server".into(),
                 }],
+                triggers: vec![],
             },
         );
 
@@ -629,6 +674,7 @@ mod tests {
                     key: "current_post_url".into(),
                     value: "{{tunnel_url}}/posts/{{current_post_slug}}".into(),
                 }],
+                triggers: vec![],
             },
         );
 
@@ -673,6 +719,7 @@ mod tests {
                     message: "hello {{name}}".into(),
                     style: LogStyle::Plain,
                 }],
+                triggers: vec![],
             },
         );
         config.workflow.insert(
@@ -681,6 +728,7 @@ mod tests {
                 steps: vec![WorkflowStep::RunWorkflow {
                     workflow: "helper".into(),
                 }],
+                triggers: vec![],
             },
         );
 
@@ -711,6 +759,7 @@ mod tests {
                 steps: vec![WorkflowStep::RunWorkflow {
                     workflow: "loop".into(),
                 }],
+                triggers: vec![],
             },
         );
 
@@ -737,6 +786,7 @@ mod tests {
             "rust".into(),
             WorkflowSpec {
                 steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
             },
         );
 
@@ -797,6 +847,7 @@ mod tests {
             "rust".into(),
             WorkflowSpec {
                 steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
             },
         );
         let mut runtime = RuntimeMachine::new(&config);
@@ -882,6 +933,7 @@ mod tests {
                     message: "announce".into(),
                     style: LogStyle::Plain,
                 }],
+                triggers: vec![],
             },
         );
 
