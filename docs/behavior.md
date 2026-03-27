@@ -70,8 +70,10 @@ Workflows run step by step, in order.
 - `log` also renders templates against the current session state before
   emitting output.
 
-If any step fails, the workflow fails immediately and `devloop run`
-returns an error.
+If any step fails, that workflow fails immediately and logs the error
+loudly, but `devloop` itself keeps running so later file changes or
+external events can retry the workflow without restarting the
+supervisor.
 
 ## Processes
 

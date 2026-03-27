@@ -46,6 +46,11 @@ without hard-coding knowledge of any one repository.
   corresponding sad path with explicit, observable failure behavior:
   non-zero exits, surfaced errors, timeouts, logs, or other signals
   that make the failure diagnosable instead of disappearing quietly.
+- Prefer noisy, non-fatal runtime failures when supervision can
+  continue safely. A transient readiness timeout, failed rebuild, or
+  broken watched edit should complain loudly in logs without taking down
+  the whole `devloop` engine unless the supervisor itself can no longer
+  make progress.
 - When forwarding inherited process output, prefer visible output over
   suppressing noise. Carriage-return-driven updates should be rendered
   as visible labeled lines; if a tool is too noisy, fix that at the

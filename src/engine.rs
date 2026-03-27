@@ -285,7 +285,15 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
             RuntimeEffect::RunWorkflow {
                 workflow_name,
                 changed_files,
-            } => adapter.run_workflow(&workflow_name, &changed_files).await?,
+            } => {
+                if let Err(error) = adapter.run_workflow(&workflow_name, &changed_files).await {
+                    error!(
+                        workflow = %workflow_name,
+                        error = %error,
+                        "workflow failed; continuing runtime"
+                    );
+                }
+            }
             RuntimeEffect::StartWatching => adapter.start_watching().await?,
             RuntimeEffect::MaintainProcesses => adapter.maintain_processes().await?,
             RuntimeEffect::PollObservedHook {
@@ -845,6 +853,7 @@ mod tests {
     struct MockRuntimeAdapter {
         calls: Vec<String>,
         changed_hooks: BTreeMap<String, bool>,
+        workflow_errors: BTreeMap<String, String>,
     }
 
     impl MockRuntimeAdapter {
@@ -852,6 +861,7 @@ mod tests {
             Self {
                 calls: Vec::new(),
                 changed_hooks: BTreeMap::new(),
+                workflow_errors: BTreeMap::new(),
             }
         }
     }
@@ -877,6 +887,9 @@ mod tests {
             workflow_name: &str,
             changed_files: &[String],
         ) -> Result<()> {
+            if let Some(message) = self.workflow_errors.get(workflow_name) {
+                return Err(anyhow!(message.clone()));
+            }
             self.calls.push(format!(
                 "workflow:{workflow_name}:{}",
                 changed_files.join(",")
@@ -1104,6 +1117,39 @@ mod tests {
                 "workflow:publish_post_url:",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_machine_logs_and_continues_after_workflow_failure() {
+        let config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec!["startup".into()],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            event: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        let mut runtime = RuntimeMachine::new(&config);
+        runtime.handle_event(RuntimeEvent::Start {
+            root_display: "/tmp/example".into(),
+            startup_workflows: vec!["startup".into()],
+        });
+        let mut adapter = MockRuntimeAdapter::new();
+        adapter.workflow_errors.insert(
+            "startup".into(),
+            "timed out waiting for process 'server' probe http://127.0.0.1:8080/".into(),
+        );
+
+        let exit = execute_runtime_effects(&mut runtime, &mut adapter)
+            .await
+            .expect("execute startup effects");
+
+        assert!(!exit);
+        assert_eq!(adapter.calls, vec!["persist:root", "autostart", "watch"]);
     }
 
     #[tokio::test]

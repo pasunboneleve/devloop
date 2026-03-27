@@ -5,6 +5,9 @@ All notable changes to `devloop` will be recorded in this file.
 ## [Unreleased]
 
 ### Fixed
+- Workflow failures such as process-readiness timeouts now log loudly
+  but do not terminate `devloop`, so the watcher stays alive and the
+  next successful edit can recover a broken local build.
 - Platform-specific release workflows no longer duplicate GitHub release notes when both assets are published to the same tag.
 
 ## [0.6.2] - 2026-03-26
