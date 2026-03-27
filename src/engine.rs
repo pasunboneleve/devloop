@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{AccessKind, AccessMode},
 };
 use serde_json::{Map, Value};
 use tokio::signal;
@@ -527,7 +528,15 @@ fn normalize_path(path: &Path) -> String {
 fn is_relevant_event(kind: &EventKind) -> bool {
     matches!(
         kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
+        EventKind::Create(_)
+            | EventKind::Modify(_)
+            | EventKind::Remove(_)
+            | EventKind::Any
+            // Some backends collapse close-after-write saves into an imprecise close event,
+            // so keep unknown close modes to avoid missing real file writes.
+            | EventKind::Access(AccessKind::Close(
+                AccessMode::Write | AccessMode::Any | AccessMode::Other
+            ))
     )
 }
 
@@ -605,6 +614,50 @@ mod tests {
         let grouped = classify_events(&root, &groups, &events);
 
         assert_eq!(grouped["content"], vec!["watched.txt"]);
+    }
+
+    #[test]
+    fn classify_changes_by_workflow_accepts_write_close_access_events() {
+        let root = PathBuf::from("/tmp/example");
+        let groups =
+            vec![CompiledWatchGroup::for_test(&["tailwind.css"], "css").expect("watch group")];
+        let events = vec![
+            Event {
+                kind: EventKind::Access(AccessKind::Close(AccessMode::Write)),
+                paths: vec![root.join("tailwind.css")],
+                attrs: Default::default(),
+            },
+            Event {
+                kind: EventKind::Access(AccessKind::Close(AccessMode::Any)),
+                paths: vec![root.join("tailwind.css")],
+                attrs: Default::default(),
+            },
+            Event {
+                kind: EventKind::Access(AccessKind::Close(AccessMode::Other)),
+                paths: vec![root.join("tailwind.css")],
+                attrs: Default::default(),
+            },
+        ];
+
+        let grouped = classify_events(&root, &groups, &events);
+
+        assert_eq!(grouped["css"], vec!["tailwind.css"]);
+    }
+
+    #[test]
+    fn classify_changes_by_workflow_rejects_read_close_access_events() {
+        let root = PathBuf::from("/tmp/example");
+        let groups =
+            vec![CompiledWatchGroup::for_test(&["tailwind.css"], "css").expect("watch group")];
+        let events = vec![Event {
+            kind: EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            paths: vec![root.join("tailwind.css")],
+            attrs: Default::default(),
+        }];
+
+        let grouped = classify_events(&root, &groups, &events);
+
+        assert!(grouped.is_empty());
     }
 
     #[tokio::test]
