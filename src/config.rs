@@ -1032,6 +1032,46 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_inline_workflow_trigger_overlapping_with_parent_trigger() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "c".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::NotifyReload],
+                triggers: vec![],
+            },
+        );
+        config.workflow.insert(
+            "b".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::Log {
+                    message: "b".into(),
+                    style: LogStyle::Plain,
+                }],
+                triggers: vec!["c".into()],
+            },
+        );
+        config.workflow.insert(
+            "a".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::RunWorkflow {
+                    workflow: "b".into(),
+                }],
+                triggers: vec!["c".into()],
+            },
+        );
+
+        let error = config.workflow["a"]
+            .validate(&config, "a")
+            .expect_err("overlapping parent and inline workflow triggers should fail");
+        assert!(
+            error.to_string().contains(
+                "workflow 'c' is reachable both as a trigger target and via run_workflow"
+            )
+        );
+    }
+
+    #[test]
     fn output_config_defaults_to_inherited_output() {
         let config: OutputConfig = toml::from_str("").expect("parse default output config");
 
