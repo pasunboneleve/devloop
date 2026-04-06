@@ -18,6 +18,24 @@ Most local setups become expensive to change:
 `devloop` keeps everything alive so you can change one thing at a
 time.
 
+<br>
+
+<p align="center" style="margin: 0.35rem 0 0.35rem 0;">
+  <a href="https://patents.google.com/patent/US1948860A"
+  target="_blank"
+  rel="noopener noreferrer">
+    <img
+        src="docs/images/us1948860a-page1-drawing-mid-yellow-card.png"
+        alt="Ball bearing patent drawing"
+        style="width:58.5%;"
+        />
+  </a>
+</p>
+
+<p align="center" style="margin: 0 0 1.25rem 0;">
+    <sub>Motion is constrained. Parts keep moving.</sub>
+</p>
+
 ## A concrete example
 
 Working on a blog post with a public preview:
