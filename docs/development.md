@@ -17,6 +17,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 checks that `devloop run` can start, begin watching, react to one file
 change, and shut down cleanly.
 
+## Releases
+
+`devloop` releases are tag-driven. Push a tag such as `v0.8.0` and the
+platform release workflows publish the Linux and macOS archives.
+
+GitHub release notes are generated from the matching section in
+`CHANGELOG.md`, not from GitHub's automatic PR summary. The Linux
+release job publishes the changelog text and compare link; the macOS job
+only attaches its archive asset to that same release.
+
 ## Opt-in watch flake smoke
 
 The repeated-edit watch flake smoke test is intentionally opt-in. It is
