@@ -12,7 +12,7 @@ on:
       archive_name:
         required: true
         type: string
-      generate_release_notes:
+      publish_release_notes:
         required: true
         type: boolean
 
@@ -56,9 +56,24 @@ jobs:
           cp "target/${{ inputs.target }}/release/devloop" dist/devloop
           tar -C dist -czf "${{ inputs.archive_name }}" devloop
 
+      - name: Extract release notes from changelog
+        if: inputs.publish_release_notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/release-notes-from-changelog.sh "${GITHUB_REF_NAME#v}" "${GITHUB_REPOSITORY}" > release-notes.md
+
       - name: Publish GitHub release asset
+        if: inputs.publish_release_notes
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ inputs.archive_name }}
-          generate_release_notes: ${{ inputs.generate_release_notes }}
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+
+      - name: Publish GitHub release asset without notes
+        if: ${{ !inputs.publish_release_notes }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ inputs.archive_name }}
           fail_on_unmatched_files: true
