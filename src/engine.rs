@@ -574,7 +574,7 @@ fn resolve_watch_registrations(
     if immediate_parent.exists() {
         return Ok(vec![CompiledWatchTarget {
             path: immediate_parent.to_path_buf(),
-            recursive: false,
+            recursive: target.recursive,
         }]);
     }
 
