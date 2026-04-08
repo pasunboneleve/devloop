@@ -135,6 +135,7 @@ mod tests {
         Config {
             root: ".".into(),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some("./state.json".into()),
             startup_workflows: vec![],
             watch: BTreeMap::new(),

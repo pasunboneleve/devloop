@@ -26,6 +26,21 @@ startup_workflows = ["startup"]
 - `startup_workflows`: workflows to run after autostart processes have
   been started.
 
+Optional watcher backend config:
+
+```toml
+[watcher]
+kind = "native"
+poll_interval_ms = 250
+```
+
+- `watcher.kind`: watcher backend to use. `native` is the default and
+  uses the platform-recommended `notify` backend. `poll` uses
+  `notify`'s polling watcher as a fallback for environments where
+  native filesystem events are unreliable.
+- `watcher.poll_interval_ms`: polling interval used when
+  `watcher.kind = "poll"`. Default: `250`.
+
 Optional browser reload server config:
 
 ```toml
@@ -50,6 +65,10 @@ workflow = "rust"
 - `paths`: glob patterns evaluated relative to `root`.
 - `workflow`: workflow to run when a matching file changes. If omitted,
   the watch-group name is used as the workflow name.
+
+`devloop` derives concrete watch targets from these patterns and asks
+the backend to watch only those literal files or directories instead of
+always watching the whole repository root recursively.
 
 ## Processes
 

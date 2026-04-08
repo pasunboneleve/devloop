@@ -4,6 +4,19 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Added
+- Added a configurable watcher backend with non-breaking `native`
+  default behavior plus a `poll` fallback mode for environments where
+  native filesystem notifications are unreliable.
+- Added a Rust repeated-edit watch flake smoke test that runs under
+  `cargo test` and therefore in GitHub Actions alongside the existing
+  runtime smoke test.
+
+### Changed
+- `devloop` now derives concrete watch targets from configured watch
+  patterns and asks the backend to watch only those files or
+  directories instead of always watching the whole repository root.
+
 ## [0.7.0] - 2026-03-27
 
 ### Added

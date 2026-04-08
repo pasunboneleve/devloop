@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use notify::{
-    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
+    Watcher,
     event::{AccessKind, AccessMode},
 };
 use serde_json::{Map, Value};
@@ -17,7 +18,7 @@ use tracing::{error, info};
 use unicode_width::UnicodeWidthStr;
 
 use crate::browser_reload::{BrowserReloadSender, BrowserReloadServer, notify_browser_reload};
-use crate::config::{CompiledWatchGroup, Config, LogStyle};
+use crate::config::{CompiledWatchGroup, CompiledWatchTarget, Config, LogStyle, WatcherKind};
 use crate::core::{RuntimeEffect, RuntimeEvent, RuntimeMachine, WorkflowEffect, WorkflowMachine};
 use crate::external_events::{ExternalEventMessage, ExternalEventServer};
 use crate::processes::ProcessManager;
@@ -69,8 +70,9 @@ struct LiveRuntimeAdapter<'a, 'b> {
     config: &'a Config,
     processes: &'a mut ProcessManager<'b>,
     state: &'a SessionState,
-    watcher: &'a mut RecommendedWatcher,
+    watcher: &'a mut Box<dyn Watcher + Send>,
     watcher_shutdown: Arc<AtomicBool>,
+    watched_targets: Vec<CompiledWatchTarget>,
     external_event_tx: tokio::sync::mpsc::UnboundedSender<ExternalEventMessage>,
     external_event_server: Option<ExternalEventServer>,
     browser_reload_server: Option<BrowserReloadServer>,
@@ -90,17 +92,15 @@ impl Engine {
         )?;
         let mut processes = ProcessManager::new(&self.config);
         let watch_groups = self.config.compiled_watchers()?;
+        let watched_targets = self.config.compiled_watch_targets();
         let (tx, rx) = mpsc::channel();
         let (external_event_tx, mut external_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_watcher = tx.clone();
         let watcher_shutdown = Arc::new(AtomicBool::new(false));
         let watcher_shutdown_callback = watcher_shutdown.clone();
-        let mut watcher = RecommendedWatcher::new(
-            move |result| {
-                forward_watcher_event(&tx_watcher, &watcher_shutdown_callback, result);
-            },
-            NotifyConfig::default(),
-        )?;
+        let mut watcher = create_watcher(&self.config, move |result| {
+            forward_watcher_event(&tx_watcher, &watcher_shutdown_callback, result);
+        })?;
         let mut maintain_tick = tokio::time::interval(Duration::from_secs(1));
         let mut runtime = RuntimeMachine::new(&self.config);
         let runtime_start = Instant::now();
@@ -114,6 +114,7 @@ impl Engine {
             state: &state,
             watcher: &mut watcher,
             watcher_shutdown,
+            watched_targets,
             external_event_tx,
             external_event_server: None,
             browser_reload_server: None,
@@ -273,9 +274,21 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
     }
 
     async fn start_watching(&mut self) -> Result<()> {
-        self.watcher
-            .watch(&self.config.root, RecursiveMode::Recursive)?;
-        info!("watching {}", self.config.root.display());
+        for target in &self.watched_targets {
+            self.watcher.watch(
+                &target.path,
+                if target.recursive {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                },
+            )?;
+            info!(
+                "watching {}{}",
+                target.path.display(),
+                if target.recursive { " (recursive)" } else { "" }
+            );
+        }
         Ok(())
     }
 
@@ -296,12 +309,32 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
 
     async fn stop_watching(&mut self) -> Result<()> {
         self.watcher_shutdown.store(true, Ordering::Relaxed);
-        self.watcher.unwatch(&self.config.root)?;
+        for target in &self.watched_targets {
+            self.watcher.unwatch(&target.path)?;
+        }
         Ok(())
     }
 
     async fn stop_all_processes(&mut self) -> Result<()> {
         self.processes.stop_all(self.state).await
+    }
+}
+
+fn create_watcher<F>(config: &Config, handler: F) -> Result<Box<dyn Watcher + Send>>
+where
+    F: FnMut(notify::Result<Event>) + Send + 'static,
+{
+    let notify_config = NotifyConfig::default();
+    match config.watcher.kind {
+        WatcherKind::Native => {
+            Ok(Box::new(RecommendedWatcher::new(handler, notify_config)?) as Box<_>)
+        }
+        WatcherKind::Poll => Ok(Box::new(PollWatcher::new(
+            handler,
+            notify_config
+                .with_compare_contents(true)
+                .with_poll_interval(Duration::from_millis(config.watcher.poll_interval_ms)),
+        )?) as Box<_>),
     }
 }
 
@@ -683,6 +716,7 @@ mod tests {
         let mut config = Config {
             root: root.clone(),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(state_path.clone()),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -738,6 +772,7 @@ mod tests {
         let mut config = Config {
             root: root.clone(),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(state_path.clone()),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -806,6 +841,7 @@ mod tests {
         let mut config = Config {
             root,
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(state_path.clone()),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -939,6 +975,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -996,6 +1033,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1046,6 +1084,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1123,6 +1162,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1182,6 +1222,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1321,6 +1362,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1422,6 +1464,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1487,6 +1530,7 @@ mod tests {
         let config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1538,6 +1582,7 @@ mod tests {
         let config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec!["startup".into()],
             watch: BTreeMap::new(),
@@ -1572,6 +1617,7 @@ mod tests {
         let config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),

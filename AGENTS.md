@@ -18,6 +18,9 @@ without hard-coding knowledge of any one repository.
   avoid baking it into the core.
 - Do not push unless explicitly asked. This repository may not even have a
   remote during early development.
+- Do not use `sleep` to resolve races. Races must be resolved with
+  deterministic logic, explicit readiness signals, or ordered state
+  transitions.
 - Run quality gates for code changes: `cargo fmt`, `cargo test`,
   `cargo clippy --all-targets --all-features -- -D warnings`.
 
