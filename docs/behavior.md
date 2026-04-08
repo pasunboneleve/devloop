@@ -49,13 +49,20 @@ merged back into the live session.
 
 ## Watching and debounce
 
-`devloop` watches the configured `root` recursively.
+`devloop` derives concrete filesystem watch targets from the configured
+watch-group patterns and watches only those files or directories.
 
 - Only relevant file-system events are considered.
 - Events are batched for `debounce_ms`.
 - Matching changes are grouped by workflow name before execution.
 - Each workflow receives the set of changed relative paths that matched
   it during the debounce window.
+- The default backend uses native filesystem notifications. A polling
+  backend can be selected in config as a fallback for environments
+  where native events are unreliable.
+- Literal file targets are watched as narrowly as the backend allows.
+  Use a trailing `/` in the config when you mean an explicit directory
+  target that should be watched recursively.
 
 If multiple watch groups map to the same workflow, their matched paths
 are merged for that workflow run.

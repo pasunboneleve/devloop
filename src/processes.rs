@@ -984,6 +984,7 @@ fn timeout_error(name: &str, probe: &ProbeSpec) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::config::{OutputExtract, ProbeSpec};
+    use crate::test_support::RustLogGuard;
     use serde_json::Value;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1323,10 +1324,7 @@ mod tests {
 
     #[test]
     fn configure_command_inherits_parent_rust_log_by_default() {
-        let original = std::env::var_os("RUST_LOG");
-        unsafe {
-            std::env::set_var("RUST_LOG", "debug");
-        }
+        let _guard = RustLogGuard::set(Some("debug"));
 
         let command = configure_command(
             &["cargo".into(), "run".into()],
@@ -1352,16 +1350,11 @@ mod tests {
             rust_log.is_none(),
             "RUST_LOG should not be overridden in child env"
         );
-
-        restore_rust_log(original);
     }
 
     #[test]
     fn configure_command_keeps_explicit_rust_log_override() {
-        let original = std::env::var_os("RUST_LOG");
-        unsafe {
-            std::env::set_var("RUST_LOG", "debug");
-        }
+        let _guard = RustLogGuard::set(Some("debug"));
 
         let mut env = BTreeMap::new();
         env.insert("RUST_LOG".into(), "info,gcp_rust_blog=debug".into());
@@ -1389,8 +1382,6 @@ mod tests {
             .expect("explicit RUST_LOG should be preserved");
 
         assert_eq!(rust_log, "info,gcp_rust_blog=debug");
-
-        restore_rust_log(original);
     }
 
     #[test]
@@ -1461,17 +1452,6 @@ mod tests {
             *key == std::ffi::OsStr::new("DEVLOOP_BROWSER_EVENTS_URL")
                 && *value == Some(std::ffi::OsStr::new("http://127.0.0.1:4455/browser-events"))
         }));
-    }
-
-    fn restore_rust_log(original: Option<std::ffi::OsString>) {
-        match original {
-            Some(value) => unsafe {
-                std::env::set_var("RUST_LOG", value);
-            },
-            None => unsafe {
-                std::env::remove_var("RUST_LOG");
-            },
-        }
     }
 
     #[test]

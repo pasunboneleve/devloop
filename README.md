@@ -100,6 +100,7 @@ Built-in reference docs are also available from the CLI:
 ```bash
 devloop docs config
 devloop docs behavior
+devloop docs development
 devloop docs security
 ```
 
@@ -185,6 +186,9 @@ For the runtime behavior reference, see
 
 For the full configuration reference, see
 [`docs/configuration.md`](docs/configuration.md).
+
+For local contributor workflow details, including the opt-in watch
+flake smoke test, see [`docs/development.md`](docs/development.md).
 
 For the external-event trust model and push-versus-polling tradeoffs,
 see [`docs/security.md`](docs/security.md).

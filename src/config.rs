@@ -13,6 +13,8 @@ pub struct Config {
     pub root: PathBuf,
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+    #[serde(default)]
+    pub watcher: WatcherConfig,
     pub state_file: Option<PathBuf>,
     #[serde(default)]
     pub startup_workflows: Vec<String>,
@@ -92,6 +94,7 @@ impl Config {
         }
         self.event_server.validate()?;
         self.browser_reload_server.validate()?;
+        self.watcher.validate()?;
         for (name, event) in &self.event {
             event
                 .validate()
@@ -127,6 +130,20 @@ impl Config {
             .iter()
             .map(|(name, group)| group.compile(name))
             .collect()
+    }
+
+    pub fn compiled_watch_targets(&self) -> Vec<CompiledWatchTarget> {
+        let mut targets = BTreeMap::<PathBuf, bool>::new();
+        for group in self.watch.values() {
+            for pattern in &group.paths {
+                let target = CompiledWatchTarget::from_pattern(&self.root, pattern);
+                targets
+                    .entry(target.path)
+                    .and_modify(|recursive| *recursive |= target.recursive)
+                    .or_insert(target.recursive);
+            }
+        }
+        targets.into_iter().map(CompiledWatchTarget::from).collect()
     }
 
     pub fn has_external_events(&self) -> bool {
@@ -211,6 +228,102 @@ impl CompiledWatchGroup {
             matchers: builder.build()?,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherKind {
+    #[default]
+    Native,
+    Poll,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatcherConfig {
+    #[serde(default)]
+    pub kind: WatcherKind,
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            kind: WatcherKind::Native,
+            poll_interval_ms: default_poll_interval_ms(),
+        }
+    }
+}
+
+impl WatcherConfig {
+    fn validate(&self) -> Result<()> {
+        if self.poll_interval_ms == 0 {
+            return Err(anyhow!(
+                "watcher poll_interval_ms must be greater than zero"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CompiledWatchTarget {
+    pub path: PathBuf,
+    pub recursive: bool,
+}
+
+impl From<(PathBuf, bool)> for CompiledWatchTarget {
+    fn from((path, recursive): (PathBuf, bool)) -> Self {
+        Self { path, recursive }
+    }
+}
+
+impl CompiledWatchTarget {
+    fn from_pattern(root: &Path, pattern: &str) -> Self {
+        let mut prefix = PathBuf::new();
+        let mut recursive = false;
+        for segment in pattern.split('/') {
+            if segment.is_empty() || segment == "." {
+                continue;
+            }
+            if segment == "**" {
+                recursive = true;
+                break;
+            }
+            if segment_has_glob_magic(segment) {
+                recursive = true;
+                break;
+            }
+            prefix.push(segment);
+        }
+
+        if prefix.as_os_str().is_empty() {
+            return Self {
+                path: root.to_path_buf(),
+                recursive: true,
+            };
+        }
+
+        if pattern_is_literal(pattern) {
+            return Self {
+                path: root.join(prefix),
+                recursive: pattern.ends_with('/'),
+            };
+        }
+
+        Self {
+            path: root.join(prefix),
+            recursive,
+        }
+    }
+}
+
+fn pattern_is_literal(pattern: &str) -> bool {
+    !pattern.split('/').any(segment_has_glob_magic) && !pattern.contains("**")
+}
+
+fn segment_has_glob_magic(segment: &str) -> bool {
+    segment.contains('*') || segment.contains('?') || segment.contains('[') || segment.contains('{')
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -702,11 +815,11 @@ pub enum LogStyle {
 }
 
 pub fn absolutize(base: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    normalize_path_buf(if path.is_absolute() {
         path.to_path_buf()
     } else {
         base.join(path)
-    }
+    })
 }
 
 fn default_debounce_ms() -> u64 {
@@ -719,6 +832,10 @@ fn default_interval_ms() -> u64 {
 
 fn default_timeout_ms() -> u64 {
     15_000
+}
+
+fn default_poll_interval_ms() -> u64 {
+    250
 }
 
 fn default_true() -> bool {
@@ -752,6 +869,10 @@ fn default_browser_reload_server_bind() -> String {
     "127.0.0.1:0".to_string()
 }
 
+fn normalize_path_buf(path: PathBuf) -> PathBuf {
+    path.components().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +881,7 @@ mod tests {
         Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1184,6 +1306,81 @@ mod tests {
             toml::from_str("").expect("parse browser reload server config");
 
         assert_eq!(config.bind, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn watcher_defaults_to_native_with_poll_fallback_interval() {
+        let watcher: WatcherConfig = toml::from_str("").expect("parse watcher config");
+
+        assert_eq!(watcher.kind, WatcherKind::Native);
+        assert_eq!(watcher.poll_interval_ms, 250);
+    }
+
+    #[test]
+    fn compiled_watch_targets_reduce_patterns_to_concrete_paths() {
+        let mut config = base_config();
+        config.root = PathBuf::from("/tmp/example");
+        config.watch.insert(
+            "rust".into(),
+            WatchGroup {
+                paths: vec![
+                    "src/**/*.rs".into(),
+                    "Cargo.toml".into(),
+                    "content/banner.html".into(),
+                ],
+                workflow: Some("rust".into()),
+            },
+        );
+        config.watch.insert(
+            "content".into(),
+            WatchGroup {
+                paths: vec!["content/**/*.md".into(), "content/**/*.html".into()],
+                workflow: Some("content".into()),
+            },
+        );
+
+        assert_eq!(
+            config.compiled_watch_targets(),
+            vec![
+                CompiledWatchTarget {
+                    path: PathBuf::from("/tmp/example/Cargo.toml"),
+                    recursive: false,
+                },
+                CompiledWatchTarget {
+                    path: PathBuf::from("/tmp/example/content"),
+                    recursive: true,
+                },
+                CompiledWatchTarget {
+                    path: PathBuf::from("/tmp/example/content/banner.html"),
+                    recursive: false,
+                },
+                CompiledWatchTarget {
+                    path: PathBuf::from("/tmp/example/src"),
+                    recursive: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compiled_watch_targets_keep_literal_directory_targets_recursive() {
+        let mut config = base_config();
+        config.root = PathBuf::from("/tmp/example");
+        config.watch.insert(
+            "content".into(),
+            WatchGroup {
+                paths: vec!["content/".into()],
+                workflow: Some("content".into()),
+            },
+        );
+
+        assert_eq!(
+            config.compiled_watch_targets(),
+            vec![CompiledWatchTarget {
+                path: PathBuf::from("/tmp/example/content"),
+                recursive: true,
+            }]
+        );
     }
 
     #[test]

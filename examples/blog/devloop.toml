@@ -6,6 +6,9 @@ debounce_ms = 300
 state_file = "./.devloop/state.json"
 startup_workflows = ["startup"]
 
+[watcher]
+kind = "native"
+
 [watch.rust]
 paths = ["src/**/*.rs", "Cargo.toml", "content/layout.html", "content/banner.html", "content/site.toml"]
 workflow = "rust"

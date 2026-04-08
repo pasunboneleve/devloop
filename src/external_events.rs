@@ -240,6 +240,7 @@ mod tests {
         Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),

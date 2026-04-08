@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use notify::{
-    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
+    Watcher,
     event::{AccessKind, AccessMode},
 };
 use serde_json::{Map, Value};
@@ -17,7 +17,7 @@ use tracing::{error, info};
 use unicode_width::UnicodeWidthStr;
 
 use crate::browser_reload::{BrowserReloadSender, BrowserReloadServer, notify_browser_reload};
-use crate::config::{CompiledWatchGroup, Config, LogStyle};
+use crate::config::{CompiledWatchGroup, CompiledWatchTarget, Config, LogStyle, WatcherKind};
 use crate::core::{RuntimeEffect, RuntimeEvent, RuntimeMachine, WorkflowEffect, WorkflowMachine};
 use crate::external_events::{ExternalEventMessage, ExternalEventServer};
 use crate::processes::ProcessManager;
@@ -69,8 +69,10 @@ struct LiveRuntimeAdapter<'a, 'b> {
     config: &'a Config,
     processes: &'a mut ProcessManager<'b>,
     state: &'a SessionState,
-    watcher: &'a mut RecommendedWatcher,
+    watcher: &'a mut Box<dyn Watcher + Send>,
     watcher_shutdown: Arc<AtomicBool>,
+    watched_targets: Vec<CompiledWatchTarget>,
+    active_watch_targets: Vec<CompiledWatchTarget>,
     external_event_tx: tokio::sync::mpsc::UnboundedSender<ExternalEventMessage>,
     external_event_server: Option<ExternalEventServer>,
     browser_reload_server: Option<BrowserReloadServer>,
@@ -90,17 +92,15 @@ impl Engine {
         )?;
         let mut processes = ProcessManager::new(&self.config);
         let watch_groups = self.config.compiled_watchers()?;
-        let (tx, rx) = mpsc::channel();
+        let watched_targets = self.config.compiled_watch_targets();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (external_event_tx, mut external_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_watcher = tx.clone();
         let watcher_shutdown = Arc::new(AtomicBool::new(false));
         let watcher_shutdown_callback = watcher_shutdown.clone();
-        let mut watcher = RecommendedWatcher::new(
-            move |result| {
-                forward_watcher_event(&tx_watcher, &watcher_shutdown_callback, result);
-            },
-            NotifyConfig::default(),
-        )?;
+        let mut watcher = create_watcher(&self.config, move |result| {
+            forward_watcher_event(&tx_watcher, &watcher_shutdown_callback, result);
+        })?;
         let mut maintain_tick = tokio::time::interval(Duration::from_secs(1));
         let mut runtime = RuntimeMachine::new(&self.config);
         let runtime_start = Instant::now();
@@ -114,11 +114,15 @@ impl Engine {
             state: &state,
             watcher: &mut watcher,
             watcher_shutdown,
+            watched_targets,
+            active_watch_targets: Vec::new(),
             external_event_tx,
             external_event_server: None,
             browser_reload_server: None,
         };
         execute_runtime_effects(&mut runtime, &mut adapter).await?;
+        let mut pending_watch_events = Vec::new();
+        let mut watch_deadline = None;
 
         loop {
             tokio::select! {
@@ -138,9 +142,26 @@ impl Engine {
                         return Ok(());
                     }
                 }
-                batch = next_batch(&rx, self.config.debounce()) => {
-                    let events = batch?;
-                    let workflows = classify_events(&self.config.root, &watch_groups, &events);
+                event = rx.recv() => {
+                    match event {
+                        Some(result) => {
+                            pending_watch_events.push(result?);
+                            if watch_deadline.is_none() {
+                                watch_deadline = Some(Instant::now() + self.config.debounce());
+                            }
+                        }
+                        None => return Err(anyhow!("watcher event channel disconnected")),
+                    }
+                }
+                _ = async {
+                    if let Some(deadline) = watch_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                }, if watch_deadline.is_some() => {
+                    let workflows =
+                        classify_events(&self.config.root, &watch_groups, &pending_watch_events);
+                    pending_watch_events.clear();
+                    watch_deadline = None;
                     if !workflows.is_empty() {
                         runtime.handle_event(RuntimeEvent::WatchChanges { workflows });
                         if execute_runtime_effects(&mut runtime, &mut adapter).await? {
@@ -273,9 +294,38 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
     }
 
     async fn start_watching(&mut self) -> Result<()> {
-        self.watcher
-            .watch(&self.config.root, RecursiveMode::Recursive)?;
-        info!("watching {}", self.config.root.display());
+        self.active_watch_targets.clear();
+        let mut registrations = BTreeMap::<std::path::PathBuf, bool>::new();
+        for target in &self.watched_targets {
+            for registration in resolve_watch_registrations(target, self.config.watcher.kind)? {
+                registrations
+                    .entry(registration.path)
+                    .and_modify(|recursive| *recursive |= registration.recursive)
+                    .or_insert(registration.recursive);
+            }
+        }
+
+        for (path, recursive) in registrations {
+            let registration = CompiledWatchTarget { path, recursive };
+            self.watcher.watch(
+                &registration.path,
+                if registration.recursive {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                },
+            )?;
+            self.active_watch_targets.push(registration.clone());
+            info!(
+                "watching {}{}",
+                registration.path.display(),
+                if registration.recursive {
+                    " (recursive)"
+                } else {
+                    ""
+                }
+            );
+        }
         Ok(())
     }
 
@@ -296,12 +346,33 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
 
     async fn stop_watching(&mut self) -> Result<()> {
         self.watcher_shutdown.store(true, Ordering::Relaxed);
-        self.watcher.unwatch(&self.config.root)?;
+        for target in &self.active_watch_targets {
+            self.watcher.unwatch(&target.path)?;
+        }
+        self.active_watch_targets.clear();
         Ok(())
     }
 
     async fn stop_all_processes(&mut self) -> Result<()> {
         self.processes.stop_all(self.state).await
+    }
+}
+
+fn create_watcher<F>(config: &Config, handler: F) -> Result<Box<dyn Watcher + Send>>
+where
+    F: FnMut(notify::Result<Event>) + Send + 'static,
+{
+    let notify_config = NotifyConfig::default();
+    match config.watcher.kind {
+        WatcherKind::Native => {
+            Ok(Box::new(RecommendedWatcher::new(handler, notify_config)?) as Box<_>)
+        }
+        WatcherKind::Poll => Ok(Box::new(PollWatcher::new(
+            handler,
+            notify_config
+                .with_compare_contents(true)
+                .with_poll_interval(Duration::from_millis(config.watcher.poll_interval_ms)),
+        )?) as Box<_>),
     }
 }
 
@@ -352,7 +423,7 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
 }
 
 fn forward_watcher_event(
-    tx: &mpsc::Sender<notify::Result<Event>>,
+    tx: &tokio::sync::mpsc::UnboundedSender<notify::Result<Event>>,
     shutting_down: &AtomicBool,
     result: notify::Result<Event>,
 ) {
@@ -462,24 +533,67 @@ fn boxed_banner_lines(message: &str) -> [String; 3] {
     [border.clone(), line, border]
 }
 
-async fn next_batch(
-    rx: &mpsc::Receiver<notify::Result<Event>>,
-    debounce: Duration,
-) -> Result<Vec<Event>> {
-    let first = match rx.recv() {
-        Ok(result) => result?,
-        Err(_) => return Err(anyhow!("watcher event channel disconnected")),
-    };
-    let start = Instant::now();
-    let mut events = vec![first];
-    while start.elapsed() < debounce {
-        match rx.try_recv() {
-            Ok(result) => events.push(result?),
-            Err(mpsc::TryRecvError::Empty) => sleep(Duration::from_millis(25)).await,
-            Err(mpsc::TryRecvError::Disconnected) => break,
-        }
+fn resolve_watch_registrations(
+    target: &CompiledWatchTarget,
+    watcher_kind: WatcherKind,
+) -> Result<Vec<CompiledWatchTarget>> {
+    if target.recursive {
+        return Ok(vec![CompiledWatchTarget {
+            path: closest_existing_ancestor(&target.path)?,
+            recursive: true,
+        }]);
     }
-    Ok(events)
+
+    if target.path.exists() {
+        if target.path.is_dir() {
+            return Ok(vec![CompiledWatchTarget {
+                path: target.path.clone(),
+                recursive: true,
+            }]);
+        }
+
+        return Ok(match watcher_kind {
+            WatcherKind::Native => {
+                let mut registrations = vec![target.clone()];
+                if let Some(parent) = target.path.parent() {
+                    registrations.push(CompiledWatchTarget {
+                        path: parent.to_path_buf(),
+                        recursive: false,
+                    });
+                }
+                registrations
+            }
+            WatcherKind::Poll => vec![target.clone()],
+        });
+    }
+
+    let immediate_parent = target
+        .path
+        .parent()
+        .ok_or_else(|| anyhow!("watch target '{}' has no parent", target.path.display()))?;
+    if immediate_parent.exists() {
+        return Ok(vec![CompiledWatchTarget {
+            path: immediate_parent.to_path_buf(),
+            recursive: target.recursive,
+        }]);
+    }
+
+    Ok(vec![CompiledWatchTarget {
+        path: closest_existing_ancestor(immediate_parent)?,
+        recursive: true,
+    }])
+}
+
+fn closest_existing_ancestor(path: &Path) -> Result<std::path::PathBuf> {
+    let mut candidate = path;
+    loop {
+        if candidate.exists() {
+            return Ok(candidate.to_path_buf());
+        }
+        candidate = candidate
+            .parent()
+            .ok_or_else(|| anyhow!("watch target '{}' has no existing ancestor", path.display()))?;
+    }
 }
 
 fn classify_events(
@@ -554,6 +668,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     fn unique_state_path() -> PathBuf {
         let unique = SystemTime::now()
@@ -587,19 +702,126 @@ mod tests {
         assert_eq!(grouped["content"], vec!["content/posts/example.md"]);
     }
 
-    #[tokio::test]
-    async fn next_batch_errors_when_watcher_channel_disconnects() {
-        let (_tx, rx) = mpsc::channel();
-        drop(_tx);
+    #[test]
+    fn resolve_watch_registration_keeps_existing_poll_file_exact() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("watched.txt");
+        std::fs::write(&file, "hello\n").expect("write watched file");
 
-        let error = next_batch(&rx, Duration::from_millis(10))
-            .await
-            .expect_err("channel disconnect should error");
+        let registrations = resolve_watch_registrations(
+            &CompiledWatchTarget {
+                path: file.clone(),
+                recursive: false,
+            },
+            WatcherKind::Poll,
+        )
+        .expect("resolve watch registration");
 
-        assert!(
-            error
-                .to_string()
-                .contains("watcher event channel disconnected")
+        assert_eq!(
+            registrations,
+            vec![CompiledWatchTarget {
+                path: file,
+                recursive: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_watch_registration_keeps_existing_native_file_and_parent() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("watched.txt");
+        std::fs::write(&file, "hello\n").expect("write watched file");
+
+        let registrations = resolve_watch_registrations(
+            &CompiledWatchTarget {
+                path: file.clone(),
+                recursive: false,
+            },
+            WatcherKind::Native,
+        )
+        .expect("resolve watch registration");
+
+        assert_eq!(
+            registrations,
+            vec![
+                CompiledWatchTarget {
+                    path: file,
+                    recursive: false,
+                },
+                CompiledWatchTarget {
+                    path: dir.path().to_path_buf(),
+                    recursive: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_watch_registration_falls_back_to_existing_parent_for_missing_file() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("watched.txt");
+
+        let registrations = resolve_watch_registrations(
+            &CompiledWatchTarget {
+                path: file,
+                recursive: false,
+            },
+            WatcherKind::Native,
+        )
+        .expect("resolve watch registration");
+
+        assert_eq!(
+            registrations,
+            vec![CompiledWatchTarget {
+                path: dir.path().to_path_buf(),
+                recursive: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_watch_registration_uses_recursive_parent_for_missing_explicit_directory_target() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("content");
+
+        let registrations = resolve_watch_registrations(
+            &CompiledWatchTarget {
+                path: target,
+                recursive: true,
+            },
+            WatcherKind::Native,
+        )
+        .expect("resolve watch registration");
+
+        assert_eq!(
+            registrations,
+            vec![CompiledWatchTarget {
+                path: dir.path().to_path_buf(),
+                recursive: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_watch_registration_climbs_recursively_when_parent_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("nested").join("watched.txt");
+
+        let registrations = resolve_watch_registrations(
+            &CompiledWatchTarget {
+                path: target,
+                recursive: false,
+            },
+            WatcherKind::Native,
+        )
+        .expect("resolve watch registration");
+
+        assert_eq!(
+            registrations,
+            vec![CompiledWatchTarget {
+                path: dir.path().to_path_buf(),
+                recursive: true,
+            }]
         );
     }
 
@@ -683,6 +905,7 @@ mod tests {
         let mut config = Config {
             root: root.clone(),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(state_path.clone()),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -738,6 +961,7 @@ mod tests {
         let mut config = Config {
             root: root.clone(),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(state_path.clone()),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -806,6 +1030,7 @@ mod tests {
         let mut config = Config {
             root,
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(state_path.clone()),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -939,6 +1164,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -996,6 +1222,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1046,6 +1273,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1123,6 +1351,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1182,6 +1411,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1321,6 +1551,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1402,7 +1633,7 @@ mod tests {
 
     #[test]
     fn forward_watcher_event_ignores_send_failures_after_shutdown() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let shutdown = AtomicBool::new(true);
         drop(rx);
 
@@ -1422,6 +1653,7 @@ mod tests {
         let mut config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1487,6 +1719,7 @@ mod tests {
         let config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),
@@ -1538,6 +1771,7 @@ mod tests {
         let config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec!["startup".into()],
             watch: BTreeMap::new(),
@@ -1572,6 +1806,7 @@ mod tests {
         let config = Config {
             root: PathBuf::from("."),
             debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
             state_file: Some(PathBuf::from("./state.json")),
             startup_workflows: vec![],
             watch: BTreeMap::new(),

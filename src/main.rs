@@ -6,6 +6,8 @@ mod external_events;
 mod output;
 mod processes;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use std::path::PathBuf;
 
@@ -62,6 +64,7 @@ enum Command {
 enum DocsTopic {
     Config,
     Behavior,
+    Development,
     Security,
 }
 
@@ -151,6 +154,7 @@ fn docs_text(topic: DocsTopic) -> &'static str {
     match topic {
         DocsTopic::Config => include_str!("../docs/configuration.md"),
         DocsTopic::Behavior => include_str!("../docs/behavior.md"),
+        DocsTopic::Development => include_str!("../docs/development.md"),
         DocsTopic::Security => include_str!("../docs/security.md"),
     }
 }
@@ -344,33 +348,19 @@ mod tests {
     use crate::output::{
         format_output_prefix, normalize_internal_log_label, normalize_source_label,
     };
+    use crate::test_support::RustLogGuard;
     use clap::Parser;
-    use std::sync::{Mutex, OnceLock};
-
-    fn rust_log_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn default_rust_log_uses_info_when_unset() {
-        let _guard = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
-        unsafe {
-            std::env::remove_var("RUST_LOG");
-        }
+        let _guard = RustLogGuard::set(None);
         assert_eq!(default_rust_log(), "info");
     }
 
     #[test]
     fn default_rust_log_respects_environment_override() {
-        let _guard = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
-        unsafe {
-            std::env::set_var("RUST_LOG", "debug,devloop=trace");
-        }
+        let _guard = RustLogGuard::set(Some("debug,devloop=trace"));
         assert_eq!(default_rust_log(), "debug,devloop=trace");
-        unsafe {
-            std::env::remove_var("RUST_LOG");
-        }
     }
 
     #[test]
@@ -419,6 +409,14 @@ mod tests {
     }
 
     #[test]
+    fn docs_text_uses_embedded_development_reference() {
+        let rendered = docs_text(DocsTopic::Development);
+
+        assert!(rendered.starts_with("# Development Guide"));
+        assert!(rendered.contains("DEVLOOP_RUN_WATCH_FLAKE_SMOKE"));
+    }
+
+    #[test]
     fn rendered_docs_drop_markdown_heading_markers() {
         let rendered = render_docs_text(DocsTopic::Config);
 
@@ -457,6 +455,16 @@ mod tests {
 
         match cli.command {
             super::Command::Docs { topic } => assert!(matches!(topic, DocsTopic::Security)),
+            _ => panic!("expected docs subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_development_docs_subcommand() {
+        let cli = Cli::try_parse_from(["devloop", "docs", "development"]).expect("parse cli");
+
+        match cli.command {
+            super::Command::Docs { topic } => assert!(matches!(topic, DocsTopic::Development)),
             _ => panic!("expected docs subcommand"),
         }
     }
