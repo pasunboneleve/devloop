@@ -307,7 +307,7 @@ impl CompiledWatchTarget {
         if pattern_is_literal(pattern) {
             return Self {
                 path: root.join(prefix),
-                recursive: false,
+                recursive: pattern.ends_with('/'),
             };
         }
 
@@ -1359,6 +1359,27 @@ mod tests {
                     recursive: true,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn compiled_watch_targets_keep_literal_directory_targets_recursive() {
+        let mut config = base_config();
+        config.root = PathBuf::from("/tmp/example");
+        config.watch.insert(
+            "content".into(),
+            WatchGroup {
+                paths: vec!["content/".into()],
+                workflow: Some("content".into()),
+            },
+        );
+
+        assert_eq!(
+            config.compiled_watch_targets(),
+            vec![CompiledWatchTarget {
+                path: PathBuf::from("/tmp/example/content"),
+                recursive: true,
+            }]
         );
     }
 

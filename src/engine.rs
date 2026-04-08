@@ -572,10 +572,9 @@ fn resolve_watch_registrations(
         .parent()
         .ok_or_else(|| anyhow!("watch target '{}' has no parent", target.path.display()))?;
     if immediate_parent.exists() {
-        let recursive = target.path.extension().is_none();
         return Ok(vec![CompiledWatchTarget {
             path: immediate_parent.to_path_buf(),
-            recursive,
+            recursive: false,
         }]);
     }
 
@@ -781,14 +780,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_watch_registration_uses_recursive_parent_for_missing_directory_like_target() {
+    fn resolve_watch_registration_uses_recursive_parent_for_missing_explicit_directory_target() {
         let dir = tempdir().expect("tempdir");
         let target = dir.path().join("content");
 
         let registrations = resolve_watch_registrations(
             &CompiledWatchTarget {
                 path: target,
-                recursive: false,
+                recursive: true,
             },
             WatcherKind::Native,
         )

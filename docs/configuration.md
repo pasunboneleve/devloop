@@ -63,6 +63,8 @@ workflow = "rust"
 
 - Table name: the watch-group name.
 - `paths`: glob patterns evaluated relative to `root`.
+  Use a trailing `/` for a literal directory target that should be
+  watched recursively even before it exists.
 - `workflow`: workflow to run when a matching file changes. If omitted,
   the watch-group name is used as the workflow name.
 
