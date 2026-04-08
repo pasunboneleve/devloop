@@ -1,11 +1,10 @@
-use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use tempfile::TempDir;
 
 #[test]
@@ -19,7 +18,7 @@ fn repeated_literal_file_edits_keep_triggering_native_watch_workflow() {
     for write_index in 1..=10 {
         let value = format!("native-trial-{}", "x".repeat(write_index));
         fixture.write_value(&value);
-        fixture.wait_for_state_value(&value, Duration::from_secs(10));
+        child.wait_for_log_line(&format!("changed value: {value}"), Duration::from_secs(10));
     }
 }
 
@@ -70,58 +69,23 @@ steps = [
         self.dir.path().join("devloop.toml")
     }
 
-    fn state_path(&self) -> std::path::PathBuf {
-        self.dir.path().join(".devloop/state.json")
-    }
-
     fn write_value(&self, value: &str) {
         self.write("watched.txt", &format!("{value}\n"));
-    }
-
-    fn wait_for_state_value(&self, value: &str, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Ok(raw) = fs::read_to_string(self.state_path())
-                && let Ok(json) = serde_json::from_str::<Value>(&raw)
-                && json
-                    .get("current_value")
-                    .and_then(Value::as_str)
-                    .is_some_and(|current| current == value)
-            {
-                return;
-            }
-
-            if Instant::now() > deadline {
-                let current = fs::read_to_string(self.state_path())
-                    .ok()
-                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                    .and_then(|json| {
-                        json.get("current_value")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
-                    });
-                panic!(
-                    "timed out waiting for current_value '{value}', last observed value: {:?}",
-                    current
-                );
-            }
-
-            std::hint::spin_loop();
-        }
     }
 
     fn write(&self, relative_path: &str, contents: &str) {
         let path = self.dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("create fixture parent directories");
+            std::fs::create_dir_all(parent).expect("create fixture parent directories");
         }
-        fs::write(path, contents).expect("write fixture file");
+        std::fs::write(path, contents).expect("write fixture file");
     }
 }
 
 struct DevloopChild {
     child: Child,
     lines: Receiver<String>,
+    history: Arc<Mutex<Vec<String>>>,
 }
 
 impl DevloopChild {
@@ -137,11 +101,17 @@ impl DevloopChild {
         let mut child = command.spawn().expect("spawn devloop");
         let stderr = child.stderr.take().expect("take child stderr");
         let (tx, rx) = mpsc::channel();
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let history_writer = Arc::clone(&history);
         thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 match line {
                     Ok(line) => {
+                        history_writer
+                            .lock()
+                            .expect("lock log history")
+                            .push(line.clone());
                         if tx.send(line).is_err() {
                             return;
                         }
@@ -150,7 +120,11 @@ impl DevloopChild {
                 }
             }
         });
-        Self { child, lines: rx }
+        Self {
+            child,
+            lines: rx,
+            history,
+        }
     }
 
     fn wait_for_log_line(&mut self, needle: &str, timeout: Duration) {
@@ -159,10 +133,12 @@ impl DevloopChild {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or_else(|| Duration::from_secs(0));
-            let line = self
-                .lines
-                .recv_timeout(remaining)
-                .unwrap_or_else(|_| panic!("timed out waiting for log line containing '{needle}'"));
+            let line = self.lines.recv_timeout(remaining).unwrap_or_else(|_| {
+                let history = self.history.lock().expect("lock log history");
+                panic!(
+                    "timed out waiting for log line containing '{needle}'. recent logs: {history:?}"
+                );
+            });
             if line.contains(needle) {
                 return;
             }

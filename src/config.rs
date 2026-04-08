@@ -133,17 +133,10 @@ impl Config {
     }
 
     pub fn compiled_watch_targets(&self) -> Vec<CompiledWatchTarget> {
-        self.compiled_watch_targets_for(self.watcher.kind)
-    }
-
-    pub fn compiled_watch_targets_for(
-        &self,
-        watcher_kind: WatcherKind,
-    ) -> Vec<CompiledWatchTarget> {
         let mut targets = BTreeMap::<PathBuf, bool>::new();
         for group in self.watch.values() {
             for pattern in &group.paths {
-                let target = CompiledWatchTarget::from_pattern(&self.root, pattern, watcher_kind);
+                let target = CompiledWatchTarget::from_pattern(&self.root, pattern);
                 targets
                     .entry(target.path)
                     .and_modify(|recursive| *recursive |= target.recursive)
@@ -286,10 +279,9 @@ impl From<(PathBuf, bool)> for CompiledWatchTarget {
 }
 
 impl CompiledWatchTarget {
-    fn from_pattern(root: &Path, pattern: &str, watcher_kind: WatcherKind) -> Self {
+    fn from_pattern(root: &Path, pattern: &str) -> Self {
         let mut prefix = PathBuf::new();
         let mut recursive = false;
-        let mut saw_dynamic_segment = false;
         for segment in pattern.split('/') {
             if segment.is_empty() || segment == "." {
                 continue;
@@ -300,7 +292,6 @@ impl CompiledWatchTarget {
             }
             if segment_has_glob_magic(segment) {
                 recursive = true;
-                saw_dynamic_segment = true;
                 break;
             }
             prefix.push(segment);
@@ -314,29 +305,15 @@ impl CompiledWatchTarget {
         }
 
         if pattern_is_literal(pattern) {
-            let candidate = root.join(&prefix);
-            if candidate.is_dir() {
-                return Self {
-                    path: candidate,
-                    recursive: true,
-                };
-            }
-
             return Self {
-                path: match watcher_kind {
-                    WatcherKind::Native => candidate
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| root.to_path_buf()),
-                    WatcherKind::Poll => candidate,
-                },
+                path: root.join(prefix),
                 recursive: false,
             };
         }
 
         Self {
             path: root.join(prefix),
-            recursive: recursive || !saw_dynamic_segment && !pattern_is_literal(pattern),
+            recursive,
         }
     }
 }
@@ -1366,7 +1343,7 @@ mod tests {
             config.compiled_watch_targets(),
             vec![
                 CompiledWatchTarget {
-                    path: PathBuf::from("/tmp/example"),
+                    path: PathBuf::from("/tmp/example/Cargo.toml"),
                     recursive: false,
                 },
                 CompiledWatchTarget {
@@ -1374,35 +1351,12 @@ mod tests {
                     recursive: true,
                 },
                 CompiledWatchTarget {
-                    path: PathBuf::from("/tmp/example/src"),
-                    recursive: true,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn poll_watch_targets_keep_exact_files_for_literal_patterns() {
-        let mut config = base_config();
-        config.root = PathBuf::from("/tmp/example");
-        config.watch.insert(
-            "content".into(),
-            WatchGroup {
-                paths: vec!["watched.txt".into(), "content/banner.html".into()],
-                workflow: Some("content".into()),
-            },
-        );
-
-        assert_eq!(
-            config.compiled_watch_targets_for(WatcherKind::Poll),
-            vec![
-                CompiledWatchTarget {
                     path: PathBuf::from("/tmp/example/content/banner.html"),
                     recursive: false,
                 },
                 CompiledWatchTarget {
-                    path: PathBuf::from("/tmp/example/watched.txt"),
-                    recursive: false,
+                    path: PathBuf::from("/tmp/example/src"),
+                    recursive: true,
                 },
             ]
         );

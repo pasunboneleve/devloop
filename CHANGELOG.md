@@ -17,6 +17,11 @@ All notable changes to `devloop` will be recorded in this file.
   patterns and asks the backend to watch only those files or
   directories instead of always watching the whole repository root.
 
+### Fixed
+- Native watch registration now resolves file and directory targets at
+  runtime, so startup no longer depends on those paths already existing
+  when config is parsed.
+
 ## [0.7.0] - 2026-03-27
 
 ### Added
