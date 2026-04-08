@@ -6,6 +6,8 @@ mod external_events;
 mod output;
 mod processes;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use std::path::PathBuf;
 
@@ -346,59 +348,8 @@ mod tests {
     use crate::output::{
         format_output_prefix, normalize_internal_log_label, normalize_source_label,
     };
+    use crate::test_support::RustLogGuard;
     use clap::Parser;
-    use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn rust_log_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct RustLogGuard {
-        _lock: MutexGuard<'static, ()>,
-        original: Option<OsString>,
-    }
-
-    impl RustLogGuard {
-        fn set(value: Option<&str>) -> Self {
-            let lock = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
-            let original = std::env::var_os("RUST_LOG");
-            match value {
-                Some(value) => set_test_env_var("RUST_LOG", value),
-                None => remove_test_env_var("RUST_LOG"),
-            }
-            Self {
-                _lock: lock,
-                original,
-            }
-        }
-    }
-
-    impl Drop for RustLogGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => set_test_env_var("RUST_LOG", value),
-                None => remove_test_env_var("RUST_LOG"),
-            }
-        }
-    }
-
-    fn set_test_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
-        // SAFETY: tests serialize all RUST_LOG mutation through `rust_log_lock`,
-        // so no concurrent test can observe partially updated process-global state.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
-
-    fn remove_test_env_var(key: &str) {
-        // SAFETY: tests serialize all RUST_LOG mutation through `rust_log_lock`,
-        // so removing the variable cannot race with other tests here.
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
 
     #[test]
     fn default_rust_log_uses_info_when_unset() {

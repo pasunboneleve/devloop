@@ -984,63 +984,12 @@ fn timeout_error(name: &str, probe: &ProbeSpec) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::config::{OutputExtract, ProbeSpec};
+    use crate::test_support::RustLogGuard;
     use serde_json::Value;
-    use std::ffi::OsString;
     use std::sync::Arc;
-    use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::AsyncReadExt;
     use tokio::sync::Mutex;
-
-    fn rust_log_lock() -> &'static StdMutex<()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
-    }
-
-    struct RustLogGuard {
-        _lock: MutexGuard<'static, ()>,
-        original: Option<OsString>,
-    }
-
-    impl RustLogGuard {
-        fn set(value: Option<&str>) -> Self {
-            let lock = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
-            let original = std::env::var_os("RUST_LOG");
-            match value {
-                Some(value) => set_test_env_var("RUST_LOG", value),
-                None => remove_test_env_var("RUST_LOG"),
-            }
-            Self {
-                _lock: lock,
-                original,
-            }
-        }
-    }
-
-    impl Drop for RustLogGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => set_test_env_var("RUST_LOG", value),
-                None => remove_test_env_var("RUST_LOG"),
-            }
-        }
-    }
-
-    fn set_test_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
-        // SAFETY: these tests serialize process-global env mutation through
-        // `rust_log_lock`, so no concurrent test observes a torn update.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
-
-    fn remove_test_env_var(key: &str) {
-        // SAFETY: these tests serialize process-global env mutation through
-        // `rust_log_lock`, so removing the variable does not race here.
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
 
     fn unique_state_path() -> PathBuf {
         let unique = SystemTime::now()
