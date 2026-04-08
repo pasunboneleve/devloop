@@ -2,6 +2,7 @@
 
 - [Behavior Reference](behavior.md)
 - [Configuration Reference](configuration.md)
+- [Development Guide](development.md)
 - [Security Notes](security.md)
 
 This directory holds detailed reference material for `devloop`.

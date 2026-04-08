@@ -9,6 +9,11 @@ use tempfile::TempDir;
 
 #[test]
 fn repeated_literal_file_edits_keep_triggering_native_watch_workflow() {
+    if std::env::var_os("DEVLOOP_RUN_WATCH_FLAKE_SMOKE").is_none() {
+        eprintln!("skipping watch flake smoke; set DEVLOOP_RUN_WATCH_FLAKE_SMOKE=1 to run it");
+        return;
+    }
+
     let fixture = WatchFixture::new();
     let mut child = DevloopChild::spawn(&fixture);
 

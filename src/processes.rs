@@ -985,10 +985,62 @@ mod tests {
     use super::*;
     use crate::config::{OutputExtract, ProbeSpec};
     use serde_json::Value;
+    use std::ffi::OsString;
     use std::sync::Arc;
+    use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::AsyncReadExt;
     use tokio::sync::Mutex;
+
+    fn rust_log_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct RustLogGuard {
+        _lock: MutexGuard<'static, ()>,
+        original: Option<OsString>,
+    }
+
+    impl RustLogGuard {
+        fn set(value: Option<&str>) -> Self {
+            let lock = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
+            let original = std::env::var_os("RUST_LOG");
+            match value {
+                Some(value) => set_test_env_var("RUST_LOG", value),
+                None => remove_test_env_var("RUST_LOG"),
+            }
+            Self {
+                _lock: lock,
+                original,
+            }
+        }
+    }
+
+    impl Drop for RustLogGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => set_test_env_var("RUST_LOG", value),
+                None => remove_test_env_var("RUST_LOG"),
+            }
+        }
+    }
+
+    fn set_test_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: these tests serialize process-global env mutation through
+        // `rust_log_lock`, so no concurrent test observes a torn update.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    fn remove_test_env_var(key: &str) {
+        // SAFETY: these tests serialize process-global env mutation through
+        // `rust_log_lock`, so removing the variable does not race here.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
 
     fn unique_state_path() -> PathBuf {
         let unique = SystemTime::now()
@@ -1323,10 +1375,7 @@ mod tests {
 
     #[test]
     fn configure_command_inherits_parent_rust_log_by_default() {
-        let original = std::env::var_os("RUST_LOG");
-        unsafe {
-            std::env::set_var("RUST_LOG", "debug");
-        }
+        let _guard = RustLogGuard::set(Some("debug"));
 
         let command = configure_command(
             &["cargo".into(), "run".into()],
@@ -1352,16 +1401,11 @@ mod tests {
             rust_log.is_none(),
             "RUST_LOG should not be overridden in child env"
         );
-
-        restore_rust_log(original);
     }
 
     #[test]
     fn configure_command_keeps_explicit_rust_log_override() {
-        let original = std::env::var_os("RUST_LOG");
-        unsafe {
-            std::env::set_var("RUST_LOG", "debug");
-        }
+        let _guard = RustLogGuard::set(Some("debug"));
 
         let mut env = BTreeMap::new();
         env.insert("RUST_LOG".into(), "info,gcp_rust_blog=debug".into());
@@ -1389,8 +1433,6 @@ mod tests {
             .expect("explicit RUST_LOG should be preserved");
 
         assert_eq!(rust_log, "info,gcp_rust_blog=debug");
-
-        restore_rust_log(original);
     }
 
     #[test]
@@ -1461,17 +1503,6 @@ mod tests {
             *key == std::ffi::OsStr::new("DEVLOOP_BROWSER_EVENTS_URL")
                 && *value == Some(std::ffi::OsStr::new("http://127.0.0.1:4455/browser-events"))
         }));
-    }
-
-    fn restore_rust_log(original: Option<std::ffi::OsString>) {
-        match original {
-            Some(value) => unsafe {
-                std::env::set_var("RUST_LOG", value);
-            },
-            None => unsafe {
-                std::env::remove_var("RUST_LOG");
-            },
-        }
     }
 
     #[test]

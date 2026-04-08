@@ -62,6 +62,7 @@ enum Command {
 enum DocsTopic {
     Config,
     Behavior,
+    Development,
     Security,
 }
 
@@ -151,6 +152,7 @@ fn docs_text(topic: DocsTopic) -> &'static str {
     match topic {
         DocsTopic::Config => include_str!("../docs/configuration.md"),
         DocsTopic::Behavior => include_str!("../docs/behavior.md"),
+        DocsTopic::Development => include_str!("../docs/development.md"),
         DocsTopic::Security => include_str!("../docs/security.md"),
     }
 }
@@ -345,32 +347,69 @@ mod tests {
         format_output_prefix, normalize_internal_log_label, normalize_source_label,
     };
     use clap::Parser;
-    use std::sync::{Mutex, OnceLock};
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn rust_log_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    struct RustLogGuard {
+        _lock: MutexGuard<'static, ()>,
+        original: Option<OsString>,
+    }
+
+    impl RustLogGuard {
+        fn set(value: Option<&str>) -> Self {
+            let lock = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
+            let original = std::env::var_os("RUST_LOG");
+            match value {
+                Some(value) => set_test_env_var("RUST_LOG", value),
+                None => remove_test_env_var("RUST_LOG"),
+            }
+            Self {
+                _lock: lock,
+                original,
+            }
+        }
+    }
+
+    impl Drop for RustLogGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => set_test_env_var("RUST_LOG", value),
+                None => remove_test_env_var("RUST_LOG"),
+            }
+        }
+    }
+
+    fn set_test_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: tests serialize all RUST_LOG mutation through `rust_log_lock`,
+        // so no concurrent test can observe partially updated process-global state.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    fn remove_test_env_var(key: &str) {
+        // SAFETY: tests serialize all RUST_LOG mutation through `rust_log_lock`,
+        // so removing the variable cannot race with other tests here.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     fn default_rust_log_uses_info_when_unset() {
-        let _guard = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
-        unsafe {
-            std::env::remove_var("RUST_LOG");
-        }
+        let _guard = RustLogGuard::set(None);
         assert_eq!(default_rust_log(), "info");
     }
 
     #[test]
     fn default_rust_log_respects_environment_override() {
-        let _guard = rust_log_lock().lock().expect("lock RUST_LOG test mutex");
-        unsafe {
-            std::env::set_var("RUST_LOG", "debug,devloop=trace");
-        }
+        let _guard = RustLogGuard::set(Some("debug,devloop=trace"));
         assert_eq!(default_rust_log(), "debug,devloop=trace");
-        unsafe {
-            std::env::remove_var("RUST_LOG");
-        }
     }
 
     #[test]
@@ -419,6 +458,14 @@ mod tests {
     }
 
     #[test]
+    fn docs_text_uses_embedded_development_reference() {
+        let rendered = docs_text(DocsTopic::Development);
+
+        assert!(rendered.starts_with("# Development Guide"));
+        assert!(rendered.contains("DEVLOOP_RUN_WATCH_FLAKE_SMOKE"));
+    }
+
+    #[test]
     fn rendered_docs_drop_markdown_heading_markers() {
         let rendered = render_docs_text(DocsTopic::Config);
 
@@ -457,6 +504,16 @@ mod tests {
 
         match cli.command {
             super::Command::Docs { topic } => assert!(matches!(topic, DocsTopic::Security)),
+            _ => panic!("expected docs subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_development_docs_subcommand() {
+        let cli = Cli::try_parse_from(["devloop", "docs", "development"]).expect("parse cli");
+
+        match cli.command {
+            super::Command::Docs { topic } => assert!(matches!(topic, DocsTopic::Development)),
             _ => panic!("expected docs subcommand"),
         }
     }

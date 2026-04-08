@@ -60,6 +60,9 @@ watch-group patterns and watches only those files or directories.
 - The default backend uses native filesystem notifications. A polling
   backend can be selected in config as a fallback for environments
   where native events are unreliable.
+- Literal file targets are watched as narrowly as the backend allows.
+  Use a trailing `/` in the config when you mean an explicit directory
+  target that should be watched recursively.
 
 If multiple watch groups map to the same workflow, their matched paths
 are merged for that workflow run.

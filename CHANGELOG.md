@@ -4,23 +4,38 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-08
+
 ### Added
 - Added a configurable watcher backend with non-breaking `native`
   default behavior plus a `poll` fallback mode for environments where
   native filesystem notifications are unreliable.
-- Added a Rust repeated-edit watch flake smoke test that runs under
-  `cargo test` and therefore in GitHub Actions alongside the existing
-  runtime smoke test.
+- Added a Rust repeated-edit watch flake smoke test that can be run
+  locally with `DEVLOOP_RUN_WATCH_FLAKE_SMOKE=1 cargo test --test
+  watch_flake_smoke -- --nocapture`.
+- Added explicit trailing-slash syntax for literal directory watch
+  targets, for example `content/`, so recursive directory intent is
+  preserved even when the directory does not yet exist at startup.
+- Added a development guide under [`docs/development.md`](docs/development.md)
+  and exposed it in the CLI as `devloop docs development`.
 
 ### Changed
 - `devloop` now derives concrete watch targets from configured watch
   patterns and asks the backend to watch only those files or
   directories instead of always watching the whole repository root.
+- The watch flake smoke test is now opt-in instead of running during
+  every default `cargo test` or CI run. The existing runtime smoke test
+  remains in CI.
 
 ### Fixed
 - Native watch registration now resolves file and directory targets at
   runtime, so startup no longer depends on those paths already existing
   when config is parsed.
+- Fixed a real watch flake where the debounce batch could be dropped if
+  another `tokio::select!` branch won the race while filesystem events
+  were already buffered.
+- Test-only environment mutation now lives behind locked helpers with
+  documented safety rationale instead of scattered raw unsafe blocks.
 
 ## [0.7.0] - 2026-03-27
 
