@@ -4,6 +4,11 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Changed
+- Updated the GitHub release publishing action to
+  `softprops/action-gh-release@v3.0.0`, which uses the Node 24 action
+  runtime.
+
 ## [0.9.0] - 2026-05-04
 
 ### Added
