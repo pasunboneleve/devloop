@@ -86,7 +86,7 @@ command = ["cargo", "run"]
 cwd = "."
 autostart = false
 restart = "always"
-env = { PORT = "8080" }
+env = { PORT = "$CONTAINER_PORT" }
 output = { inherit = true, body_style = "plain" }
 ```
 
@@ -101,6 +101,41 @@ output = { inherit = true, body_style = "plain" }
 - `readiness`: optional readiness probe.
 - `liveness`: optional liveness probe.
 - `output`: inherited-output behavior and output-derived state rules.
+
+### Environment interpolation
+
+Process `command` arguments, process `env` values, and HTTP probe URLs
+can reference variables from the parent `devloop` environment:
+
+```toml
+[process.server]
+command = ["cargo", "run"]
+env = { PORT = "$CONTAINER_PORT" }
+
+[process.server.readiness]
+kind = "http"
+url = "http://127.0.0.1:$CONTAINER_PORT/"
+
+[process.tunnel]
+command = [
+  "cloudflared",
+  "tunnel",
+  "--url",
+  "http://127.0.0.1:$CONTAINER_PORT",
+]
+
+[process.chromium]
+command = [
+  "chromium-browser",
+  "--remote-debugging-port=9222",
+  "http://localhost:$CONTAINER_PORT",
+]
+```
+
+Supported forms are `$NAME` and `${NAME}`. Use `$$` for a literal dollar
+sign. Expansion is performed by `devloop` before spawning a process or
+checking an HTTP probe; it does not invoke a shell. Missing or malformed
+references fail loudly with the field and variable name.
 
 ### Output config
 
@@ -153,7 +188,7 @@ Rule keys:
 ```toml
 [process.server.readiness]
 kind = "http"
-url = "http://127.0.0.1:8080/"
+url = "http://127.0.0.1:$CONTAINER_PORT/"
 interval_ms = 500
 timeout_ms = 30000
 ```

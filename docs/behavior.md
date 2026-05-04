@@ -108,6 +108,14 @@ Managed processes are long-running child commands.
 - Managed child processes inherit the ambient environment unless the
   process config explicitly overrides individual variables such as
   `env.RUST_LOG`.
+- Before a process is spawned, `devloop` expands `$NAME` and `${NAME}`
+  references in process command arguments and configured process
+  environment values from its own parent environment. Use `$$` for a
+  literal dollar sign.
+- HTTP readiness and liveness probe URLs use the same expansion when the
+  probe is checked.
+- Missing or malformed environment references fail loudly with the
+  field name so the configuration error is visible.
 
 Liveness probes are checked on the configured interval while the process
 is running. If a liveness probe fails and the restart policy allows it,

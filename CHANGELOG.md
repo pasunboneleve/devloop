@@ -4,6 +4,14 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-04
+
+### Added
+- Added shell-free parent-environment interpolation for process
+  command arguments, process environment values, and HTTP probe URLs,
+  so client configs can share values such as `CONTAINER_PORT` without
+  repo-local wrapper scripts.
+
 ## [0.8.0] - 2026-04-08
 
 ### Added

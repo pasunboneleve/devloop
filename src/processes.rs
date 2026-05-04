@@ -18,6 +18,7 @@ use crate::config::{
     ProcessSpec,
 };
 use crate::core::{ProcessEffect, ProcessSupervisor};
+use crate::env_expand;
 use crate::external_events::{ExternalEventEnvironment, apply_external_event_env};
 use crate::output::{
     dim_start, format_output_prefix_with_style, should_colorize_output, style_reset,
@@ -305,8 +306,16 @@ impl<'a> ProcessManager<'a> {
                         continue;
                     };
                     let now_ms = self.clock_start.elapsed().as_millis() as u64;
-                    let healthy = match check_probe(&self.client, &process, liveness, state).await {
-                        Ok(()) => true,
+                    let healthy = match expand_probe_env(&process, liveness) {
+                        Ok(liveness) => {
+                            match check_probe(&self.client, &process, &liveness, state).await {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    warn!("liveness probe failed for {}: {}", process, error);
+                                    false
+                                }
+                            }
+                        }
                         Err(error) => {
                             warn!("liveness probe failed for {}: {}", process, error);
                             false
@@ -803,6 +812,7 @@ fn configure_command(
     cwd: PathBuf,
     context: CommandContext<'_>,
 ) -> Result<Command> {
+    let command = env_expand::expand_vec(command, "command")?;
     let Some(program) = command.first() else {
         return Err(anyhow!("command must not be empty"));
     };
@@ -810,7 +820,7 @@ fn configure_command(
     let mut cmd = Command::new(program);
     cmd.args(&command[1..]);
     cmd.current_dir(cwd);
-    let mut full_env = context.env.clone();
+    let mut full_env = env_expand::expand_map(context.env, "env")?;
     apply_external_event_env(&mut full_env, context.external_event_env);
     apply_browser_reload_env(&mut full_env, context.browser_reload_env);
     cmd.envs(full_env);
@@ -919,21 +929,48 @@ async fn wait_for_probe(
     probe: &ProbeSpec,
     state: &SessionState,
 ) -> Result<()> {
+    let expanded_probe = expand_probe_env(name, probe)?;
     let started = std::time::Instant::now();
-    let timeout = match probe {
+    let timeout = match &expanded_probe {
         ProbeSpec::Http { timeout_ms, .. } | ProbeSpec::StateKey { timeout_ms, .. } => {
             Duration::from_millis(*timeout_ms)
         }
     };
-    let interval = Duration::from_millis(probe.interval());
+    let interval = Duration::from_millis(expanded_probe.interval());
     loop {
-        if check_probe(client, name, probe, state).await.is_ok() {
+        if check_probe(client, name, &expanded_probe, state)
+            .await
+            .is_ok()
+        {
             return Ok(());
         }
         if started.elapsed() >= timeout {
-            return Err(timeout_error(name, probe));
+            return Err(timeout_error(name, &expanded_probe));
         }
         sleep(interval).await;
+    }
+}
+
+fn expand_probe_env(process: &str, probe: &ProbeSpec) -> Result<ProbeSpec> {
+    match probe {
+        ProbeSpec::Http {
+            url,
+            interval_ms,
+            timeout_ms,
+        } => Ok(ProbeSpec::Http {
+            url: env_expand::expand_value(url, &format!("process '{process}' http probe url"))?,
+            interval_ms: *interval_ms,
+            timeout_ms: *timeout_ms,
+        }),
+        ProbeSpec::StateKey {
+            key,
+            interval_ms,
+            timeout_ms,
+        } => Ok(ProbeSpec::StateKey {
+            key: key.clone(),
+            interval_ms: *interval_ms,
+            timeout_ms: *timeout_ms,
+        }),
     }
 }
 
@@ -984,7 +1021,7 @@ fn timeout_error(name: &str, probe: &ProbeSpec) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::config::{OutputExtract, ProbeSpec};
-    use crate::test_support::RustLogGuard;
+    use crate::test_support::{EnvVarGuard, RustLogGuard};
     use serde_json::Value;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1385,6 +1422,73 @@ mod tests {
     }
 
     #[test]
+    fn configure_command_expands_parent_env_in_command_args_and_env_values() {
+        let _guard = EnvVarGuard::set("CONTAINER_PORT", Some("18080"));
+        let mut env = BTreeMap::new();
+        env.insert("PORT".into(), "$CONTAINER_PORT".into());
+
+        let command = configure_command(
+            &[
+                "cloudflared".into(),
+                "tunnel".into(),
+                "--url".into(),
+                "http://127.0.0.1:$CONTAINER_PORT".into(),
+            ],
+            PathBuf::from("/tmp"),
+            CommandContext {
+                env: &env,
+                external_event_env: None,
+                browser_reload_env: None,
+                root: Path::new("/tmp"),
+                state_path: Path::new("/tmp/state.json"),
+                changed_files: &[],
+                workflow: "startup",
+            },
+        )
+        .expect("configure command");
+
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("tunnel"),
+                std::ffi::OsStr::new("--url"),
+                std::ffi::OsStr::new("http://127.0.0.1:18080")
+            ]
+        );
+        let port = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PORT"))
+            .and_then(|(_, value)| value)
+            .expect("PORT should be set");
+        assert_eq!(port, std::ffi::OsStr::new("18080"));
+    }
+
+    #[test]
+    fn configure_command_reports_missing_env_references() {
+        let _guard = EnvVarGuard::set("MISSING_DEVLOOP_TEST_VAR", None);
+
+        let error = configure_command(
+            &["echo".into(), "$MISSING_DEVLOOP_TEST_VAR".into()],
+            PathBuf::from("/tmp"),
+            CommandContext {
+                env: &BTreeMap::new(),
+                external_event_env: None,
+                browser_reload_env: None,
+                root: Path::new("/tmp"),
+                state_path: Path::new("/tmp/state.json"),
+                changed_files: &[],
+                workflow: "startup",
+            },
+        )
+        .expect_err("missing env should fail");
+
+        assert!(error.to_string().contains("command[1]"));
+        assert!(error.to_string().contains("MISSING_DEVLOOP_TEST_VAR"));
+    }
+
+    #[test]
     fn configure_command_injects_external_event_environment() {
         let env = BTreeMap::new();
         let external_event_env = ExternalEventEnvironment {
@@ -1552,5 +1656,25 @@ mod tests {
         .expect("probe should succeed");
 
         std::fs::remove_file(state_path).expect("cleanup state file");
+    }
+
+    #[test]
+    fn expands_http_probe_urls_from_parent_env() {
+        let _guard = EnvVarGuard::set("CONTAINER_PORT", Some("18080"));
+
+        let expanded = expand_probe_env(
+            "server",
+            &ProbeSpec::Http {
+                url: "http://127.0.0.1:$CONTAINER_PORT/".into(),
+                interval_ms: 100,
+                timeout_ms: 1000,
+            },
+        )
+        .expect("expand probe");
+
+        match expanded {
+            ProbeSpec::Http { url, .. } => assert_eq!(url, "http://127.0.0.1:18080/"),
+            ProbeSpec::StateKey { .. } => panic!("expected http probe"),
+        }
     }
 }
