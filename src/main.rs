@@ -2,6 +2,7 @@ mod browser_reload;
 mod config;
 mod core;
 mod engine;
+mod env_expand;
 mod external_events;
 mod output;
 mod processes;
