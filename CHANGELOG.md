@@ -4,6 +4,8 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-04
+
 ### Added
 - Added shell-free parent-environment interpolation for process
   command arguments, process environment values, and HTTP probe URLs,
