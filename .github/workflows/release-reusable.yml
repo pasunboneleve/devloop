@@ -65,7 +65,7 @@ jobs:
 
       - name: Publish GitHub release asset
         if: inputs.publish_release_notes
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.0
         with:
           files: ${{ inputs.archive_name }}
           body_path: release-notes.md
@@ -73,7 +73,7 @@ jobs:
 
       - name: Publish GitHub release asset without notes
         if: ${{ !inputs.publish_release_notes }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.0
         with:
           files: ${{ inputs.archive_name }}
           fail_on_unmatched_files: true
