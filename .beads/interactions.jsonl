@@ -1,0 +1,2 @@
+{"id":"int-7230a6ae","kind":"field_change","created_at":"2026-05-04T04:43:24.260954052Z","actor":"Daniel Vianna","issue_id":"devloop-hrb","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
+{"id":"int-0600ed25","kind":"field_change","created_at":"2026-05-04T04:44:14.236762188Z","actor":"Daniel Vianna","issue_id":"devloop-hrb","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Documented in README and behavior reference"}}
