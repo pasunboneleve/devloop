@@ -195,7 +195,7 @@ impl WatchGroup {
         let mut builder = GlobSetBuilder::new();
         for pattern in &self.paths {
             builder
-                .add(Glob::new(pattern).with_context(|| {
+                .add(Glob::new(&matcher_pattern(pattern)).with_context(|| {
                     format!("invalid glob '{pattern}' in watch group '{name}'")
                 })?);
         }
@@ -221,7 +221,7 @@ impl CompiledWatchGroup {
     pub fn for_test(patterns: &[&str], workflow: &str) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
         for pattern in patterns {
-            builder.add(Glob::new(pattern)?);
+            builder.add(Glob::new(&matcher_pattern(pattern))?);
         }
         Ok(Self {
             workflow: workflow.to_owned(),
@@ -320,6 +320,22 @@ impl CompiledWatchTarget {
 
 fn pattern_is_literal(pattern: &str) -> bool {
     !pattern.split('/').any(segment_has_glob_magic) && !pattern.contains("**")
+}
+
+/// Glob used to match change events for a watch pattern.
+///
+/// A literal directory target (trailing `/`) is registered as a *recursive*
+/// watch target (see [`CompiledWatchTarget::from_pattern`]), so its matcher
+/// must also match files nested inside it — not just the bare directory path.
+/// Without this, the directory is watched and events arrive, but the bare
+/// `apps/api/src/` glob never matches `apps/api/src/foo.ts`, so no workflow
+/// fires. Expand such patterns to `apps/api/src/**`.
+fn matcher_pattern(pattern: &str) -> String {
+    if pattern.ends_with('/') && pattern_is_literal(pattern) {
+        format!("{pattern}**")
+    } else {
+        pattern.to_owned()
+    }
 }
 
 fn segment_has_glob_magic(segment: &str) -> bool {
@@ -1381,6 +1397,24 @@ mod tests {
                 recursive: true,
             }]
         );
+    }
+
+    #[test]
+    fn literal_directory_pattern_matches_nested_files() {
+        // Regression: a trailing-slash directory is watched recursively, so its
+        // matcher must match files nested inside it — not just the bare dir.
+        let group = CompiledWatchGroup::for_test(&["apps/api/src/"], "api").unwrap();
+        assert!(group.matches(Path::new("apps/api/src/dimensions.ts")));
+        assert!(group.matches(Path::new("apps/api/src/nested/deep.ts")));
+        assert!(!group.matches(Path::new("apps/web/src/page.tsx")));
+    }
+
+    #[test]
+    fn literal_file_pattern_matches_only_that_file() {
+        // A pattern without a trailing slash stays a single-file target.
+        let group = CompiledWatchGroup::for_test(&["Cargo.toml"], "rust").unwrap();
+        assert!(group.matches(Path::new("Cargo.toml")));
+        assert!(!group.matches(Path::new("src/Cargo.toml")));
     }
 
     #[test]
