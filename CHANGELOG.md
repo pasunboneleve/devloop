@@ -4,10 +4,20 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-24
+
 ### Changed
 - Updated the GitHub release publishing action to
   `softprops/action-gh-release@v3.0.0`, which uses the Node 24 action
   runtime.
+
+### Fixed
+- Literal trailing-slash directory watch patterns (for example
+  `content/`) now match files nested inside the directory, so edits
+  under a watched directory trigger its workflow. The directory was
+  already watched recursively, but the change-to-workflow matcher used
+  the bare pattern, which `globset` treats as a literal that never
+  matches nested files, so no workflow ran.
 
 ## [0.9.0] - 2026-05-04
 
