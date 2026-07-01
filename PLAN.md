@@ -9,7 +9,7 @@ repository as the first client.
 ### 1. Project scaffolding
 - Replace default boilerplate with project-specific docs.
 - Define architecture boundaries between engine, config, and hooks.
-- Capture work in `bd`.
+- Capture work in `kata`.
 
 ### 2. Engine MVP
 - Load a config file from a target repository.

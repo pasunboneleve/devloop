@@ -6,8 +6,8 @@ configuration-driven engine for local watch/rebuild/reload workflows
 without hard-coding knowledge of any one repository.
 
 ## Working rules
-- Use `bd` for task tracking. Create or update issues before substantial
-  edits.
+- Use `kata` for task tracking. Create or update issues before substantial
+  edits, and assign active work before implementation.
 - Prefer stable abstractions over repo-specific shortcuts. Put
   project-specific behavior behind config or hooks.
 - Prefer small, focused libraries over bespoke implementations when
@@ -82,11 +82,11 @@ without hard-coding knowledge of any one repository.
   `CHANGELOG.md` as part of the same change before commit.
 - `devloop` uses semantic versioning. Update versions intentionally to
   match the scope of delivered changes.
-- Record follow-up work in `bd`, not as free-form TODO comments.
+- Record follow-up work in `kata`, not as free-form TODO comments.
 
 ## Session completion
 1. File issues for unfinished work or risks discovered during
    implementation.
 2. Run quality gates if code changed.
-3. Update issue status in `bd`.
+3. Update issue status in `kata`.
 4. Summarize the current state, verification, and next steps.

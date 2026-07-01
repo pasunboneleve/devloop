@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
+use rustix::io::Errno;
+use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Stderr, Stdout};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
 use crate::browser_reload::{BrowserReloadEnvironment, apply_browser_reload_env};
@@ -40,6 +42,7 @@ pub struct ProcessManager<'a> {
 
 struct ManagedProcess {
     child: Child,
+    process_group: Pid,
 }
 
 struct CommandContext<'a> {
@@ -99,7 +102,7 @@ impl<'a> ProcessManager<'a> {
         let Some(mut child) = self.children.remove(name) else {
             return Ok(());
         };
-        terminate_child(name, &mut child.child).await?;
+        terminate_child(name, &mut child.child, child.process_group).await?;
         self.supervisor.on_process_stopped(name);
         Ok(())
     }
@@ -232,9 +235,11 @@ impl<'a> ProcessManager<'a> {
         )?;
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
+        command.process_group(0);
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to start process '{name}'"))?;
+        let process_group = child_process_group(name, &child)?;
         clear_output_state_keys(&spec.output.rules, state)?;
         let process_name = name.to_owned();
         let source_label = process_output_source_label(name, &spec.command);
@@ -271,8 +276,13 @@ impl<'a> ProcessManager<'a> {
                 state.clone(),
             ));
         }
-        self.children
-            .insert(name.to_owned(), ManagedProcess { child });
+        self.children.insert(
+            name.to_owned(),
+            ManagedProcess {
+                child,
+                process_group,
+            },
+        );
         self.supervisor.on_process_started(name);
         info!("started process {}", name);
         Ok(())
@@ -910,17 +920,49 @@ fn clear_output_state_keys(rules: &[OutputRule], state: &SessionState) -> Result
     Ok(())
 }
 
-async fn terminate_child(name: &str, child: &mut Child) -> Result<()> {
+fn child_process_group(name: &str, child: &Child) -> Result<Pid> {
+    let id = child
+        .id()
+        .ok_or_else(|| anyhow!("process '{name}' exited before its process group was recorded"))?;
+    Pid::from_raw(id as i32)
+        .ok_or_else(|| anyhow!("process '{name}' has invalid process group id {id}"))
+}
+
+async fn terminate_child(name: &str, child: &mut Child, process_group: Pid) -> Result<()> {
     if child.try_wait()?.is_some() {
-        info!("process {} already exited", name);
+        signal_process_group(name, process_group, Signal::KILL)?;
+        info!("process {} already exited; cleaned up process group", name);
         return Ok(());
     }
-    child
-        .kill()
-        .await
-        .with_context(|| format!("failed to stop process '{name}'"))?;
+
+    signal_process_group(name, process_group, Signal::TERM)?;
+    match timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(result) => {
+            result.with_context(|| format!("failed to wait for process '{name}' after SIGTERM"))?;
+            signal_process_group(name, process_group, Signal::KILL)?;
+        }
+        Err(_) => {
+            signal_process_group(name, process_group, Signal::KILL)?;
+            child
+                .wait()
+                .await
+                .with_context(|| format!("failed to stop process '{name}' after SIGKILL"))?;
+        }
+    }
     info!("stopped process {}", name);
     Ok(())
+}
+
+fn signal_process_group(name: &str, process_group: Pid, signal: Signal) -> Result<()> {
+    match kill_process_group(process_group, signal) {
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        Err(error) => Err(anyhow!(
+            "failed to send {:?} to process group for process '{}': {}",
+            signal,
+            name,
+            error
+        )),
+    }
 }
 
 async fn wait_for_probe(
@@ -981,7 +1023,16 @@ async fn check_probe(
     state: &SessionState,
 ) -> Result<()> {
     match probe {
-        ProbeSpec::Http { url, .. } => match client.get(url).send().await {
+        ProbeSpec::Http {
+            url,
+            interval_ms,
+            timeout_ms,
+        } => match client
+            .get(url)
+            .timeout(probe_attempt_timeout(*interval_ms, *timeout_ms))
+            .send()
+            .await
+        {
             Ok(response) if response.status().is_success() => {
                 info!("process {} is healthy at {}", name, url);
                 Ok(())
@@ -1006,6 +1057,11 @@ async fn check_probe(
     }
 }
 
+fn probe_attempt_timeout(interval_ms: u64, timeout_ms: u64) -> Duration {
+    let bounded = interval_ms.saturating_mul(2).max(1000).min(timeout_ms);
+    Duration::from_millis(bounded)
+}
+
 fn timeout_error(name: &str, probe: &ProbeSpec) -> anyhow::Error {
     match probe {
         ProbeSpec::Http { url, .. } => {
@@ -1020,11 +1076,13 @@ fn timeout_error(name: &str, probe: &ProbeSpec) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{OutputExtract, ProbeSpec};
+    use crate::config::{OutputConfig, OutputExtract, ProbeSpec};
     use crate::test_support::{EnvVarGuard, RustLogGuard};
+    use rustix::process::test_kill_process;
     use serde_json::Value;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
     use tokio::io::AsyncReadExt;
     use tokio::sync::Mutex;
 
@@ -1034,6 +1092,107 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("devloop-process-state-{unique}.json"))
+    }
+
+    fn test_config(root: &Path) -> Config {
+        Config {
+            root: root.to_path_buf(),
+            debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
+            state_file: Some(unique_state_path()),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
+            event: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &Path) {
+        let started = Instant::now();
+        loop {
+            if path.exists() {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "timed out waiting for {}",
+                path.display()
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_gone(raw_pid: i32) {
+        let pid = Pid::from_raw(raw_pid).expect("pid");
+        let started = Instant::now();
+        loop {
+            if matches!(test_kill_process(pid), Err(Errno::SRCH)) {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "process {raw_pid} still exists after managed process stop"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_named_terminates_descendant_processes() {
+        let dir = tempdir().expect("tempdir");
+        let pid_path = dir.path().join("descendant.pid");
+        let script_path = dir.path().join("spawn-descendant.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+sh -c 'trap "" TERM; while :; do sleep 1; done' &
+echo "$!" > "{}"
+wait
+"#,
+                pid_path.display()
+            ),
+        )
+        .expect("write script");
+
+        let mut config = test_config(dir.path());
+        config.process.insert(
+            "server".into(),
+            ProcessSpec {
+                command: vec!["sh".into(), script_path.display().to_string()],
+                cwd: Some(dir.path().to_path_buf()),
+                autostart: false,
+                readiness: None,
+                liveness: None,
+                restart: crate::config::RestartPolicy::Never,
+                env: BTreeMap::new(),
+                output: OutputConfig::default(),
+            },
+        );
+        let state = SessionState::load(unique_state_path()).expect("state");
+        let mut manager = ProcessManager::new(&config);
+
+        manager
+            .start_named("server", &state)
+            .await
+            .expect("start process");
+        wait_for_path(&pid_path).await;
+        let descendant_pid = std::fs::read_to_string(&pid_path)
+            .expect("read pid")
+            .trim()
+            .parse::<i32>()
+            .expect("parse pid");
+
+        manager.stop_named("server").await.expect("stop process");
+
+        assert_process_gone(descendant_pid).await;
     }
 
     #[test]
@@ -1051,6 +1210,22 @@ mod tests {
         );
 
         assert_eq!(value.as_deref(), Some("https://abc.trycloudflare.com"));
+    }
+
+    #[test]
+    fn probe_attempt_timeout_is_bounded_by_probe_timeout() {
+        assert_eq!(
+            probe_attempt_timeout(100, 5000),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            probe_attempt_timeout(750, 5000),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            probe_attempt_timeout(750, 1200),
+            Duration::from_millis(1200)
+        );
     }
 
     #[test]

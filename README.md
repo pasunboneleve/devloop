@@ -304,8 +304,8 @@ which runs `cargo fmt` before each commit.
 Task tracking:
 
 ```bash
-bd ready
-bd show <issue>
-bd update <issue> --status in_progress
-bd close <issue>
+kata ready --agent
+kata show <issue> --agent
+kata assign <issue> <owner> --agent
+kata close <issue> --done --message "<validation and delivery evidence>" --commit <sha>
 ```

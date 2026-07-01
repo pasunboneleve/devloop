@@ -99,6 +99,9 @@ Managed processes are long-running child commands.
 
 - `start_process` is a no-op if the named process is already running.
 - `restart_process` stops the child, then starts it again.
+- Managed processes are started in their own Unix process group, and
+  stop/restart/shutdown terminates that group so descendant processes do
+  not survive the supervisor.
 - `wait_for_process` waits on the configured readiness probe, not just
   on successful spawning.
 - `restart = "always"` restarts a child after any exit unless
