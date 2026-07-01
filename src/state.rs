@@ -122,14 +122,18 @@ pub(crate) fn render_template_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_STATE_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     fn unique_state_path() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        std::env::temp_dir().join(format!("devloop-state-{unique}.json"))
+        let id = NEXT_STATE_PATH_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("devloop-state-{unique}-{id}.json"))
     }
 
     #[test]
