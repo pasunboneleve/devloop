@@ -2,10 +2,8 @@
 /examples/*/state.json
 **/.#*
 
-# Beads / Dolt files (added by bd init)
-.dolt/
-*.db
-.beads-credential-key
+# Kata local overrides
+.kata.local.toml
 
 # Codex droppings
 **/.codex

@@ -4,6 +4,14 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-01
+
+### Fixed
+- Managed processes are now started in their own Unix process groups
+  and stopped as groups, so child processes spawned by a managed command
+  do not survive `stop_process`, `restart_process`, or `ctrl-c`
+  shutdown.
+
 ## [0.9.1] - 2026-06-24
 
 ### Changed
