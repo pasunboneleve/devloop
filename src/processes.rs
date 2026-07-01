@@ -1023,7 +1023,16 @@ async fn check_probe(
     state: &SessionState,
 ) -> Result<()> {
     match probe {
-        ProbeSpec::Http { url, .. } => match client.get(url).send().await {
+        ProbeSpec::Http {
+            url,
+            interval_ms,
+            timeout_ms,
+        } => match client
+            .get(url)
+            .timeout(probe_attempt_timeout(*interval_ms, *timeout_ms))
+            .send()
+            .await
+        {
             Ok(response) if response.status().is_success() => {
                 info!("process {} is healthy at {}", name, url);
                 Ok(())
@@ -1046,6 +1055,11 @@ async fn check_probe(
             }
         }
     }
+}
+
+fn probe_attempt_timeout(interval_ms: u64, timeout_ms: u64) -> Duration {
+    let bounded = interval_ms.saturating_mul(2).max(1000).min(timeout_ms);
+    Duration::from_millis(bounded)
 }
 
 fn timeout_error(name: &str, probe: &ProbeSpec) -> anyhow::Error {
@@ -1196,6 +1210,22 @@ wait
         );
 
         assert_eq!(value.as_deref(), Some("https://abc.trycloudflare.com"));
+    }
+
+    #[test]
+    fn probe_attempt_timeout_is_bounded_by_probe_timeout() {
+        assert_eq!(
+            probe_attempt_timeout(100, 5000),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            probe_attempt_timeout(750, 5000),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            probe_attempt_timeout(750, 1200),
+            Duration::from_millis(1200)
+        );
     }
 
     #[test]

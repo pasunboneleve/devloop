@@ -11,6 +11,8 @@ All notable changes to `devloop` will be recorded in this file.
   and stopped as groups, so child processes spawned by a managed command
   do not survive `stop_process`, `restart_process`, or `ctrl-c`
   shutdown.
+- HTTP readiness and liveness probe attempts are now request-bounded, so
+  one stuck request cannot stall the probe loop or shutdown path.
 
 ## [0.9.1] - 2026-06-24
 
