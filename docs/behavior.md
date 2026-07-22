@@ -108,6 +108,12 @@ Managed processes are long-running child commands.
   `devloop` is shutting down.
 - `restart = "on_failure"` restarts only after unsuccessful exit.
 - `restart = "never"` never restarts automatically.
+- Restart policies use the managed command's exit status. A wrapper that
+  exits successfully after its long-running child dies is not restarted by
+  `on_failure`; the service remains down. For development-server wrappers,
+  use `restart = "always"` or propagate the child's exit status. A liveness
+  probe can detect a dead child only while its wrapper remains running; a
+  readiness probe only checks startup and does not supervise ongoing health.
 - Managed child processes inherit the ambient environment unless the
   process config explicitly overrides individual variables such as
   `env.RUST_LOG`.
