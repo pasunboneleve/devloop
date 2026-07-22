@@ -202,6 +202,20 @@ server for browser listeners.
   first.
 - When output color is enabled, labels are colorized per source.
 
+Every `devloop run` also persists a per-session log under the `logs/`
+directory beside its state file. With the default state file, that is
+`.devloop/logs/`. The persistent log contains `tracing` output plus labeled
+managed-process and hook output, even when an `output.inherit` setting hides
+that child output from the terminal. Devloop reports the selected log path at
+startup. It never deletes or rotates session logs; the client owns retention.
+
+Devloop ignores the active session-log file when classifying watch events, so
+broad patterns such as `**/*` do not retrigger workflows on that log write.
+Other files in the same `logs/` directory remain normal watched files.
+
+Devloop creates the log before it starts the runtime. If it cannot create the
+directory or file, startup fails rather than running without durable evidence.
+
 ### Color rules
 
 Colorized output is enabled when stdout is a terminal and `NO_COLOR` is

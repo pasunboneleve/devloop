@@ -1,4 +1,5 @@
 /target
+/.devloop/
 /examples/*/state.json
 **/.#*
 

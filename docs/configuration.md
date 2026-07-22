@@ -26,6 +26,12 @@ startup_workflows = ["startup"]
 - `startup_workflows`: workflows to run after autostart processes have
   been started.
 
+Each `devloop run` creates a unique durable log beside the state file, under
+`<state-file-parent>/logs/`. The default layout is therefore
+`<root>/.devloop/logs/`. Add `.devloop/` to the client repository's
+`.gitignore`; Devloop owns both the state and log files there. Logs do not need
+configuration and are not created by `devloop validate` or `devloop docs`.
+
 Optional watcher backend config:
 
 ```toml
