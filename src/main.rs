@@ -6,20 +6,24 @@ mod env_expand;
 mod external_events;
 mod output;
 mod processes;
+mod session_log;
 mod state;
 #[cfg(test)]
 mod test_support;
 
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Parser as MarkdownParser, Tag, TagEnd,
 };
-use tracing::{Event, Subscriber};
+use tracing::{Event, Subscriber, error};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
 use tracing_subscriber::registry::LookupSpan;
@@ -27,6 +31,9 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::config::Config;
 use crate::engine::Engine;
 use crate::output::{format_output_prefix, normalize_internal_log_label, should_colorize_output};
+use crate::session_log::SessionLog;
+
+const SESSION_LOG_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -71,15 +78,10 @@ enum DocsTopic {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(default_rust_log()))
-        .event_format(DevloopLogFormatter::default())
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
     match cli.command {
         Command::Validate { config } => {
+            init_logging(None);
             let config = resolve_config_path(config)?;
             let config = Config::load(&config)?;
             config.validate()?;
@@ -88,13 +90,158 @@ async fn main() -> Result<()> {
             let config = resolve_config_path(config)?;
             let config = Config::load(&config)?;
             config.validate()?;
-            Engine::new(config).run().await?;
+            let state_file = config
+                .state_file
+                .as_deref()
+                .ok_or_else(|| anyhow!("state file missing after config load"))?;
+            let session_log = SessionLog::create(state_file)?;
+            init_logging(Some(session_log.clone()));
+            announce_session_log_path(&session_log).await?;
+            if let Err(error) = Engine::new(config, session_log.clone()).run().await {
+                error!(error = %format!("{error:#}"), "devloop run failed");
+                flush_session_log_before_exit(&session_log).await;
+                return Err(error);
+            }
+            flush_session_log_before_exit(&session_log).await;
         }
         Command::Docs { topic } => {
             print!("{}", render_docs_text(topic));
         }
     }
     Ok(())
+}
+
+async fn flush_session_log_before_exit(session_log: &SessionLog) {
+    match tokio::time::timeout(
+        SESSION_LOG_SHUTDOWN_FLUSH_TIMEOUT,
+        session_log.flush_queued(),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("devloop: failed to flush session log before exit: {error}"),
+        Err(_) => eprintln!("devloop: timed out flushing session log before exit"),
+    }
+}
+
+async fn announce_session_log_path(session_log: &SessionLog) -> Result<()> {
+    let message = format!("writing session log: {}", session_log.path().display());
+    session_log
+        .write_labeled_line("devloop", message.as_bytes())
+        .with_context(|| "failed to persist session log path before runtime start")?;
+    session_log
+        .flush_queued()
+        .await
+        .with_context(|| "failed to flush session log path before runtime start")?;
+    let _ = writeln!(io::stderr(), "devloop: {message}");
+    Ok(())
+}
+
+fn init_logging(session_log: Option<SessionLog>) {
+    match session_log {
+        Some(session_log) => tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(default_rust_log()))
+            .event_format(DevloopLogFormatter::default())
+            .with_writer(SessionLogMakeWriter { session_log })
+            .init(),
+        None => tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(default_rust_log()))
+            .event_format(DevloopLogFormatter::default())
+            .with_writer(std::io::stderr)
+            .init(),
+    }
+}
+
+#[derive(Clone)]
+struct SessionLogMakeWriter {
+    session_log: SessionLog,
+}
+
+impl<'a> MakeWriter<'a> for SessionLogMakeWriter {
+    type Writer = SessionLogTeeWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SessionLogTeeWriter {
+            session_log: self.session_log.clone(),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+struct SessionLogTeeWriter {
+    session_log: SessionLog,
+    buffer: Vec<u8>,
+}
+
+impl Write for SessionLogTeeWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_buffer_to_log_and_terminal()
+    }
+}
+
+impl SessionLogTeeWriter {
+    fn flush_buffer_to_log_and_terminal(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return io::stderr().flush();
+        }
+        let log_bytes = strip_ansi_csi_sequences(&self.buffer);
+        let log_result = self.session_log.queue_raw(log_bytes);
+        let terminal_result = io::stderr().write_all(&self.buffer);
+        if let Err(error) = log_result {
+            eprintln!("devloop: failed to persist tracing output: {error}");
+        }
+        terminal_result?;
+        self.buffer.clear();
+        io::stderr().flush()
+    }
+}
+
+impl Drop for SessionLogTeeWriter {
+    fn drop(&mut self) {
+        if let Err(error) = self.flush_buffer_to_log_and_terminal() {
+            eprintln!("devloop: failed to flush tracing output: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+impl SessionLogTeeWriter {
+    fn write_for_test(session_log: SessionLog, chunks: &[&[u8]]) -> io::Result<()> {
+        let mut writer = Self {
+            session_log,
+            buffer: Vec::new(),
+        };
+        for chunk in chunks {
+            writer.write_all(chunk)?;
+        }
+        writer.flush()
+    }
+}
+
+fn strip_ansi_csi_sequences(bytes: &[u8]) -> Vec<u8> {
+    let mut stripped = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                index += 1;
+                if (0x40..=0x7e).contains(&byte) {
+                    break;
+                }
+            }
+            continue;
+        }
+        stripped.push(bytes[index]);
+        index += 1;
+    }
+    stripped
 }
 
 fn default_rust_log() -> String {
@@ -343,14 +490,17 @@ fn format_heading(text: &str, level: HeadingLevel) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, DocsTopic, default_rust_log, docs_text, format_tracing_prefix, render_docs_text,
-        render_markdown_for_terminal,
+        Cli, DocsTopic, SessionLogTeeWriter, announce_session_log_path, default_rust_log,
+        docs_text, format_tracing_prefix, render_docs_text, render_markdown_for_terminal,
+        strip_ansi_csi_sequences,
     };
     use crate::output::{
         format_output_prefix, normalize_internal_log_label, normalize_source_label,
     };
+    use crate::session_log::SessionLog;
     use crate::test_support::RustLogGuard;
     use clap::Parser;
+    use tempfile::tempdir;
 
     #[test]
     fn default_rust_log_uses_info_when_unset() {
@@ -370,6 +520,67 @@ mod tests {
             format_output_prefix(&normalize_source_label("devloop::processes"), false),
             "[devloop processes] "
         );
+    }
+
+    #[tokio::test]
+    async fn session_log_tee_writer_appends_one_buffered_record() {
+        let dir = tempdir().expect("tempdir");
+        let log = SessionLog::create(&dir.path().join(".devloop/state.json")).expect("create log");
+
+        SessionLogTeeWriter::write_for_test(
+            log.clone(),
+            &[b"first ".as_slice(), b"second\n".as_slice()],
+        )
+        .expect("write tracing event");
+        log.flush_queued()
+            .await
+            .expect("flush queued tracing event");
+
+        assert_eq!(
+            std::fs::read_to_string(log.path()).expect("read log"),
+            "first second\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn announce_session_log_path_reports_persistence_failure() {
+        let dir = tempdir().expect("tempdir");
+        let log = SessionLog::create(&dir.path().join(".devloop/state.json")).expect("create log");
+        log.fail_for_test(
+            std::io::ErrorKind::BrokenPipe,
+            "simulated session log failure",
+        );
+
+        let error = announce_session_log_path(&log)
+            .await
+            .expect_err("announcement should report log failure");
+
+        assert!(format!("{error:#}").contains("failed to persist session log path"));
+    }
+
+    #[tokio::test]
+    async fn session_log_tee_writer_strips_ansi_sequences_from_file_copy() {
+        let dir = tempdir().expect("tempdir");
+        let log = SessionLog::create(&dir.path().join(".devloop/state.json")).expect("create log");
+
+        SessionLogTeeWriter::write_for_test(
+            log.clone(),
+            &[b"\x1b[31mred".as_slice(), b"\x1b[0m plain\n".as_slice()],
+        )
+        .expect("write tracing event");
+        log.flush_queued()
+            .await
+            .expect("flush queued tracing event");
+
+        assert_eq!(
+            std::fs::read_to_string(log.path()).expect("read log"),
+            "red plain\n"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_csi_sequences_removes_color_codes() {
+        assert_eq!(strip_ansi_csi_sequences(b"a\x1b[2;31mb\x1b[0mc"), b"abc");
     }
 
     #[test]
@@ -407,6 +618,17 @@ mod tests {
 
         assert!(rendered.starts_with("# Configuration Reference"));
         assert!(rendered.contains("startup_workflows"));
+        assert!(rendered.contains("## State and session logs"));
+        assert!(rendered.contains(".devloop/logs/"));
+    }
+
+    #[test]
+    fn docs_text_uses_embedded_session_log_behavior_reference() {
+        let rendered = docs_text(DocsTopic::Behavior);
+
+        assert!(rendered.starts_with("# Behavior Reference"));
+        assert!(rendered.contains("### Session logs"));
+        assert!(rendered.contains("output.inherit"));
     }
 
     #[test]

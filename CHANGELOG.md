@@ -4,6 +4,14 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-23
+
+### Added
+
+- `devloop run` now persists a unique session log under the state-file
+  directory's `logs/` subdirectory (by default `.devloop/logs/`), including
+  engine, process, and hook output even when terminal inheritance is disabled.
+
 ## [0.9.3] - 2026-07-22
 
 ### Changed

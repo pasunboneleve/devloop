@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,10 +21,12 @@ use crate::config::{CompiledWatchGroup, CompiledWatchTarget, Config, LogStyle, W
 use crate::core::{RuntimeEffect, RuntimeEvent, RuntimeMachine, WorkflowEffect, WorkflowMachine};
 use crate::external_events::{ExternalEventMessage, ExternalEventServer};
 use crate::processes::ProcessManager;
+use crate::session_log::SessionLog;
 use crate::state::SessionState;
 
 pub struct Engine {
     config: Config,
+    session_log: SessionLog,
 }
 
 trait WorkflowEffectAdapter {
@@ -79,8 +81,11 @@ struct LiveRuntimeAdapter<'a, 'b> {
 }
 
 impl Engine {
-    pub fn new(config: Config) -> Self {
-        Self { config }
+    pub fn new(config: Config, session_log: SessionLog) -> Self {
+        Self {
+            config,
+            session_log,
+        }
     }
 
     pub async fn run(self) -> Result<()> {
@@ -90,16 +95,24 @@ impl Engine {
                 .clone()
                 .ok_or_else(|| anyhow!("state file missing after config load"))?,
         )?;
-        let mut processes = ProcessManager::new(&self.config);
+        let mut processes =
+            ProcessManager::new(&self.config).with_session_log(self.session_log.clone());
         let watch_groups = self.config.compiled_watchers()?;
         let watched_targets = self.config.compiled_watch_targets();
+        let ignored_watch_paths = vec![self.session_log.path().to_path_buf()];
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (external_event_tx, mut external_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_watcher = tx.clone();
+        let watcher_ignored_paths = ignored_watch_paths.clone();
         let watcher_shutdown = Arc::new(AtomicBool::new(false));
         let watcher_shutdown_callback = watcher_shutdown.clone();
         let mut watcher = create_watcher(&self.config, move |result| {
-            forward_watcher_event(&tx_watcher, &watcher_shutdown_callback, result);
+            forward_watcher_event(
+                &tx_watcher,
+                &watcher_shutdown_callback,
+                result,
+                &watcher_ignored_paths,
+            );
         })?;
         let mut maintain_tick = tokio::time::interval(Duration::from_secs(1));
         let mut runtime = RuntimeMachine::new(&self.config);
@@ -158,8 +171,12 @@ impl Engine {
                         tokio::time::sleep_until(deadline).await;
                     }
                 }, if watch_deadline.is_some() => {
-                    let workflows =
-                        classify_events(&self.config.root, &watch_groups, &pending_watch_events);
+                    let workflows = classify_events(
+                        &self.config.root,
+                        &watch_groups,
+                        &pending_watch_events,
+                        &ignored_watch_paths,
+                    );
                     pending_watch_events.clear();
                     watch_deadline = None;
                     if !workflows.is_empty() {
@@ -425,8 +442,19 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
 fn forward_watcher_event(
     tx: &tokio::sync::mpsc::UnboundedSender<notify::Result<Event>>,
     shutting_down: &AtomicBool,
-    result: notify::Result<Event>,
+    mut result: notify::Result<Event>,
+    ignored_paths: &[PathBuf],
 ) {
+    if let Ok(event) = &mut result {
+        event.paths.retain(|path| {
+            !ignored_paths
+                .iter()
+                .any(|ignored| path_is_equivalent_to_ignored_path(path, ignored))
+        });
+        if event.paths.is_empty() {
+            return;
+        }
+    }
     if let Err(error) = tx.send(result)
         && !shutting_down.load(Ordering::Relaxed)
     {
@@ -600,6 +628,7 @@ fn classify_events(
     root: &Path,
     watch_groups: &[CompiledWatchGroup],
     events: &[Event],
+    ignored_paths: &[PathBuf],
 ) -> BTreeMap<String, Vec<String>> {
     let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for event in events {
@@ -607,6 +636,12 @@ fn classify_events(
             continue;
         }
         for path in &event.paths {
+            if ignored_paths
+                .iter()
+                .any(|ignored_path| path_is_equivalent_to_ignored_path(path, ignored_path))
+            {
+                continue;
+            }
             let Some(relative) = relativize_event_path(root, path) else {
                 continue;
             };
@@ -632,9 +667,34 @@ fn relativize_event_path<'a>(root: &'a Path, path: &'a Path) -> Option<&'a Path>
         .or_else(|| strip_private_prefix_variant(root, path))
 }
 
+fn path_is_equivalent_to_ignored_path(path: &Path, ignored_path: &Path) -> bool {
+    if path == ignored_path {
+        return true;
+    }
+    if let Some(private_path) = private_path_variant(ignored_path)
+        && path == private_path
+    {
+        return true;
+    }
+    if let Some(public_path) = public_path_variant(ignored_path)
+        && path == public_path
+    {
+        return true;
+    }
+    false
+}
+
 fn strip_private_prefix_variant<'a>(root: &'a Path, path: &'a Path) -> Option<&'a Path> {
-    let private_root = Path::new("/private").join(root.strip_prefix("/").ok()?);
+    let private_root = private_path_variant(root)?;
     path.strip_prefix(&private_root).ok()
+}
+
+fn private_path_variant(path: &Path) -> Option<PathBuf> {
+    Some(Path::new("/private").join(path.strip_prefix("/").ok()?))
+}
+
+fn public_path_variant(path: &Path) -> Option<PathBuf> {
+    Some(Path::new("/").join(path.strip_prefix("/private").ok()?))
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -697,9 +757,50 @@ mod tests {
                 attrs: Default::default(),
             },
         ];
-        let grouped = classify_events(&root, &groups, &events);
+        let grouped = classify_events(&root, &groups, &events, &[]);
         assert_eq!(grouped["server"], vec!["src/main.rs"]);
         assert_eq!(grouped["content"], vec!["content/posts/example.md"]);
+    }
+
+    #[test]
+    fn classify_events_ignores_active_session_log_file_even_for_broad_patterns() {
+        let root = PathBuf::from("/tmp/example");
+        let groups = vec![CompiledWatchGroup::for_test(&["**/*"], "all").expect("watch group")];
+        let ignored_paths = vec![root.join(".devloop/logs/session-1.log")];
+        let events = vec![
+            Event {
+                kind: EventKind::Modify(ModifyKind::Any),
+                paths: vec![root.join(".devloop/logs/session-1.log")],
+                attrs: Default::default(),
+            },
+            Event {
+                kind: EventKind::Modify(ModifyKind::Any),
+                paths: vec![root.join(".devloop/logs/user-owned.log")],
+                attrs: Default::default(),
+            },
+        ];
+
+        let grouped = classify_events(&root, &groups, &events, &ignored_paths);
+
+        assert_eq!(grouped["all"], vec![".devloop/logs/user-owned.log"]);
+    }
+
+    #[test]
+    fn classify_events_ignores_private_path_variant_of_active_session_log_file() {
+        let root = PathBuf::from("/tmp/example");
+        let groups = vec![CompiledWatchGroup::for_test(&["**/*"], "all").expect("watch group")];
+        let ignored_paths = vec![root.join(".devloop/logs/session-1.log")];
+        let events = vec![Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![PathBuf::from(
+                "/private/tmp/example/.devloop/logs/session-1.log",
+            )],
+            attrs: Default::default(),
+        }];
+
+        let grouped = classify_events(&root, &groups, &events, &ignored_paths);
+
+        assert!(grouped.is_empty());
     }
 
     #[test]
@@ -838,7 +939,7 @@ mod tests {
             attrs: Default::default(),
         }];
 
-        let grouped = classify_events(&root, &groups, &events);
+        let grouped = classify_events(&root, &groups, &events, &[]);
 
         assert_eq!(grouped["content"], vec!["watched.txt"]);
     }
@@ -866,7 +967,7 @@ mod tests {
             },
         ];
 
-        let grouped = classify_events(&root, &groups, &events);
+        let grouped = classify_events(&root, &groups, &events, &[]);
 
         assert_eq!(grouped["css"], vec!["tailwind.css"]);
     }
@@ -882,7 +983,7 @@ mod tests {
             attrs: Default::default(),
         }];
 
-        let grouped = classify_events(&root, &groups, &events);
+        let grouped = classify_events(&root, &groups, &events, &[]);
 
         assert!(grouped.is_empty());
     }
@@ -1645,7 +1746,28 @@ mod tests {
                 paths: vec![PathBuf::from("content/layout.html")],
                 attrs: Default::default(),
             }),
+            &[],
         );
+    }
+
+    #[test]
+    fn forward_watcher_event_drops_ignored_paths_before_queueing() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = AtomicBool::new(false);
+        let ignored_paths = vec![PathBuf::from("/tmp/example/.devloop/logs/session-1.log")];
+
+        forward_watcher_event(
+            &tx,
+            &shutdown,
+            Ok(Event {
+                kind: EventKind::Modify(ModifyKind::Any),
+                paths: vec![PathBuf::from("/tmp/example/.devloop/logs/session-1.log")],
+                attrs: Default::default(),
+            }),
+            &ignored_paths,
+        );
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
