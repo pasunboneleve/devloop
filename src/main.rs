@@ -618,6 +618,17 @@ mod tests {
 
         assert!(rendered.starts_with("# Configuration Reference"));
         assert!(rendered.contains("startup_workflows"));
+        assert!(rendered.contains("## State and session logs"));
+        assert!(rendered.contains(".devloop/logs/"));
+    }
+
+    #[test]
+    fn docs_text_uses_embedded_session_log_behavior_reference() {
+        let rendered = docs_text(DocsTopic::Behavior);
+
+        assert!(rendered.starts_with("# Behavior Reference"));
+        assert!(rendered.contains("### Session logs"));
+        assert!(rendered.contains("output.inherit"));
     }
 
     #[test]

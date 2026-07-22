@@ -4,6 +4,8 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-23
+
 ### Added
 
 - `devloop run` now persists a unique session log under the state-file

@@ -133,6 +133,8 @@ restart the supervisor if you need to seed a different initial state.
 Each `devloop run` also writes a durable, per-session log beside that
 state file. With the default state-file location, logs live under
 `.devloop/logs/`; add `.devloop/` to the client repository's `.gitignore`.
+The [Behavior Reference](docs/behavior.md#session-logs) defines what the log
+captures and how `devloop` handles it.
 
 ## Example use case
 
