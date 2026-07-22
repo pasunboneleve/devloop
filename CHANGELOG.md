@@ -4,6 +4,13 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-07-22
+
+### Changed
+- Clarified how to watch sibling directories by setting `root` to their
+  common parent, and documented the `restart = "never"` default plus the
+  wrapper exit-status behavior of `on_failure`.
+
 ## [0.9.2] - 2026-07-01
 
 ### Fixed
