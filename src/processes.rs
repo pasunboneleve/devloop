@@ -1762,7 +1762,7 @@ while :; do sleep 1; done
             &script_path,
             r#"#!/bin/sh
 printf 'started\n'
-while :; do sleep 1; done
+exec sleep 600
 "#,
         )
         .expect("write script");
