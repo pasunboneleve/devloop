@@ -1580,17 +1580,21 @@ mod tests {
     use rustix::process::test_kill_process;
     use serde_json::Value;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Mutex;
+
+    static TEST_STATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn unique_state_path() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        std::env::temp_dir().join(format!("devloop-process-state-{unique}.json"))
+        let sequence = TEST_STATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("devloop-process-state-{unique}-{sequence}.json"))
     }
 
     fn test_config(root: &Path) -> Config {
@@ -1934,7 +1938,7 @@ exit 0
             format!(
                 r#"#!/bin/sh
 touch "{}"
-while :; do sleep 1; done
+exec sleep 600
 "#,
                 first_started.display()
             ),
@@ -1945,7 +1949,7 @@ while :; do sleep 1; done
             format!(
                 r#"#!/bin/sh
 touch "{}"
-while :; do sleep 1; done
+exec sleep 600
 "#,
                 second_started.display()
             ),
