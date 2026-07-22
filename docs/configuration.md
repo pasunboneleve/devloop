@@ -76,6 +76,24 @@ always watching the whole repository root recursively. `native` remains
 the default backend; `poll` exists as a fallback for environments where
 filesystem notifications are unreliable.
 
+### Watching a sibling directory
+
+Watch patterns cannot match paths outside `root`. If the configuration is
+in `devloop/` and you need to watch its sibling `skills/` directory, make
+their common parent the root and use a root-relative path:
+
+```toml
+root = ".."
+
+[watch.skills]
+paths = ["skills/"]
+workflow = "skills"
+```
+
+`root` also resolves relative process commands, `cwd` values, and the
+default state-file location. Adjust those paths if they were previously
+relative to `devloop/`.
+
 ## Processes
 
 Processes are long-running commands supervised by `devloop`.
@@ -96,7 +114,8 @@ output = { inherit = true, body_style = "plain" }
 - `cwd`: working directory for the process. Relative paths are resolved
   from `root`.
 - `autostart`: whether to start the process before startup workflows.
-- `restart`: one of `never`, `on_failure`, or `always`.
+- `restart`: one of `never`, `on_failure`, or `always`. Defaults to
+  `never`, so a process without this key is not automatically restarted.
 - `env`: extra environment variables for the process.
 - `readiness`: optional readiness probe.
 - `liveness`: optional liveness probe.

@@ -8,15 +8,15 @@ paths = ["watched.txt"]
 workflow = "content"
 
 [process.server]
-command = ["python3", "-m", "http.server", "18081", "--bind", "127.0.0.1"]
+command = ["./scripts/emit-ready.sh"]
 cwd = "."
 autostart = false
-restart = "never"
-output = { inherit = false }
+restart = "always"
+output = { inherit = true, rules = [{ state_key = "server_ready", pattern = "^(ready)$", extract = "regex" }] }
 
 [process.server.readiness]
-kind = "http"
-url = "http://127.0.0.1:18081/"
+kind = "state_key"
+key = "server_ready"
 interval_ms = 100
 timeout_ms = 5000
 
@@ -38,6 +38,6 @@ steps = [
 [workflow.content]
 steps = [
   { action = "run_hook", hook = "current_value" },
-  { action = "write_state", key = "current_url", value = "http://127.0.0.1:18081/{{current_value}}" },
+  { action = "write_state", key = "current_url", value = "devloop://{{current_value}}" },
   { action = "log", message = "changed value: {{current_value}}" },
 ]
