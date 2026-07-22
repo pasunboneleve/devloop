@@ -11,6 +11,11 @@ All notable changes to `devloop` will be recorded in this file.
   common parent, and documented the `restart = "never"` default plus the
   wrapper exit-status behavior of `on_failure`.
 
+### Fixed
+- Made the cross-platform runtime smoke test use output-derived state
+  readiness instead of a fixture-local HTTP server, removing its flaky
+  loopback startup dependency while preserving workflow and watch coverage.
+
 ## [0.9.2] - 2026-07-01
 
 ### Fixed
