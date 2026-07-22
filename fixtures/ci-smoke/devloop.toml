@@ -11,8 +11,8 @@ workflow = "content"
 command = ["python3", "-m", "http.server", "18081", "--bind", "127.0.0.1"]
 cwd = "."
 autostart = false
-restart = "never"
-output = { inherit = false }
+restart = "always"
+output = { inherit = true }
 
 [process.server.readiness]
 kind = "http"
