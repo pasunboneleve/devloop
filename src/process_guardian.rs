@@ -73,11 +73,11 @@ impl GuardianExecutable {
         #[cfg(target_os = "macos")]
         {
             let temporary_image = self.copy_to_temporary_executable()?;
-            return Ok(GuardianInvocation {
+            Ok(GuardianInvocation {
                 path: temporary_image.to_path_buf(),
                 inherited_image: None,
                 _temporary_image: Some(temporary_image),
-            });
+            })
         }
 
         #[cfg(not(target_os = "macos"))]
