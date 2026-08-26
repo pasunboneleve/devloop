@@ -116,8 +116,13 @@ Managed processes are long-running child commands.
   escapes portable Unix process-group containment. Such commands must
   provide their own shutdown integration instead of daemonizing beneath
   `devloop`.
-- `wait_for_process` waits on the configured readiness probe, not just
-  on successful spawning.
+- `wait_for_process` requires the named process to be running while it
+  waits on the configured readiness probe. Persisted readiness state from
+  an earlier process instance cannot make a stopped or failed process ready.
+- State keys populated by a process's output rules belong to that process
+  instance. `devloop` clears them before every start attempt and when the
+  process stops or exits, so a failed dependency cannot leave a stale URL or
+  other process-derived value available to later workflows.
 - `restart = "always"` restarts a child after any exit unless
   `devloop` is shutting down.
 - `restart = "on_failure"` restarts only after unsuccessful exit.
@@ -139,6 +144,8 @@ Managed processes are long-running child commands.
   probe is checked.
 - Missing or malformed environment references fail loudly with the
   field name so the configuration error is visible.
+- Workflow failures include their complete causal error chain and leave the
+  runtime watching in degraded mode when it is safe to continue.
 
 Liveness probes are checked on the configured interval while the process
 is running. If a liveness probe fails and the restart policy allows it,

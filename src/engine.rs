@@ -217,7 +217,7 @@ impl WorkflowEffectAdapter for LiveWorkflowAdapter<'_, '_> {
     }
 
     async fn stop_process(&mut self, process: &str) -> Result<()> {
-        self.processes.stop_named(process).await
+        self.processes.stop_named(process, self.state).await
     }
 
     async fn restart_process(&mut self, process: &str) -> Result<()> {
@@ -421,8 +421,8 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
                 if let Err(error) = adapter.run_workflow(&workflow_name, &changed_files).await {
                     error!(
                         workflow = %workflow_name,
-                        error = %error,
-                        "workflow failed; continuing runtime"
+                        error = %workflow_failure_chain(&error),
+                        "workflow failed; continuing runtime in degraded mode"
                     );
                 }
             }
@@ -444,6 +444,10 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
     }
 
     Ok(false)
+}
+
+fn workflow_failure_chain(error: &anyhow::Error) -> String {
+    format!("{error:#}")
 }
 
 fn forward_watcher_event(
@@ -743,6 +747,17 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("devloop-engine-state-{unique}.json"))
+    }
+
+    #[test]
+    fn workflow_failure_chain_includes_root_cause() {
+        let error = anyhow!("executable 'cloudflared' was not found")
+            .context("guardian failed to start process 'tunnel'");
+
+        let message = workflow_failure_chain(&error);
+
+        assert!(message.contains("guardian failed to start process 'tunnel'"));
+        assert!(message.contains("executable 'cloudflared' was not found"));
     }
 
     #[test]

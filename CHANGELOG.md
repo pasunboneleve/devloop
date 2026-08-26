@@ -4,6 +4,18 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-08-26
+
+### Fixed
+
+- Invalidated process-output state before every start attempt and when the
+  process stops or exits, preventing stale values such as tunnel URLs from
+  surviving a missing executable or dead process.
+- Made `wait_for_process` reject stopped and failed processes even when their
+  readiness state persists from an earlier run.
+- Logged complete workflow failure chains while explicitly continuing the
+  runtime in degraded mode.
+
 ## [0.10.1] - 2026-08-26
 
 ### Changed

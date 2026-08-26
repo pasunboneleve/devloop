@@ -144,10 +144,19 @@ impl<'a> ProcessManager<'a> {
         self.start(name, spec, state).await
     }
 
-    pub async fn stop_named(&mut self, name: &str) -> Result<()> {
+    pub async fn stop_named(&mut self, name: &str, state: &SessionState) -> Result<()> {
+        let output_rules = self
+            .config
+            .process
+            .get(name)
+            .ok_or_else(|| anyhow!("unknown process '{name}'"))?
+            .output
+            .rules
+            .clone();
         let Some(mut child) = self.children.remove(name) else {
             return Ok(());
         };
+        self.retire_output_state(name, &output_rules, state);
         terminate_child(name, &mut child.guarded.child, child.guarded.process_group).await?;
         self.supervisor.on_process_stopped(name);
         if let Err(error) =
@@ -162,18 +171,75 @@ impl<'a> ProcessManager<'a> {
         if self.shutting_down {
             return Ok(());
         }
-        self.stop_named(name).await?;
+        self.stop_named(name, state).await?;
         self.start_named(name, state).await
     }
 
-    pub async fn wait_for_named(&self, name: &str, state: &SessionState) -> Result<()> {
-        let spec = self
+    pub async fn wait_for_named(&mut self, name: &str, state: &SessionState) -> Result<()> {
+        let (readiness, output_rules) = self
             .config
             .process
             .get(name)
+            .map(|spec| (spec.readiness.clone(), spec.output.rules.clone()))
             .ok_or_else(|| anyhow!("unknown process '{name}'"))?;
-        if let Some(check) = &spec.readiness {
-            wait_for_probe(&self.client, name, check, state).await?;
+        let Some(probe) = readiness else {
+            return self
+                .ensure_process_running(name, &output_rules, state)
+                .await;
+        };
+        let probe = expand_probe_env(name, &probe)?;
+        let started = Instant::now();
+        let timeout = match &probe {
+            ProbeSpec::Http { timeout_ms, .. } | ProbeSpec::StateKey { timeout_ms, .. } => {
+                Duration::from_millis(*timeout_ms)
+            }
+        };
+        let interval = Duration::from_millis(probe.interval());
+        loop {
+            self.ensure_process_running(name, &output_rules, state)
+                .await?;
+            if check_probe(&self.client, name, &probe, state).await.is_ok() {
+                self.ensure_process_running(name, &output_rules, state)
+                    .await?;
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(timeout_error(name, &probe));
+            }
+            sleep(interval).await;
+        }
+    }
+
+    async fn ensure_process_running(
+        &mut self,
+        name: &str,
+        output_rules: &[OutputRule],
+        state: &SessionState,
+    ) -> Result<()> {
+        let child = self
+            .children
+            .get_mut(name)
+            .ok_or_else(|| anyhow!("process '{name}' is not running"))?;
+        let status = child.guarded.child.try_wait()?;
+        if let Some(status) = status {
+            let managed = self
+                .children
+                .remove(name)
+                .ok_or_else(|| anyhow!("missing exited process '{name}'"))?;
+            self.retire_output_state(name, output_rules, state);
+            signal_process_group(name, managed.guarded.process_group, Signal::KILL)?;
+            self.spawn_output_cleanup(name.to_owned(), managed.output_tasks);
+            let now_ms = self.clock_start.elapsed().as_millis() as u64;
+            for effect in self.supervisor.on_tick(
+                self.config,
+                now_ms,
+                vec![(name.to_owned(), status.success())],
+            ) {
+                self.apply_process_effect(effect, state).await?;
+            }
+            return Err(anyhow!(
+                "process '{name}' exited with {status} before it became ready"
+            ));
         }
         Ok(())
     }
@@ -270,7 +336,7 @@ impl<'a> ProcessManager<'a> {
         for effect in self.supervisor.on_shutdown() {
             match effect {
                 ProcessEffect::StopProcess { process } => {
-                    if let Err(error) = self.stop_named(&process).await {
+                    if let Err(error) = self.stop_named(&process, state).await {
                         cleanup_errors.push(error.context(format!(
                             "failed to stop process '{process}' during shutdown"
                         )));
@@ -312,6 +378,15 @@ impl<'a> ProcessManager<'a> {
                     .children
                     .remove(&name)
                     .ok_or_else(|| anyhow!("missing exited process '{name}'"))?;
+                let output_rules = self
+                    .config
+                    .process
+                    .get(&name)
+                    .ok_or_else(|| anyhow!("missing config for exited process '{name}'"))?
+                    .output
+                    .rules
+                    .clone();
+                self.retire_output_state(&name, &output_rules, state);
                 signal_process_group(&name, managed.guarded.process_group, Signal::KILL)?;
                 self.spawn_output_cleanup(name.clone(), managed.output_tasks);
                 exits.push((name, status.success()));
@@ -362,6 +437,16 @@ impl<'a> ProcessManager<'a> {
         Ok(OutputStateGeneration { current, value })
     }
 
+    /// Retires one process generation without allowing state persistence to
+    /// prevent process cleanup or turn a child exit into a runtime failure.
+    fn retire_output_state(&mut self, name: &str, rules: &[OutputRule], state: &SessionState) {
+        if let Err(error) = self.next_output_state_generation(name, rules, state) {
+            warn!(
+                "failed to invalidate output state for process {name}; continuing cleanup: {error:#}"
+            );
+        }
+    }
+
     async fn finish_output_cleanup_tasks(&mut self) -> Result<()> {
         let mut cleanup_errors = Vec::new();
         while let Some(result) = self.output_cleanup_tasks.join_next().await {
@@ -382,6 +467,8 @@ impl<'a> ProcessManager<'a> {
         if self.children.contains_key(name) {
             return Ok(());
         }
+        let output_generation =
+            self.next_output_state_generation(name, &spec.output.rules, state)?;
         let command = configure_command(
             &spec.command,
             resolve_cwd(&self.config.root, spec.cwd.as_deref()),
@@ -398,8 +485,6 @@ impl<'a> ProcessManager<'a> {
         let mut guarded =
             spawn_guarded_process(name, command, Stdio::inherit(), &self.guardian_executable)
                 .await?;
-        let output_generation =
-            self.next_output_state_generation(name, &spec.output.rules, state)?;
         let process_name = name.to_owned();
         let source_label = process_output_source_label(name, &spec.command);
         let inherit_output = spec.output.inherit;
@@ -475,7 +560,7 @@ impl<'a> ProcessManager<'a> {
                 ProcessEffect::RestartProcess { process } => {
                     self.restart_named(&process, state).await?
                 }
-                ProcessEffect::StopProcess { process } => self.stop_named(&process).await?,
+                ProcessEffect::StopProcess { process } => self.stop_named(&process, state).await?,
                 ProcessEffect::CheckLiveness { process } => {
                     let Some(spec) = self.config.process.get(&process) else {
                         continue;
@@ -1601,34 +1686,6 @@ fn signal_process_group(name: &str, process_group: Pid, signal: Signal) -> Resul
     }
 }
 
-async fn wait_for_probe(
-    client: &reqwest::Client,
-    name: &str,
-    probe: &ProbeSpec,
-    state: &SessionState,
-) -> Result<()> {
-    let expanded_probe = expand_probe_env(name, probe)?;
-    let started = std::time::Instant::now();
-    let timeout = match &expanded_probe {
-        ProbeSpec::Http { timeout_ms, .. } | ProbeSpec::StateKey { timeout_ms, .. } => {
-            Duration::from_millis(*timeout_ms)
-        }
-    };
-    let interval = Duration::from_millis(expanded_probe.interval());
-    loop {
-        if check_probe(client, name, &expanded_probe, state)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        if started.elapsed() >= timeout {
-            return Err(timeout_error(name, &expanded_probe));
-        }
-        sleep(interval).await;
-    }
-}
-
 fn expand_probe_env(process: &str, probe: &ProbeSpec) -> Result<ProbeSpec> {
     match probe {
         ProbeSpec::Http {
@@ -1818,6 +1875,193 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn failed_start_invalidates_output_owned_state() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = test_config(dir.path());
+        config.process.insert(
+            "tunnel".into(),
+            ProcessSpec {
+                command: vec!["devloop-test-command-that-does-not-exist".into()],
+                cwd: None,
+                autostart: false,
+                readiness: None,
+                liveness: None,
+                restart: crate::config::RestartPolicy::Never,
+                env: BTreeMap::new(),
+                output: OutputConfig {
+                    rules: vec![OutputRule {
+                        state_key: "tunnel_url".into(),
+                        pattern: None,
+                        extract: OutputExtract::UrlToken,
+                        capture_group: 1,
+                    }],
+                    ..OutputConfig::default()
+                },
+            },
+        );
+        let state = SessionState::load(unique_state_path()).expect("state");
+        state
+            .set(
+                "tunnel_url",
+                Value::String("https://stale.trycloudflare.com".into()),
+            )
+            .expect("seed stale tunnel URL");
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
+
+        let error = manager
+            .start_named("tunnel", &state)
+            .await
+            .expect_err("missing executable should fail to start");
+
+        assert!(format!("{error:#}").contains("devloop-test-command-that-does-not-exist"));
+        assert_eq!(
+            state.get_string("tunnel_url").expect("read tunnel URL"),
+            Some(String::new())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_rejects_stale_readiness_without_a_running_process() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = test_config(dir.path());
+        config.process.insert(
+            "tunnel".into(),
+            ProcessSpec {
+                command: vec!["cloudflared".into()],
+                cwd: None,
+                autostart: false,
+                readiness: Some(ProbeSpec::StateKey {
+                    key: "tunnel_url".into(),
+                    interval_ms: 10,
+                    timeout_ms: 100,
+                }),
+                liveness: None,
+                restart: crate::config::RestartPolicy::Never,
+                env: BTreeMap::new(),
+                output: OutputConfig {
+                    rules: vec![OutputRule {
+                        state_key: "tunnel_url".into(),
+                        pattern: None,
+                        extract: OutputExtract::UrlToken,
+                        capture_group: 1,
+                    }],
+                    ..OutputConfig::default()
+                },
+            },
+        );
+        let state = SessionState::load(unique_state_path()).expect("state");
+        state
+            .set(
+                "tunnel_url",
+                Value::String("https://stale.trycloudflare.com".into()),
+            )
+            .expect("seed stale tunnel URL");
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
+
+        let error = manager
+            .wait_for_named("tunnel", &state)
+            .await
+            .expect_err("stale state must not imply readiness");
+
+        assert_eq!(error.to_string(), "process 'tunnel' is not running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_reports_process_exit_before_readiness() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = test_config(dir.path());
+        config.process.insert(
+            "server".into(),
+            ProcessSpec {
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf 'ready\\n'; exit 17".into(),
+                ],
+                cwd: None,
+                autostart: false,
+                readiness: Some(ProbeSpec::StateKey {
+                    key: "server_ready".into(),
+                    interval_ms: 10,
+                    timeout_ms: 1000,
+                }),
+                liveness: None,
+                restart: crate::config::RestartPolicy::Never,
+                env: BTreeMap::new(),
+                output: OutputConfig {
+                    rules: vec![OutputRule {
+                        state_key: "server_ready".into(),
+                        pattern: Some("(ready)".into()),
+                        extract: OutputExtract::Regex,
+                        capture_group: 1,
+                    }],
+                    ..OutputConfig::default()
+                },
+            },
+        );
+        let state = SessionState::load(unique_state_path()).expect("state");
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
+        manager
+            .start_named("server", &state)
+            .await
+            .expect("start server");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let ready = state
+                    .get_string("server_ready")
+                    .expect("read readiness state")
+                    .is_some_and(|value| !value.is_empty());
+                let exited = manager
+                    .children
+                    .get_mut("server")
+                    .expect("managed server")
+                    .guarded
+                    .child
+                    .try_wait()
+                    .expect("read server status")
+                    .is_some();
+                if ready && exited {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("capture readiness before observing server exit");
+
+        let error = manager
+            .wait_for_named("server", &state)
+            .await
+            .expect_err("exited process must not become ready");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("process 'server' exited with"),
+            "{message}"
+        );
+        assert!(message.contains("17"), "{message}");
+        assert!(!manager.children.contains_key("server"));
+        assert_eq!(
+            state
+                .get_string("server_ready")
+                .expect("read readiness state"),
+            Some(String::new())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn terminate_child_bounds_wait_for_an_unresponsive_guardian() {
         let mut command = Command::new("/bin/sh");
         command
@@ -1916,9 +2160,135 @@ wait
             .parse::<i32>()
             .expect("parse pid");
 
-        manager.stop_named("server").await.expect("stop process");
+        manager
+            .stop_named("server", &state)
+            .await
+            .expect("stop process");
 
         assert_process_gone(descendant_pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_named_invalidates_output_owned_state() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = test_config(dir.path());
+        config.process.insert(
+            "tunnel".into(),
+            ProcessSpec {
+                command: vec!["sh".into(), "-c".into(), "exec sleep 600".into()],
+                cwd: None,
+                autostart: false,
+                readiness: None,
+                liveness: None,
+                restart: crate::config::RestartPolicy::Never,
+                env: BTreeMap::new(),
+                output: OutputConfig {
+                    rules: vec![OutputRule {
+                        state_key: "tunnel_url".into(),
+                        pattern: None,
+                        extract: OutputExtract::UrlToken,
+                        capture_group: 1,
+                    }],
+                    ..OutputConfig::default()
+                },
+            },
+        );
+        let state = SessionState::load(unique_state_path()).expect("state");
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
+        manager
+            .start_named("tunnel", &state)
+            .await
+            .expect("start tunnel");
+        state
+            .set(
+                "tunnel_url",
+                Value::String("https://active.trycloudflare.com".into()),
+            )
+            .expect("set active tunnel URL");
+
+        manager
+            .stop_named("tunnel", &state)
+            .await
+            .expect("stop tunnel");
+
+        assert_eq!(
+            state.get_string("tunnel_url").expect("read tunnel URL"),
+            Some(String::new())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn natural_exit_invalidates_output_owned_state() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = test_config(dir.path());
+        config.process.insert(
+            "tunnel".into(),
+            ProcessSpec {
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf '%s\\n' https://active.trycloudflare.com".into(),
+                ],
+                cwd: None,
+                autostart: false,
+                readiness: None,
+                liveness: None,
+                restart: crate::config::RestartPolicy::Never,
+                env: BTreeMap::new(),
+                output: OutputConfig {
+                    inherit: false,
+                    rules: vec![OutputRule {
+                        state_key: "tunnel_url".into(),
+                        pattern: None,
+                        extract: OutputExtract::UrlToken,
+                        capture_group: 1,
+                    }],
+                    ..OutputConfig::default()
+                },
+            },
+        );
+        let state = SessionState::load(unique_state_path()).expect("state");
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
+        manager
+            .start_named("tunnel", &state)
+            .await
+            .expect("start tunnel");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .get_string("tunnel_url")
+                    .expect("read tunnel URL")
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("capture tunnel URL");
+
+        timeout(Duration::from_secs(5), async {
+            while manager.children.contains_key("tunnel") {
+                manager.maintain(&state).await.expect("maintain process");
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observe tunnel exit");
+
+        assert_eq!(
+            state.get_string("tunnel_url").expect("read tunnel URL"),
+            Some(String::new())
+        );
     }
 
     #[cfg(unix)]
@@ -1971,7 +2341,10 @@ while :; do sleep 1; done
             .await
             .expect("start process");
         wait_for_path(&started_path).await;
-        manager.stop_named("server").await.expect("stop process");
+        manager
+            .stop_named("server", &state)
+            .await
+            .expect("stop process");
 
         assert!(
             std::fs::read_to_string(log.path())
@@ -2053,7 +2426,10 @@ exec sleep 600
             .await
             .expect("wait for restarted process readiness");
         assert!(manager.children.contains_key("server"));
-        manager.stop_named("server").await.expect("stop process");
+        manager
+            .stop_named("server", &state)
+            .await
+            .expect("stop process");
     }
 
     #[cfg(unix)]
