@@ -314,9 +314,15 @@ output-derived updates.
 On `ctrl-c`, `devloop`:
 
 1. marks itself as shutting down
-2. stops all managed processes
-3. suppresses further automatic restarts
-4. exits
+2. stops watching without requiring configured watch targets to be
+   disjoint or unique
+3. stops all managed processes
+4. suppresses further automatic restarts
+5. exits successfully
+
+Overlapping recursive and literal watch patterns are valid. A redundant
+watch registration or an already-removed backend watch cannot interrupt
+process cleanup during shutdown.
 
 ## Known non-goals
 

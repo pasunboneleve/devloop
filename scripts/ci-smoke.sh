@@ -85,7 +85,11 @@ state_path = pathlib.Path(sys.argv[1])
 deadline = time.time() + 15
 while time.time() < deadline:
     if state_path.exists():
-        data = json.loads(state_path.read_text())
+        try:
+            data = json.loads(state_path.read_text())
+        except json.JSONDecodeError:
+            time.sleep(0.1)
+            continue
         if data.get("current_value") == "initial":
             sys.exit(0)
     time.sleep(0.1)
@@ -123,7 +127,11 @@ while time.time() < deadline:
         watched_path.write_text("updated\n")
         next_write = now + 0.5
     if state_path.exists():
-        data = json.loads(state_path.read_text())
+        try:
+            data = json.loads(state_path.read_text())
+        except json.JSONDecodeError:
+            time.sleep(0.1)
+            continue
         if (
             data.get("current_value") == "updated"
             and data.get("current_url") == "devloop://updated"

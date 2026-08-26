@@ -4,6 +4,14 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-08-26
+
+### Fixed
+
+- Made `ctrl-c` shutdown tolerate redundant or overlapping watch targets, so
+  native watcher teardown cannot skip managed-process cleanup or turn a normal
+  exit into an error.
+
 ## [0.10.2] - 2026-08-26
 
 ### Fixed

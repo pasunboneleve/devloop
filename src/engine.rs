@@ -13,7 +13,7 @@ use notify::{
 use serde_json::{Map, Value};
 use tokio::signal;
 use tokio::time::{Instant, sleep};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use unicode_width::UnicodeWidthStr;
 
 use crate::browser_reload::{BrowserReloadSender, BrowserReloadServer, notify_browser_reload};
@@ -76,7 +76,6 @@ struct LiveRuntimeAdapter<'a, 'b> {
     watcher: &'a mut Box<dyn Watcher + Send>,
     watcher_shutdown: Arc<AtomicBool>,
     watched_targets: Vec<CompiledWatchTarget>,
-    active_watch_targets: Vec<CompiledWatchTarget>,
     external_event_tx: tokio::sync::mpsc::UnboundedSender<ExternalEventMessage>,
     external_event_server: Option<ExternalEventServer>,
     browser_reload_server: Option<BrowserReloadServer>,
@@ -135,7 +134,6 @@ impl Engine {
             watcher: &mut watcher,
             watcher_shutdown,
             watched_targets,
-            active_watch_targets: Vec::new(),
             external_event_tx,
             external_event_server: None,
             browser_reload_server: None,
@@ -318,7 +316,6 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
     }
 
     async fn start_watching(&mut self) -> Result<()> {
-        self.active_watch_targets.clear();
         let mut registrations = BTreeMap::<std::path::PathBuf, bool>::new();
         for target in &self.watched_targets {
             for registration in resolve_watch_registrations(target, self.config.watcher.kind)? {
@@ -339,7 +336,6 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
                     RecursiveMode::NonRecursive
                 },
             )?;
-            self.active_watch_targets.push(registration.clone());
             info!(
                 "watching {}{}",
                 registration.path.display(),
@@ -369,11 +365,11 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
     }
 
     async fn stop_watching(&mut self) -> Result<()> {
+        // Native watcher backends may represent overlapping recursive and
+        // literal registrations with the same underlying OS watches. Dropping
+        // the whole watcher is the idempotent shutdown operation; unregistering
+        // each configured target can remove a descendant twice.
         self.watcher_shutdown.store(true, Ordering::Relaxed);
-        for target in &self.active_watch_targets {
-            self.watcher.unwatch(&target.path)?;
-        }
-        self.active_watch_targets.clear();
         Ok(())
     }
 
@@ -437,7 +433,14 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
                 }
             }
             RuntimeEffect::LogInfo { message } => adapter.log_info(message).await?,
-            RuntimeEffect::StopWatching => adapter.stop_watching().await?,
+            RuntimeEffect::StopWatching => {
+                if let Err(error) = adapter.stop_watching().await {
+                    warn!(
+                        error = %error,
+                        "watcher teardown failed; continuing process cleanup"
+                    );
+                }
+            }
             RuntimeEffect::StopAllProcesses => adapter.stop_all_processes().await?,
             RuntimeEffect::Exit => return Ok(true),
         }
@@ -456,6 +459,9 @@ fn forward_watcher_event(
     mut result: notify::Result<Event>,
     ignored_paths: &[PathBuf],
 ) {
+    if shutting_down.load(Ordering::Relaxed) {
+        return;
+    }
     if let Ok(event) = &mut result {
         event.paths.retain(|path| {
             !ignored_paths
@@ -1595,6 +1601,7 @@ mod tests {
         calls: Vec<String>,
         changed_hooks: BTreeMap<String, bool>,
         workflow_errors: BTreeMap<String, String>,
+        stop_watching_error: Option<String>,
         watching: bool,
     }
 
@@ -1604,6 +1611,7 @@ mod tests {
                 calls: Vec::new(),
                 changed_hooks: BTreeMap::new(),
                 workflow_errors: BTreeMap::new(),
+                stop_watching_error: None,
                 watching: false,
             }
         }
@@ -1668,6 +1676,9 @@ mod tests {
 
         async fn stop_watching(&mut self) -> Result<()> {
             self.calls.push("stop_watch".into());
+            if let Some(message) = &self.stop_watching_error {
+                return Err(anyhow!(message.clone()));
+            }
             self.watching = false;
             Ok(())
         }
@@ -1763,11 +1774,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ctrl_c_continues_cleanup_when_watcher_teardown_reports_missing_watch() {
+        let config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec![],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
+            event: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        let mut runtime = RuntimeMachine::new(&config);
+        let mut adapter = MockRuntimeAdapter::new();
+        adapter.stop_watching_error =
+            Some("No watch was found. about [\"content/banner.html\"]".into());
+
+        runtime.handle_event(RuntimeEvent::CtrlC);
+        let exit = execute_runtime_effects(&mut runtime, &mut adapter)
+            .await
+            .expect("watcher teardown must not abort the remaining shutdown effects");
+
+        assert!(exit);
+        assert_eq!(
+            adapter.calls,
+            vec![
+                "log:received ctrl-c, shutting down",
+                "stop_watch",
+                "stop_all",
+            ]
+        );
+    }
+
     #[test]
-    fn forward_watcher_event_ignores_send_failures_after_shutdown() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn forward_watcher_event_ignores_events_after_shutdown() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let shutdown = AtomicBool::new(true);
-        drop(rx);
 
         forward_watcher_event(
             &tx,
@@ -1779,6 +1826,8 @@ mod tests {
             }),
             &[],
         );
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
