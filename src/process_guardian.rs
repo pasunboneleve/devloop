@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -21,12 +23,31 @@ const MAX_START_ERROR_BYTES: usize = 16 * 1024;
 
 /// Holds the exact companion image used for every guardian in one devloop run.
 ///
-/// Keeping the file open pins its inode across in-place upgrades. Each spawn
-/// executes a duplicated descriptor, so later hooks and restarts cannot switch
-/// to a different guardian protocol while the supervisor is still running.
+/// Keeping the file open pins its inode across path replacement. Linux executes
+/// a duplicated descriptor directly. macOS materializes the pinned bytes in a
+/// private temporary executable kept only until spawn completes. Later hooks
+/// and restarts therefore cannot switch guardian protocols mid-run.
 #[derive(Clone)]
 pub struct GuardianExecutable {
     image: Arc<File>,
+}
+
+/// Keeps a prepared guardian image alive until `Command::spawn` completes.
+pub struct GuardianInvocation {
+    path: PathBuf,
+    inherited_image: Option<OwnedFd>,
+    #[cfg(target_os = "macos")]
+    _temporary_image: Option<tempfile::TempPath>,
+}
+
+impl GuardianInvocation {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn inherited_image_fd(&self) -> Option<i32> {
+        self.inherited_image.as_ref().map(AsRawFd::as_raw_fd)
+    }
 }
 
 impl GuardianExecutable {
@@ -48,7 +69,23 @@ impl GuardianExecutable {
         })
     }
 
-    pub fn duplicate_for_exec(&self) -> Result<(PathBuf, OwnedFd)> {
+    pub fn prepare_invocation(&self) -> Result<GuardianInvocation> {
+        #[cfg(target_os = "macos")]
+        {
+            let temporary_image = self.copy_to_temporary_executable()?;
+            return Ok(GuardianInvocation {
+                path: temporary_image.to_path_buf(),
+                inherited_image: None,
+                _temporary_image: Some(temporary_image),
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        self.prepare_descriptor_invocation()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn prepare_descriptor_invocation(&self) -> Result<GuardianInvocation> {
         // SAFETY: fcntl duplicates the live companion descriptor without
         // borrowing memory. The returned descriptor is immediately owned.
         let raw_fd = unsafe {
@@ -68,7 +105,41 @@ impl GuardianExecutable {
         let path = PathBuf::from(format!("/proc/self/fd/{raw_fd}"));
         #[cfg(not(target_os = "linux"))]
         let path = PathBuf::from(format!("/dev/fd/{raw_fd}"));
-        Ok((path, descriptor))
+        Ok(GuardianInvocation {
+            path,
+            inherited_image: Some(descriptor),
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn copy_to_temporary_executable(&self) -> Result<tempfile::TempPath> {
+        let mut temporary = tempfile::Builder::new()
+            .prefix("devloop-process-guardian-")
+            .tempfile()
+            .context("failed to create temporary process guardian executable")?;
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = self
+                .image
+                .read_at(&mut buffer, offset)
+                .context("failed to read pinned process guardian executable")?;
+            if count == 0 {
+                break;
+            }
+            temporary
+                .write_all(&buffer[..count])
+                .context("failed to copy pinned process guardian executable")?;
+            offset += count as u64;
+        }
+        temporary
+            .flush()
+            .context("failed to flush temporary process guardian executable")?;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .context("failed to make temporary process guardian executable")?;
+        Ok(temporary.into_temp_path())
     }
 }
 
@@ -331,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_executable_keeps_original_inode_after_path_replacement() {
+    fn pinned_executable_keeps_original_image_after_path_replacement() {
         let directory = tempfile::tempdir().expect("create executable fixture directory");
         let path = directory.path().join("guardian");
         let replacement = directory.path().join("replacement");
@@ -339,27 +410,30 @@ mod tests {
         std::fs::copy("/usr/bin/false", &replacement).expect("copy replacement executable");
         let executable = GuardianExecutable::open_path(&path).expect("pin original executable");
         std::fs::rename(&replacement, &path).expect("replace executable path");
-        let (descriptor_path, descriptor) = executable
-            .duplicate_for_exec()
-            .expect("duplicate pinned executable");
-        let descriptor_fd = descriptor.as_raw_fd();
-        let mut command = Command::new(descriptor_path);
+        let invocation = executable
+            .prepare_invocation()
+            .expect("prepare pinned executable");
+        let inherited_image_fd = invocation.inherited_image_fd();
+        let mut command = Command::new(invocation.path());
         // SAFETY: the closure changes only the close-on-exec flag of the owned
         // fixture descriptor before exec.
         unsafe {
             command.pre_exec(move || {
-                let flags = libc::fcntl(descriptor_fd, libc::F_GETFD);
-                if flags == -1
-                    || libc::fcntl(descriptor_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
-                {
-                    return Err(io::Error::last_os_error());
+                if let Some(descriptor_fd) = inherited_image_fd {
+                    let flags = libc::fcntl(descriptor_fd, libc::F_GETFD);
+                    if flags == -1
+                        || libc::fcntl(descriptor_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC)
+                            == -1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
         }
 
         let status = command.status().expect("execute pinned original inode");
-        drop(descriptor);
+        drop(invocation);
 
         assert!(status.success());
     }

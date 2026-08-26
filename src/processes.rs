@@ -560,9 +560,9 @@ async fn spawn_guarded_process(
         UnixStream::pair().context("failed to create parent-death control socket")?;
     let guardian_control_fd = guardian_control.as_raw_fd();
     let target = command.as_std();
-    let (guardian_path, guardian_image) = guardian_executable.duplicate_for_exec()?;
-    let guardian_image_fd = guardian_image.as_raw_fd();
-    let mut guardian = Command::new(guardian_path);
+    let guardian_image = guardian_executable.prepare_invocation()?;
+    let guardian_image_fd = guardian_image.inherited_image_fd();
+    let mut guardian = Command::new(guardian_image.path());
     devloop::process_guardian::append_invocation(&mut guardian, target);
     if let Some(cwd) = target.get_current_dir() {
         guardian.current_dir(cwd);
@@ -586,15 +586,17 @@ async fn spawn_guarded_process(
     // at one fixed descriptor in the guardian process.
     unsafe {
         guardian.pre_exec(move || {
-            let guardian_image_flags = libc::fcntl(guardian_image_fd, libc::F_GETFD);
-            if guardian_image_flags == -1
-                || libc::fcntl(
-                    guardian_image_fd,
-                    libc::F_SETFD,
-                    guardian_image_flags & !libc::FD_CLOEXEC,
-                ) == -1
-            {
-                return Err(std::io::Error::last_os_error());
+            if let Some(guardian_image_fd) = guardian_image_fd {
+                let guardian_image_flags = libc::fcntl(guardian_image_fd, libc::F_GETFD);
+                if guardian_image_flags == -1
+                    || libc::fcntl(
+                        guardian_image_fd,
+                        libc::F_SETFD,
+                        guardian_image_flags & !libc::FD_CLOEXEC,
+                    ) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             if guardian_control_fd == devloop::process_guardian::CONTROL_FD {
                 let flags = libc::fcntl(devloop::process_guardian::CONTROL_FD, libc::F_GETFD);
