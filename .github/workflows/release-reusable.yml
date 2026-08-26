@@ -45,7 +45,7 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
+      - name: Build release binaries
         run: cargo build --release --target ${{ inputs.target }}
 
       - name: Package release archive
@@ -54,7 +54,8 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp "target/${{ inputs.target }}/release/devloop" dist/devloop
-          tar -C dist -czf "${{ inputs.archive_name }}" devloop
+          cp "target/${{ inputs.target }}/release/devloop-process-guardian" dist/devloop-process-guardian
+          tar -C dist -czf "${{ inputs.archive_name }}" devloop devloop-process-guardian
 
       - name: Extract release notes from changelog
         if: inputs.publish_release_notes

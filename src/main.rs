@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
             config.validate()?;
         }
         Command::Run { config } => {
+            let guardian_executable = devloop::process_guardian::GuardianExecutable::open()?;
             let config = resolve_config_path(config)?;
             let config = Config::load(&config)?;
             config.validate()?;
@@ -97,7 +98,10 @@ async fn main() -> Result<()> {
             let session_log = SessionLog::create(state_file)?;
             init_logging(Some(session_log.clone()));
             announce_session_log_path(&session_log).await?;
-            if let Err(error) = Engine::new(config, session_log.clone()).run().await {
+            if let Err(error) = Engine::new(config, session_log.clone(), guardian_executable)
+                .run()
+                .await
+            {
                 error!(error = %format!("{error:#}"), "devloop run failed");
                 flush_session_log_before_exit(&session_log).await;
                 return Err(error);
