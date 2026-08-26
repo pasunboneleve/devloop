@@ -30,6 +30,7 @@ use crate::output::{
 };
 use crate::session_log::SessionLog;
 use crate::state::SessionState;
+use devloop::process_guardian::GuardianExecutable;
 
 pub struct ProcessManager<'a> {
     config: &'a Config,
@@ -45,6 +46,7 @@ pub struct ProcessManager<'a> {
     external_event_env: Option<ExternalEventEnvironment>,
     browser_reload_env: Option<BrowserReloadEnvironment>,
     session_log: Option<SessionLog>,
+    guardian_executable: GuardianExecutable,
 }
 
 struct ManagedProcess {
@@ -60,7 +62,7 @@ struct ManagedProcess {
 struct GuardedProcess {
     child: Child,
     process_group: Pid,
-    _control: UnixStream,
+    _lifetime: UnixStream,
 }
 
 struct OutputTask {
@@ -77,25 +79,8 @@ const OUTPUT_DRAIN_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_DRAIN_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 const TERMINAL_OUTPUT_QUEUE_CAPACITY: usize = 256;
 const SESSION_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
-const GUARDIAN_CONTROL_FD: i32 = 3;
-const PROCESS_GUARDIAN_SCRIPT: &str = r#"set -eu
-trap ':' TERM
-(
-  trap '' TERM
-  if IFS= read -r _ <&3; then
-    exit 0
-  fi
-  kill -KILL 0
-) &
-guardian_pid=$!
-set +e
-"$@" 3<&-
-status=$?
-set -e
-kill -KILL "$guardian_pid" 2>/dev/null || true
-wait "$guardian_pid" 2>/dev/null || true
-exit "$status"
-"#;
+const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const GUARDIAN_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct CommandContext<'a> {
     env: &'a BTreeMap<String, String>,
@@ -108,7 +93,7 @@ struct CommandContext<'a> {
 }
 
 impl<'a> ProcessManager<'a> {
-    pub fn new(config: &'a Config) -> Self {
+    pub fn new(config: &'a Config, guardian_executable: GuardianExecutable) -> Self {
         Self {
             config,
             children: BTreeMap::new(),
@@ -123,6 +108,7 @@ impl<'a> ProcessManager<'a> {
             external_event_env: None,
             browser_reload_env: None,
             session_log: None,
+            guardian_executable,
         }
     }
 
@@ -218,7 +204,8 @@ impl<'a> ProcessManager<'a> {
             },
         )?;
         let source_label = process_output_source_label(name, &spec.command);
-        let mut guarded = spawn_guarded_process(name, command, Stdio::null())?;
+        let mut guarded =
+            spawn_guarded_process(name, command, Stdio::null(), &self.guardian_executable).await?;
         let stdout = guarded
             .child
             .stdout
@@ -408,7 +395,9 @@ impl<'a> ProcessManager<'a> {
                 workflow: "startup",
             },
         )?;
-        let mut guarded = spawn_guarded_process(name, command, Stdio::inherit())?;
+        let mut guarded =
+            spawn_guarded_process(name, command, Stdio::inherit(), &self.guardian_executable)
+                .await?;
         let output_generation =
             self.next_output_state_generation(name, &spec.output.rules, state)?;
         let process_name = name.to_owned();
@@ -556,22 +545,25 @@ impl<'a> ProcessManager<'a> {
     }
 }
 
-/// Spawns a managed command behind an internal guardian. The guardian is the
-/// process-group leader and watches a private socket whose writer exists only
-/// in devloop. Supervisor death closes that writer in every exit mode, so EOF
-/// kills the group even when devloop cannot execute its normal shutdown path.
-fn spawn_guarded_process(name: &str, command: Command, stdin: Stdio) -> Result<GuardedProcess> {
-    let (control, guardian_control) =
+/// Spawns a managed command behind devloop's internal Rust guardian.
+///
+/// The guardian stays outside the target process group, so ordinary TERM/KILL
+/// signals reach only the target tree. It watches a private lifetime socket;
+/// EOF after any devloop exit makes it kill the group and reap its direct target.
+async fn spawn_guarded_process(
+    name: &str,
+    command: Command,
+    stdin: Stdio,
+    guardian_executable: &GuardianExecutable,
+) -> Result<GuardedProcess> {
+    let (mut lifetime, guardian_control) =
         UnixStream::pair().context("failed to create parent-death control socket")?;
     let guardian_control_fd = guardian_control.as_raw_fd();
     let target = command.as_std();
-    let mut guardian = Command::new("/bin/sh");
-    guardian
-        .arg("-c")
-        .arg(PROCESS_GUARDIAN_SCRIPT)
-        .arg("devloop-process-guardian")
-        .arg(target.get_program())
-        .args(target.get_args());
+    let (guardian_path, guardian_image) = guardian_executable.duplicate_for_exec()?;
+    let guardian_image_fd = guardian_image.as_raw_fd();
+    let mut guardian = Command::new(guardian_path);
+    devloop::process_guardian::append_invocation(&mut guardian, target);
     if let Some(cwd) = target.get_current_dir() {
         guardian.current_dir(cwd);
     }
@@ -594,11 +586,21 @@ fn spawn_guarded_process(name: &str, command: Command, stdin: Stdio) -> Result<G
     // at one fixed descriptor in the guardian process.
     unsafe {
         guardian.pre_exec(move || {
-            if guardian_control_fd == GUARDIAN_CONTROL_FD {
-                let flags = libc::fcntl(GUARDIAN_CONTROL_FD, libc::F_GETFD);
+            let guardian_image_flags = libc::fcntl(guardian_image_fd, libc::F_GETFD);
+            if guardian_image_flags == -1
+                || libc::fcntl(
+                    guardian_image_fd,
+                    libc::F_SETFD,
+                    guardian_image_flags & !libc::FD_CLOEXEC,
+                ) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if guardian_control_fd == devloop::process_guardian::CONTROL_FD {
+                let flags = libc::fcntl(devloop::process_guardian::CONTROL_FD, libc::F_GETFD);
                 if flags == -1
                     || libc::fcntl(
-                        GUARDIAN_CONTROL_FD,
+                        devloop::process_guardian::CONTROL_FD,
                         libc::F_SETFD,
                         flags & !libc::FD_CLOEXEC,
                     ) == -1
@@ -606,23 +608,37 @@ fn spawn_guarded_process(name: &str, command: Command, stdin: Stdio) -> Result<G
                     return Err(std::io::Error::last_os_error());
                 }
             } else {
-                if libc::dup2(guardian_control_fd, GUARDIAN_CONTROL_FD) == -1 {
+                if libc::dup2(guardian_control_fd, devloop::process_guardian::CONTROL_FD) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-                libc::close(guardian_control_fd);
+                if libc::close(guardian_control_fd) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
     }
-    let child = guardian
+    let mut child = guardian
         .spawn()
         .with_context(|| format!("failed to start guarded process '{name}'"))?;
-    let process_group = child_process_group(name, &child)?;
+    drop(guardian_image);
     drop(guardian_control);
+    let process_group = match devloop::process_guardian::receive_process_group(&mut lifetime) {
+        Ok(process_group) => process_group,
+        Err(error) => {
+            drop(lifetime);
+            child
+                .wait()
+                .await
+                .with_context(|| format!("failed to reap guardian for process '{name}'"))?;
+            return Err(error)
+                .with_context(|| format!("guardian failed to start process '{name}'"));
+        }
+    };
     Ok(GuardedProcess {
         child,
         process_group,
-        _control: control,
+        _lifetime: lifetime,
     })
 }
 
@@ -1514,15 +1530,24 @@ fn clear_output_state_keys(rules: &[OutputRule], state: &SessionState) -> Result
     Ok(())
 }
 
-fn child_process_group(name: &str, child: &Child) -> Result<Pid> {
-    let id = child
-        .id()
-        .ok_or_else(|| anyhow!("process '{name}' exited before its process group was recorded"))?;
-    Pid::from_raw(id as i32)
-        .ok_or_else(|| anyhow!("process '{name}' has invalid process group id {id}"))
+async fn terminate_child(name: &str, child: &mut Child, process_group: Pid) -> Result<()> {
+    terminate_child_with_timeouts(
+        name,
+        child,
+        process_group,
+        PROCESS_STOP_TIMEOUT,
+        GUARDIAN_REAP_TIMEOUT,
+    )
+    .await
 }
 
-async fn terminate_child(name: &str, child: &mut Child, process_group: Pid) -> Result<()> {
+async fn terminate_child_with_timeouts(
+    name: &str,
+    child: &mut Child,
+    process_group: Pid,
+    stop_timeout: Duration,
+    guardian_reap_timeout: Duration,
+) -> Result<()> {
     if child.try_wait()?.is_some() {
         signal_process_group(name, process_group, Signal::KILL)?;
         info!("process {} already exited; cleaned up process group", name);
@@ -1530,17 +1555,32 @@ async fn terminate_child(name: &str, child: &mut Child, process_group: Pid) -> R
     }
 
     signal_process_group(name, process_group, Signal::TERM)?;
-    match timeout(Duration::from_secs(2), child.wait()).await {
+    match timeout(stop_timeout, child.wait()).await {
         Ok(result) => {
             result.with_context(|| format!("failed to wait for process '{name}' after SIGTERM"))?;
             signal_process_group(name, process_group, Signal::KILL)?;
         }
         Err(_) => {
             signal_process_group(name, process_group, Signal::KILL)?;
-            child
-                .wait()
-                .await
-                .with_context(|| format!("failed to stop process '{name}' after SIGKILL"))?;
+            match timeout(guardian_reap_timeout, child.wait()).await {
+                Ok(result) => {
+                    result.with_context(|| {
+                        format!("failed to wait for process '{name}' after SIGKILL")
+                    })?;
+                }
+                Err(_) => {
+                    warn!(
+                        "process {name} did not exit after target group SIGKILL; killing its guardian"
+                    );
+                    child
+                        .start_kill()
+                        .with_context(|| format!("failed to kill guardian for process '{name}'"))?;
+                    child
+                        .wait()
+                        .await
+                        .with_context(|| format!("failed to reap guardian for process '{name}'"))?;
+                }
+            }
         }
     }
     info!("stopped process {}", name);
@@ -1732,8 +1772,10 @@ mod tests {
         command
             .arg("-c")
             .arg("IFS= read -r line; printf '%s' \"$line\"");
-        let mut guarded =
-            spawn_guarded_process("stdin-reader", command, Stdio::piped()).expect("spawn guard");
+        let guardian = GuardianExecutable::open().expect("open test guardian");
+        let mut guarded = spawn_guarded_process("stdin-reader", command, Stdio::piped(), &guardian)
+            .await
+            .expect("spawn guard");
         let mut stdin = guarded.child.stdin.take().expect("take stdin");
         let mut stdout = guarded.child.stdout.take().expect("take stdout");
 
@@ -1751,6 +1793,59 @@ mod tests {
 
         assert!(status.success());
         assert_eq!(output, "from-devloop");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guarded_process_surfaces_target_spawn_error() {
+        let command = Command::new("devloop-test-command-that-does-not-exist");
+        let guardian = GuardianExecutable::open().expect("open test guardian");
+        let error = match spawn_guarded_process("missing", command, Stdio::null(), &guardian).await
+        {
+            Ok(_) => panic!("missing target unexpectedly started"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("failed to start guarded command"),
+            "{message}"
+        );
+        assert!(!message.contains("unexpected end of file"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_child_bounds_wait_for_an_unresponsive_guardian() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; printf ready; IFS= read -r _")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = command.spawn().expect("spawn guardian fixture");
+        let mut ready = [0_u8; 5];
+        child
+            .stdout
+            .as_mut()
+            .expect("guardian fixture stdout")
+            .read_exact(&mut ready)
+            .await
+            .expect("guardian fixture readiness");
+        assert_eq!(&ready, b"ready");
+        let nonexistent_group = Pid::from_raw(2_000_000_000).expect("nonexistent process group");
+
+        terminate_child_with_timeouts(
+            "unresponsive-guardian",
+            &mut child,
+            nonexistent_group,
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("bound guardian wait");
+
+        assert!(child.try_wait().expect("read guardian status").is_some());
     }
 
     #[cfg(unix)]
@@ -1803,7 +1898,10 @@ wait
             },
         );
         let state = SessionState::load(unique_state_path()).expect("state");
-        let mut manager = ProcessManager::new(&config);
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
 
         manager
             .start_named("server", &state)
@@ -1860,7 +1958,11 @@ while :; do sleep 1; done
         let state_file = dir.path().join(".devloop/state.json");
         let state = SessionState::load(state_file.clone()).expect("state");
         let log = SessionLog::create(&state_file).expect("create log");
-        let mut manager = ProcessManager::new(&config).with_session_log(log.clone());
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        )
+        .with_session_log(log.clone());
 
         manager
             .start_named("server", &state)
@@ -1920,7 +2022,11 @@ exec sleep 600
         let state_file = dir.path().join(".devloop/state.json");
         let state = SessionState::load(state_file.clone()).expect("state");
         let log = SessionLog::create(&state_file).expect("create log");
-        let mut manager = ProcessManager::new(&config).with_session_log(log.clone());
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        )
+        .with_session_log(log.clone());
 
         manager
             .start_named("server", &state)
@@ -1981,7 +2087,10 @@ exit 0
         );
         let state_file = dir.path().join(".devloop/state.json");
         let state = SessionState::load(state_file).expect("state");
-        let mut manager = ProcessManager::new(&config);
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
 
         manager
             .start_named("server", &state)
@@ -2030,7 +2139,11 @@ exit 0
         let state_file = dir.path().join(".devloop/state.json");
         let state = SessionState::load(state_file.clone()).expect("state");
         let log = SessionLog::create(&state_file).expect("create log");
-        let mut manager = ProcessManager::new(&config).with_session_log(log.clone());
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        )
+        .with_session_log(log.clone());
 
         manager
             .start_named("server", &state)
@@ -2101,7 +2214,11 @@ exec sleep 600
         let state_file = dir.path().join(".devloop/state.json");
         let state = SessionState::load(state_file.clone()).expect("state");
         let log = SessionLog::create(&state_file).expect("create log");
-        let mut manager = ProcessManager::new(&config).with_session_log(log.clone());
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        )
+        .with_session_log(log.clone());
 
         manager
             .start_named("first", &state)
@@ -2130,7 +2247,10 @@ exec sleep 600
     async fn finish_output_cleanup_tasks_drains_all_failures() {
         let dir = tempdir().expect("tempdir");
         let config = test_config(dir.path());
-        let mut manager = ProcessManager::new(&config);
+        let mut manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
         manager
             .output_cleanup_tasks
             .spawn(async { Err(anyhow!("first cleanup failure")) });
@@ -2285,7 +2405,11 @@ exec sleep 600
         let state_file = dir.path().join(".devloop/state.json");
         let state = SessionState::load(state_file.clone()).expect("state");
         let log = SessionLog::create(&state_file).expect("create log");
-        let manager = ProcessManager::new(&config).with_session_log(log.clone());
+        let manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        )
+        .with_session_log(log.clone());
 
         manager
             .run_hook("capture", &state, &[], "test")
@@ -2324,7 +2448,11 @@ exec sleep 600
             std::io::ErrorKind::BrokenPipe,
             "simulated session log failure",
         );
-        let manager = ProcessManager::new(&config).with_session_log(log);
+        let manager = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        )
+        .with_session_log(log);
 
         manager
             .run_hook("capture", &state, &[], "test")

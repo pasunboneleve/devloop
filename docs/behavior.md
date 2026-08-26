@@ -100,10 +100,16 @@ Managed processes are long-running child commands.
 - `start_process` is a no-op if the named process is already running.
 - `restart_process` stops the child, then starts it again.
 - Every external command, including managed processes and hooks, is
-  launched in a guarded Unix process group. The guardian watches a
-  private control channel owned by `devloop`. Normal
-  stop/restart/shutdown terminates the group, and abrupt `devloop`
-  disappearance closes the channel so the guardian kills the group.
+  launched in its own Unix process group through an internal Rust
+  companion process. At run startup, `devloop` opens and retains the
+  exact companion image, so an in-place installation update cannot
+  change the guardian protocol for later hooks or restarts. The guardian
+  remains outside the target group, ignores terminal-oriented signals,
+  and watches a private lifetime channel owned by `devloop`. Managed
+  targets restore ordinary signal handling before they start. Normal
+  stop/restart/shutdown terminates the target group, and abrupt
+  `devloop` disappearance closes the channel so the guardian kills the
+  group and reaps its direct target.
   Children, grandchildren, and deeper descendants are covered while
   they remain in the inherited process group.
 - A descendant that deliberately creates a new session or process group

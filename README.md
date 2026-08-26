@@ -72,6 +72,10 @@ Each supported platform publishes its release asset independently, so a
 failure on one platform does not block the other asset from being
 attached to the GitHub release.
 
+Each archive contains `devloop` and `devloop-process-guardian`. Install
+both executables in the same directory. `cargo install` installs the
+pair together.
+
 Supported prebuilt release targets:
 
 - `x86_64-unknown-linux-gnu`

@@ -6,9 +6,11 @@ All notable changes to `devloop` will be recorded in this file.
 
 ### Fixed
 
-- Guard every managed process and hook with a parent-death control
-  channel, so an abrupt `devloop` exit kills children, grandchildren,
-  and deeper descendants that remain in the command's process group.
+- Guard every managed process and hook with a pinned Rust companion and
+  parent-death channel, so an abrupt `devloop` exit kills children,
+  grandchildren, and deeper descendants that remain in the command's
+  process group. The companion has a distinct process identity and
+  stays consistent across in-place installation updates.
 
 ## [0.10.0] - 2026-07-23
 

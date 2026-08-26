@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
-use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+use rustix::process::{Pid, Signal, getpgid, kill_process, test_kill_process};
 use tempfile::TempDir;
 
 #[test]
@@ -24,12 +24,69 @@ fn assert_abrupt_supervisor_death_cleans_tree(launch: TreeLaunch) {
     let parent = fixture.wait_for_pid("parent.pid", Duration::from_secs(10));
     let child = fixture.wait_for_pid("child.pid", Duration::from_secs(10));
     let grandchild = fixture.wait_for_pid("grandchild.pid", Duration::from_secs(10));
+    let guardian = assert_target_group(&devloop, parent, child, grandchild);
+    assert_guardian_identity_and_signal_resilience(guardian);
 
     devloop.kill_supervisor();
 
+    assert_process_gone(guardian);
     assert_process_gone(parent);
     assert_process_gone(child);
     assert_process_gone(grandchild);
+}
+
+fn assert_target_group(devloop: &DevloopChild, parent: i32, child: i32, grandchild: i32) -> i32 {
+    let parent = Pid::from_raw(parent).expect("parent pid");
+    let child = Pid::from_raw(child).expect("child pid");
+    let grandchild = Pid::from_raw(grandchild).expect("grandchild pid");
+    let devloop = Pid::from_raw(devloop.child.id() as i32).expect("devloop pid");
+
+    assert_eq!(getpgid(Some(parent)).expect("parent process group"), parent);
+    assert_eq!(getpgid(Some(child)).expect("child process group"), parent);
+    assert_eq!(
+        getpgid(Some(grandchild)).expect("grandchild process group"),
+        parent
+    );
+    assert_ne!(
+        getpgid(Some(devloop)).expect("devloop process group"),
+        parent
+    );
+    process_parent(parent.as_raw_nonzero().get())
+}
+
+fn assert_guardian_identity_and_signal_resilience(raw_pid: i32) {
+    let guardian = Pid::from_raw(raw_pid).expect("guardian pid");
+    let process_name = process_field(raw_pid, "comm");
+    let executable_name = std::path::Path::new(process_name.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(process_name.trim());
+    assert_ne!(
+        executable_name, "devloop",
+        "guardian must have a distinct name"
+    );
+
+    kill_process(guardian, Signal::TERM).expect("send SIGTERM to guardian");
+    assert!(
+        test_kill_process(guardian).is_ok(),
+        "guardian must survive name-oriented termination signals"
+    );
+}
+
+fn process_parent(raw_pid: i32) -> i32 {
+    process_field(raw_pid, "ppid")
+        .trim()
+        .parse()
+        .expect("parse guardian pid")
+}
+
+fn process_field(raw_pid: i32, field: &str) -> String {
+    let output = Command::new("ps")
+        .args(["-o", &format!("{field}="), "-p", &raw_pid.to_string()])
+        .output()
+        .expect("inspect process");
+    assert!(output.status.success(), "ps failed for process {raw_pid}");
+    String::from_utf8(output.stdout).expect("ps output is UTF-8")
 }
 
 #[derive(Clone, Copy)]

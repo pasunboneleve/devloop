@@ -23,10 +23,12 @@ use crate::external_events::{ExternalEventMessage, ExternalEventServer};
 use crate::processes::ProcessManager;
 use crate::session_log::SessionLog;
 use crate::state::SessionState;
+use devloop::process_guardian::GuardianExecutable;
 
 pub struct Engine {
     config: Config,
     session_log: SessionLog,
+    guardian_executable: GuardianExecutable,
 }
 
 trait WorkflowEffectAdapter {
@@ -81,10 +83,15 @@ struct LiveRuntimeAdapter<'a, 'b> {
 }
 
 impl Engine {
-    pub fn new(config: Config, session_log: SessionLog) -> Self {
+    pub fn new(
+        config: Config,
+        session_log: SessionLog,
+        guardian_executable: GuardianExecutable,
+    ) -> Self {
         Self {
             config,
             session_log,
+            guardian_executable,
         }
     }
 
@@ -95,8 +102,8 @@ impl Engine {
                 .clone()
                 .ok_or_else(|| anyhow!("state file missing after config load"))?,
         )?;
-        let mut processes =
-            ProcessManager::new(&self.config).with_session_log(self.session_log.clone());
+        let mut processes = ProcessManager::new(&self.config, self.guardian_executable)
+            .with_session_log(self.session_log.clone());
         let watch_groups = self.config.compiled_watchers()?;
         let watched_targets = self.config.compiled_watch_targets();
         let ignored_watch_paths = vec![self.session_log.path().to_path_buf()];
@@ -1028,7 +1035,10 @@ mod tests {
             },
         );
 
-        let mut processes = ProcessManager::new(&config);
+        let mut processes = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
         run_workflow(&config, &mut processes, &state, None, "compose", &[])
             .await
             .expect("run workflow");
@@ -1093,7 +1103,10 @@ mod tests {
             },
         );
 
-        let mut processes = ProcessManager::new(&config);
+        let mut processes = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
         run_workflow(&config, &mut processes, &state, None, "content", &[])
             .await
             .expect("run workflow");
@@ -1153,7 +1166,10 @@ mod tests {
             },
         );
 
-        let mut processes = ProcessManager::new(&config);
+        let mut processes = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
         run_workflow(&config, &mut processes, &state, None, "announce", &[])
             .await
             .expect("run workflow");
@@ -1941,7 +1957,10 @@ mod tests {
         };
         let state_path = unique_state_path();
         let state = SessionState::load(state_path.clone()).expect("load state");
-        let mut processes = ProcessManager::new(&config);
+        let mut processes = ProcessManager::new(
+            &config,
+            GuardianExecutable::open().expect("open test guardian"),
+        );
 
         let error = run_workflow(&config, &mut processes, &state, None, "missing", &[])
             .await
