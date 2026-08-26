@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -46,9 +48,19 @@ pub struct ProcessManager<'a> {
 }
 
 struct ManagedProcess {
+    guarded: GuardedProcess,
+    output_tasks: Vec<OutputTask>,
+}
+
+/// Owns every external command behind one process-containment boundary.
+///
+/// The control socket remains open for exactly as long as devloop owns the
+/// command. If devloop disappears, socket EOF makes the guardian kill the
+/// complete process group without relying on supervisor shutdown code.
+struct GuardedProcess {
     child: Child,
     process_group: Pid,
-    output_tasks: Vec<OutputTask>,
+    _control: UnixStream,
 }
 
 struct OutputTask {
@@ -65,6 +77,25 @@ const OUTPUT_DRAIN_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_DRAIN_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 const TERMINAL_OUTPUT_QUEUE_CAPACITY: usize = 256;
 const SESSION_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const GUARDIAN_CONTROL_FD: i32 = 3;
+const PROCESS_GUARDIAN_SCRIPT: &str = r#"set -eu
+trap ':' TERM
+(
+  trap '' TERM
+  if IFS= read -r _ <&3; then
+    exit 0
+  fi
+  kill -KILL 0
+) &
+guardian_pid=$!
+set +e
+"$@" 3<&-
+status=$?
+set -e
+kill -KILL "$guardian_pid" 2>/dev/null || true
+wait "$guardian_pid" 2>/dev/null || true
+exit "$status"
+"#;
 
 struct CommandContext<'a> {
     env: &'a BTreeMap<String, String>,
@@ -131,7 +162,7 @@ impl<'a> ProcessManager<'a> {
         let Some(mut child) = self.children.remove(name) else {
             return Ok(());
         };
-        terminate_child(name, &mut child.child, child.process_group).await?;
+        terminate_child(name, &mut child.guarded.child, child.guarded.process_group).await?;
         self.supervisor.on_process_stopped(name);
         if let Err(error) =
             wait_for_output_tasks(name, child.output_tasks, self.session_log.clone()).await
@@ -173,7 +204,7 @@ impl<'a> ProcessManager<'a> {
             .hook
             .get(name)
             .ok_or_else(|| anyhow!("unknown hook '{name}'"))?;
-        let mut command = configure_command(
+        let command = configure_command(
             &spec.command,
             resolve_cwd(&self.config.root, spec.cwd.as_deref()),
             CommandContext {
@@ -187,17 +218,14 @@ impl<'a> ProcessManager<'a> {
             },
         )?;
         let source_label = process_output_source_label(name, &spec.command);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to run hook '{name}'"))?;
-        let stdout = child
+        let mut guarded = spawn_guarded_process(name, command, Stdio::null())?;
+        let stdout = guarded
+            .child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("failed to capture stdout for hook '{name}'"))?;
-        let stderr = child
+        let stderr = guarded
+            .child
             .stderr
             .take()
             .ok_or_else(|| anyhow!("failed to capture stderr for hook '{name}'"))?;
@@ -213,7 +241,11 @@ impl<'a> ProcessManager<'a> {
             source_label.clone(),
             name.to_owned(),
         );
-        let child_status = async { child.wait().await.map_err(anyhow::Error::from) };
+        let child_status = async move {
+            let status = guarded.child.wait().await.map_err(anyhow::Error::from)?;
+            signal_process_group(name, guarded.process_group, Signal::KILL)?;
+            Ok::<_, anyhow::Error>(status)
+        };
         let (status, stdout, stderr) = tokio::try_join!(child_status, stdout_task, stderr_task)
             .with_context(|| format!("failed to run hook '{name}'"))?;
         if let Some(session_log) = &self.session_log
@@ -284,7 +316,7 @@ impl<'a> ProcessManager<'a> {
                     .children
                     .get_mut(&name)
                     .ok_or_else(|| anyhow!("missing managed process '{name}'"))?;
-                managed.child.try_wait()?
+                managed.guarded.child.try_wait()?
             };
 
             if let Some(status) = exited {
@@ -293,7 +325,7 @@ impl<'a> ProcessManager<'a> {
                     .children
                     .remove(&name)
                     .ok_or_else(|| anyhow!("missing exited process '{name}'"))?;
-                signal_process_group(&name, managed.process_group, Signal::KILL)?;
+                signal_process_group(&name, managed.guarded.process_group, Signal::KILL)?;
                 self.spawn_output_cleanup(name.clone(), managed.output_tasks);
                 exits.push((name, status.success()));
             }
@@ -363,7 +395,7 @@ impl<'a> ProcessManager<'a> {
         if self.children.contains_key(name) {
             return Ok(());
         }
-        let mut command = configure_command(
+        let command = configure_command(
             &spec.command,
             resolve_cwd(&self.config.root, spec.cwd.as_deref()),
             CommandContext {
@@ -376,13 +408,7 @@ impl<'a> ProcessManager<'a> {
                 workflow: "startup",
             },
         )?;
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.process_group(0);
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to start process '{name}'"))?;
-        let process_group = child_process_group(name, &child)?;
+        let mut guarded = spawn_guarded_process(name, command, Stdio::inherit())?;
         let output_generation =
             self.next_output_state_generation(name, &spec.output.rules, state)?;
         let process_name = name.to_owned();
@@ -393,7 +419,7 @@ impl<'a> ProcessManager<'a> {
         let stdout_sink = OutputSink::Stdout(self.stdout.clone());
         let stderr_sink = OutputSink::Stderr(self.stderr.clone());
         let mut output_tasks = Vec::new();
-        if let Some(stdout) = child.stdout.take() {
+        if let Some(stdout) = guarded.child.stdout.take() {
             output_tasks.push(OutputTask {
                 handle: tokio::spawn(forward_output_lines(
                     stdout,
@@ -411,7 +437,7 @@ impl<'a> ProcessManager<'a> {
                 )),
             });
         }
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = guarded.child.stderr.take() {
             output_tasks.push(OutputTask {
                 handle: tokio::spawn(forward_output_lines(
                     stderr,
@@ -432,8 +458,7 @@ impl<'a> ProcessManager<'a> {
         self.children.insert(
             name.to_owned(),
             ManagedProcess {
-                child,
-                process_group,
+                guarded,
                 output_tasks,
             },
         );
@@ -529,6 +554,76 @@ impl<'a> ProcessManager<'a> {
             );
         }
     }
+}
+
+/// Spawns a managed command behind an internal guardian. The guardian is the
+/// process-group leader and watches a private socket whose writer exists only
+/// in devloop. Supervisor death closes that writer in every exit mode, so EOF
+/// kills the group even when devloop cannot execute its normal shutdown path.
+fn spawn_guarded_process(name: &str, command: Command, stdin: Stdio) -> Result<GuardedProcess> {
+    let (control, guardian_control) =
+        UnixStream::pair().context("failed to create parent-death control socket")?;
+    let guardian_control_fd = guardian_control.as_raw_fd();
+    let target = command.as_std();
+    let mut guardian = Command::new("/bin/sh");
+    guardian
+        .arg("-c")
+        .arg(PROCESS_GUARDIAN_SCRIPT)
+        .arg("devloop-process-guardian")
+        .arg(target.get_program())
+        .args(target.get_args());
+    if let Some(cwd) = target.get_current_dir() {
+        guardian.current_dir(cwd);
+    }
+    for (key, value) in target.get_envs() {
+        match value {
+            Some(value) => {
+                guardian.env(key, value);
+            }
+            None => {
+                guardian.env_remove(key);
+            }
+        }
+    }
+    guardian.stdout(Stdio::piped());
+    guardian.stderr(Stdio::piped());
+    guardian.stdin(stdin);
+    guardian.process_group(0);
+    // SAFETY: this closure runs after fork and before exec. It only uses
+    // async-signal-safe libc calls to expose the already-open control socket
+    // at one fixed descriptor in the guardian process.
+    unsafe {
+        guardian.pre_exec(move || {
+            if guardian_control_fd == GUARDIAN_CONTROL_FD {
+                let flags = libc::fcntl(GUARDIAN_CONTROL_FD, libc::F_GETFD);
+                if flags == -1
+                    || libc::fcntl(
+                        GUARDIAN_CONTROL_FD,
+                        libc::F_SETFD,
+                        flags & !libc::FD_CLOEXEC,
+                    ) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else {
+                if libc::dup2(guardian_control_fd, GUARDIAN_CONTROL_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(guardian_control_fd);
+            }
+            Ok(())
+        });
+    }
+    let child = guardian
+        .spawn()
+        .with_context(|| format!("failed to start guarded process '{name}'"))?;
+    let process_group = child_process_group(name, &child)?;
+    drop(guardian_control);
+    Ok(GuardedProcess {
+        child,
+        process_group,
+        _control: control,
+    })
 }
 
 async fn wait_for_output_tasks(
@@ -1628,6 +1723,34 @@ mod tests {
             );
             sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guarded_process_preserves_configured_stdin() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("IFS= read -r line; printf '%s' \"$line\"");
+        let mut guarded =
+            spawn_guarded_process("stdin-reader", command, Stdio::piped()).expect("spawn guard");
+        let mut stdin = guarded.child.stdin.take().expect("take stdin");
+        let mut stdout = guarded.child.stdout.take().expect("take stdout");
+
+        stdin
+            .write_all(b"from-devloop\n")
+            .await
+            .expect("write stdin");
+        drop(stdin);
+        let status = guarded.child.wait().await.expect("wait for guard");
+        let mut output = String::new();
+        stdout
+            .read_to_string(&mut output)
+            .await
+            .expect("read stdout");
+
+        assert!(status.success());
+        assert_eq!(output, "from-devloop");
     }
 
     #[cfg(unix)]

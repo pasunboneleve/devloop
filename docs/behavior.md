@@ -99,9 +99,17 @@ Managed processes are long-running child commands.
 
 - `start_process` is a no-op if the named process is already running.
 - `restart_process` stops the child, then starts it again.
-- Managed processes are started in their own Unix process group, and
-  stop/restart/shutdown terminates that group so descendant processes do
-  not survive the supervisor.
+- Every external command, including managed processes and hooks, is
+  launched in a guarded Unix process group. The guardian watches a
+  private control channel owned by `devloop`. Normal
+  stop/restart/shutdown terminates the group, and abrupt `devloop`
+  disappearance closes the channel so the guardian kills the group.
+  Children, grandchildren, and deeper descendants are covered while
+  they remain in the inherited process group.
+- A descendant that deliberately creates a new session or process group
+  escapes portable Unix process-group containment. Such commands must
+  provide their own shutdown integration instead of daemonizing beneath
+  `devloop`.
 - `wait_for_process` waits on the configured readiness probe, not just
   on successful spawning.
 - `restart = "always"` restarts a child after any exit unless
@@ -135,6 +143,8 @@ the process is restarted.
 Hooks are one-shot commands executed inside workflows.
 
 - Hooks run to completion before the workflow continues.
+- Hooks use the same guarded process-group lifecycle as managed
+  processes, including cleanup after abrupt `devloop` termination.
 - Hook stdout and stderr are captured fully, then rendered with a source
   label if `hook.<name>.output.inherit` is enabled.
 - Hook output defaults to `body_style = "dim"` so helper-command output

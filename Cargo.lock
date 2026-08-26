@@ -241,6 +241,7 @@ dependencies = [
  "axum",
  "clap",
  "globset",
+ "libc",
  "notify",
  "pulldown-cmark",
  "rand",

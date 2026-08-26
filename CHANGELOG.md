@@ -4,6 +4,12 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Guard every managed process and hook with a parent-death control
+  channel, so an abrupt `devloop` exit kills children, grandchildren,
+  and deeper descendants that remain in the command's process group.
+
 ## [0.10.0] - 2026-07-23
 
 ### Added
