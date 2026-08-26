@@ -335,8 +335,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("create executable fixture directory");
         let path = directory.path().join("guardian");
         let replacement = directory.path().join("replacement");
-        std::fs::copy("/bin/true", &path).expect("copy original executable");
-        std::fs::copy("/bin/false", &replacement).expect("copy replacement executable");
+        std::fs::copy("/usr/bin/true", &path).expect("copy original executable");
+        std::fs::copy("/usr/bin/false", &replacement).expect("copy replacement executable");
         let executable = GuardianExecutable::open_path(&path).expect("pin original executable");
         std::fs::rename(&replacement, &path).expect("replace executable path");
         let (descriptor_path, descriptor) = executable
