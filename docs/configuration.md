@@ -197,7 +197,10 @@ Use `plain` when subprocess color or exact body rendering matters. Use
 ### Output rules
 
 Each rule extracts a value from process output and writes it into the
-session state.
+session state. The value belongs to the current process instance: `devloop`
+clears it before each start attempt and when the process stops or exits.
+Consequently, a missing executable or other startup failure cannot leave a
+value captured by an earlier run available to later workflows.
 
 ```toml
 output = { rules = [{ state_key = "tunnel_url", extract = "url_token" }] }

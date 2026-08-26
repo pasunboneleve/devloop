@@ -56,6 +56,42 @@ fn runtime_start_failure_is_persisted_in_the_session_log() {
     assert!(content.contains("failed to parse state file"));
 }
 
+#[test]
+fn workflow_spawn_failure_logs_full_chain_and_keeps_runtime_alive() {
+    let fixture = SessionLogFixture::new();
+    fixture.write_config(
+        r#"root = "."
+startup_workflows = ["startup"]
+
+[watch.config]
+paths = ["devloop.toml"]
+workflow = "startup"
+
+[process.tunnel]
+command = ["devloop-test-command-that-does-not-exist"]
+autostart = false
+
+[workflow.startup]
+steps = [{ action = "start_process", process = "tunnel" }]
+"#,
+    );
+    let mut child = DevloopChild::spawn(&fixture);
+
+    child.wait_for_stderr(
+        "workflow failed; continuing runtime in degraded mode",
+        Duration::from_secs(10),
+    );
+    fixture.wait_for_single_session_log_containing(
+        "devloop-test-command-that-does-not-exist",
+        Duration::from_secs(10),
+    );
+
+    let content = fixture.read_single_session_log();
+    assert!(content.contains("guardian failed to start process 'tunnel'"));
+    assert!(content.contains("devloop-test-command-that-does-not-exist"));
+    child.assert_running();
+}
+
 struct SessionLogFixture {
     dir: TempDir,
 }
@@ -90,6 +126,10 @@ steps = [
 
     fn path(&self) -> &std::path::Path {
         self.dir.path()
+    }
+
+    fn write_config(&self, config: &str) {
+        std::fs::write(self.path().join("devloop.toml"), config).expect("write fixture config");
     }
 
     fn read_single_session_log(&self) -> String {
@@ -168,24 +208,39 @@ impl DevloopChild {
 
     fn wait_for_stderr(&mut self, needle: &str, timeout: Duration) {
         let deadline = std::time::Instant::now() + timeout;
+        let mut observed = Vec::new();
         loop {
             let now = std::time::Instant::now();
             assert!(
                 now < deadline,
                 "timed out waiting for stderr containing '{needle}'"
             );
-            let line = self
-                .stderr
-                .recv_timeout(deadline - now)
-                .unwrap_or_else(|_| panic!("timed out waiting for stderr containing '{needle}'"));
+            let line = self.stderr.recv_timeout(deadline - now).unwrap_or_else(|_| {
+                let status = self.child.try_wait().expect("read devloop status");
+                panic!(
+                    "timed out waiting for stderr containing '{needle}'; status: {status:?}; stderr: {}",
+                    observed.join(" | ")
+                )
+            });
             if line.contains(needle) {
                 return;
             }
+            observed.push(line);
         }
     }
 
     fn wait_for_exit(&mut self) -> std::process::ExitStatus {
         self.child.wait().expect("wait for devloop")
+    }
+
+    fn assert_running(&mut self) {
+        assert!(
+            self.child
+                .try_wait()
+                .expect("read devloop status")
+                .is_none(),
+            "devloop exited instead of continuing in degraded mode"
+        );
     }
 }
 
