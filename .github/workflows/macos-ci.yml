@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   rust:
+    name: macOS
     uses: ./.github/workflows/rust-ci-reusable.yml
     with:
       runner: macos-latest

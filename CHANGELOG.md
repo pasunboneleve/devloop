@@ -4,6 +4,13 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-26
+
+### Changed
+
+- Gave Linux and macOS CI distinct required-check names so `main`
+  protection can require both platforms without an ambiguous status.
+
 ### Fixed
 
 - Guard every managed process and hook with a pinned Rust companion and
