@@ -69,9 +69,7 @@ chmod +x "${tmp_dir}/scripts/emit-ready.sh"
 state_path="${tmp_dir}/.devloop/state.json"
 devloop_bin="${repo_root}/target/debug/devloop"
 
-if [[ ! -x "${devloop_bin}" ]]; then
-  (cd "${repo_root}" && cargo build >/dev/null)
-fi
+(cd "${repo_root}" && cargo build --bins >/dev/null)
 
 "${devloop_bin}" run --config "${tmp_dir}/devloop.toml" >"${log_path}" 2>&1 &
 devloop_pid=$!
