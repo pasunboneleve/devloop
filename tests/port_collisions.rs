@@ -1,12 +1,29 @@
 #![cfg(unix)]
 
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process};
 use tempfile::TempDir;
+
+#[test]
+#[ignore]
+fn serve_ephemeral_port() {
+    if std::env::var_os("DEVLOOP_TEST_SERVER_MODE").is_none() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral test server");
+    println!(
+        "listening {}",
+        listener.local_addr().expect("read server address").port()
+    );
+    std::io::stdout().flush().expect("flush server address");
+    loop {
+        let _ = listener.accept().expect("accept test connection");
+    }
+}
 
 #[test]
 fn separate_sessions_can_run_on_distinct_ports() {
@@ -96,7 +113,6 @@ impl SessionFixture {
     fn new(address: SocketAddr) -> Self {
         let dir = tempfile::tempdir().expect("create session fixture");
         let fixture = Self { dir };
-        fixture.copy_server();
         let config = format!(
             r#"root = "."
 state_file = "./.devloop/state.json"
@@ -107,7 +123,7 @@ paths = ["devloop.toml"]
 workflow = "startup"
 
 [process.server]
-command = ["python3", "server.py", "{port}"]
+command = ["devloop-test-command-that-must-not-run"]
 autostart = false
 readiness = {{ kind = "http", url = "http://{address}/", interval_ms = 20, timeout_ms = 5000 }}
 restart = "always"
@@ -118,7 +134,6 @@ steps = [
   {{ action = "wait_for_process", process = "server" }},
 ]
 "#,
-            port = address.port(),
         );
         std::fs::write(fixture.config_path(), config).expect("write session config");
         fixture
@@ -127,8 +142,9 @@ steps = [
     fn ephemeral() -> Self {
         let dir = tempfile::tempdir().expect("create session fixture");
         let fixture = Self { dir };
-        fixture.copy_server();
-        let config = r#"root = "."
+        let test_binary = std::env::current_exe().expect("resolve integration test executable");
+        let config = format!(
+            r#"root = "."
 state_file = "./.devloop/state.json"
 startup_workflows = ["startup"]
 
@@ -137,31 +153,26 @@ paths = ["devloop.toml"]
 workflow = "startup"
 
 [process.server]
-command = ["python3", "server.py", "0"]
+command = ["{test_binary}", "--exact", "serve_ephemeral_port", "--ignored", "--nocapture"]
 autostart = false
-readiness = { kind = "state_key", key = "server_port", interval_ms = 20, timeout_ms = 5000 }
+readiness = {{ kind = "state_key", key = "server_port", interval_ms = 20, timeout_ms = 5000 }}
 restart = "always"
-output = { inherit = false, rules = [{ state_key = "server_port", pattern = "^listening ([0-9]+)$", extract = "regex", capture_group = 1 }] }
+env = {{ DEVLOOP_TEST_SERVER_MODE = "1" }}
+output = {{ inherit = false, rules = [{{ state_key = "server_port", pattern = "^listening ([0-9]+)$", extract = "regex", capture_group = 1 }}] }}
 
 [workflow.startup]
 steps = [
-  { action = "start_process", process = "server" },
-  { action = "wait_for_process", process = "server" },
+  {{ action = "start_process", process = "server" }},
+  {{ action = "wait_for_process", process = "server" }},
 ]
-"#;
+"#,
+            test_binary = test_binary.display()
+        );
         std::fs::write(fixture.config_path(), config).expect("write session config");
         fixture
     }
 
-    fn copy_server(&self) {
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/port-session/server.py"),
-            self.path().join("server.py"),
-        )
-        .expect("copy server fixture");
-    }
-
-    fn path(&self) -> &Path {
+    fn path(&self) -> &std::path::Path {
         self.dir.path()
     }
 
