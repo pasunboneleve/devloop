@@ -4,6 +4,15 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-09-01
+
+### Fixed
+
+- Made startup stop with a clear non-zero error when a managed process's local
+  readiness address is already occupied, without restarting the failed process
+  or disturbing the existing listener. Concurrent sessions remain supported
+  when they use different ports.
+
 ## [0.10.3] - 2026-08-26
 
 ### Fixed

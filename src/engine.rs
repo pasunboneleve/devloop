@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use notify::{
     Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
     Watcher,
@@ -18,9 +18,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::browser_reload::{BrowserReloadSender, BrowserReloadServer, notify_browser_reload};
 use crate::config::{CompiledWatchGroup, CompiledWatchTarget, Config, LogStyle, WatcherKind};
-use crate::core::{RuntimeEffect, RuntimeEvent, RuntimeMachine, WorkflowEffect, WorkflowMachine};
+use crate::core::{
+    RuntimeEffect, RuntimeEvent, RuntimeMachine, WorkflowEffect, WorkflowMachine, WorkflowRunOrigin,
+};
 use crate::external_events::{ExternalEventMessage, ExternalEventServer};
-use crate::processes::ProcessManager;
+use crate::processes::{ManagedAddressInUse, ProcessManager};
 use crate::session_log::SessionLog;
 use crate::state::SessionState;
 use devloop::process_guardian::GuardianExecutable;
@@ -54,7 +56,12 @@ trait RuntimeEffectAdapter {
     async fn start_external_event_server(&mut self) -> Result<()>;
     async fn start_browser_reload_server(&mut self) -> Result<()>;
     async fn start_autostart_processes(&mut self) -> Result<()>;
-    async fn run_workflow(&mut self, workflow_name: &str, changed_files: &[String]) -> Result<()>;
+    async fn run_workflow(
+        &mut self,
+        workflow_name: &str,
+        changed_files: &[String],
+        origin: WorkflowRunOrigin,
+    ) -> Result<()>;
     async fn start_watching(&mut self) -> Result<()>;
     async fn maintain_processes(&mut self) -> Result<()>;
     async fn poll_observed_hook(&mut self, hook: &str) -> Result<bool>;
@@ -67,6 +74,7 @@ struct LiveWorkflowAdapter<'a, 'b> {
     processes: &'a mut ProcessManager<'b>,
     state: &'a SessionState,
     browser_reload_sender: Option<BrowserReloadSender>,
+    restart_after_failed_start: bool,
 }
 
 struct LiveRuntimeAdapter<'a, 'b> {
@@ -223,7 +231,9 @@ impl WorkflowEffectAdapter for LiveWorkflowAdapter<'_, '_> {
     }
 
     async fn wait_for_process(&mut self, process: &str) -> Result<()> {
-        self.processes.wait_for_named(process, self.state).await
+        self.processes
+            .wait_for_named(process, self.state, self.restart_after_failed_start)
+            .await
     }
 
     async fn run_hook(
@@ -302,7 +312,12 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
         self.processes.start_autostart(self.state).await
     }
 
-    async fn run_workflow(&mut self, workflow_name: &str, changed_files: &[String]) -> Result<()> {
+    async fn run_workflow(
+        &mut self,
+        workflow_name: &str,
+        changed_files: &[String],
+        origin: WorkflowRunOrigin,
+    ) -> Result<()> {
         info!("running workflow {}", workflow_name);
         let mut adapter = LiveWorkflowAdapter {
             processes: self.processes,
@@ -311,6 +326,7 @@ impl RuntimeEffectAdapter for LiveRuntimeAdapter<'_, '_> {
                 .browser_reload_server
                 .as_ref()
                 .map(BrowserReloadServer::sender),
+            restart_after_failed_start: origin == WorkflowRunOrigin::Runtime,
         };
         execute_workflow(self.config, &mut adapter, workflow_name, changed_files).await
     }
@@ -409,12 +425,32 @@ async fn execute_runtime_effects<A: RuntimeEffectAdapter>(
             RuntimeEffect::StartBrowserReloadServer => {
                 adapter.start_browser_reload_server().await?
             }
-            RuntimeEffect::StartAutostartProcesses => adapter.start_autostart_processes().await?,
+            RuntimeEffect::StartAutostartProcesses => {
+                if let Err(error) = adapter.start_autostart_processes().await {
+                    adapter
+                        .stop_all_processes()
+                        .await
+                        .context("failed to clean up after autostart failure")?;
+                    return Err(error);
+                }
+            }
             RuntimeEffect::RunWorkflow {
                 workflow_name,
                 changed_files,
+                origin,
             } => {
-                if let Err(error) = adapter.run_workflow(&workflow_name, &changed_files).await {
+                if let Err(error) = adapter
+                    .run_workflow(&workflow_name, &changed_files, origin)
+                    .await
+                {
+                    if origin == WorkflowRunOrigin::Startup
+                        && error.downcast_ref::<ManagedAddressInUse>().is_some()
+                    {
+                        adapter.stop_all_processes().await.with_context(|| {
+                            format!("failed to clean up after startup workflow '{workflow_name}'")
+                        })?;
+                        return Err(error);
+                    }
                     error!(
                         workflow = %workflow_name,
                         error = %workflow_failure_chain(&error),
@@ -496,6 +532,7 @@ async fn run_workflow(
         processes,
         state,
         browser_reload_sender,
+        restart_after_failed_start: true,
     };
     execute_workflow(config, &mut adapter, workflow_name, changed_files).await
 }
@@ -1601,6 +1638,7 @@ mod tests {
         calls: Vec<String>,
         changed_hooks: BTreeMap<String, bool>,
         workflow_errors: BTreeMap<String, String>,
+        workflow_address_conflicts: BTreeSet<String>,
         stop_watching_error: Option<String>,
         watching: bool,
     }
@@ -1611,6 +1649,7 @@ mod tests {
                 calls: Vec::new(),
                 changed_hooks: BTreeMap::new(),
                 workflow_errors: BTreeMap::new(),
+                workflow_address_conflicts: BTreeSet::new(),
                 stop_watching_error: None,
                 watching: false,
             }
@@ -1642,7 +1681,11 @@ mod tests {
             &mut self,
             workflow_name: &str,
             changed_files: &[String],
+            _origin: WorkflowRunOrigin,
         ) -> Result<()> {
+            if self.workflow_address_conflicts.contains(workflow_name) {
+                return Err(ManagedAddressInUse::new("server", "127.0.0.1:8787").into());
+            }
             if let Some(message) = self.workflow_errors.get(workflow_name) {
                 return Err(anyhow!(message.clone()));
             }
@@ -2001,6 +2044,42 @@ mod tests {
 
         assert!(!exit);
         assert_eq!(adapter.calls, vec!["persist:root", "autostart", "watch"]);
+    }
+
+    #[tokio::test]
+    async fn startup_address_collision_stops_and_cleans_up_before_watching() {
+        let config = Config {
+            root: PathBuf::from("."),
+            debounce_ms: 100,
+            watcher: crate::config::WatcherConfig::default(),
+            state_file: Some(PathBuf::from("./state.json")),
+            startup_workflows: vec!["startup".into()],
+            watch: BTreeMap::new(),
+            process: BTreeMap::new(),
+            hook: BTreeMap::new(),
+            event_server: crate::config::EventServerConfig::default(),
+            browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
+            event: BTreeMap::new(),
+            workflow: BTreeMap::new(),
+        };
+        let mut runtime = RuntimeMachine::new(&config);
+        runtime.handle_event(RuntimeEvent::Start {
+            root_display: "/tmp/example".into(),
+            startup_workflows: vec!["startup".into()],
+        });
+        let mut adapter = MockRuntimeAdapter::new();
+        adapter.workflow_address_conflicts.insert("startup".into());
+
+        let error = execute_runtime_effects(&mut runtime, &mut adapter)
+            .await
+            .expect_err("startup collision must stop the runtime");
+
+        assert_eq!(
+            error.to_string(),
+            "process 'server' cannot start: address 127.0.0.1:8787 is already in use"
+        );
+        assert_eq!(adapter.calls, vec!["persist:root", "autostart", "stop_all"]);
+        assert!(!adapter.watching);
     }
 
     #[tokio::test]

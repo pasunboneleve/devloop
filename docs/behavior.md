@@ -43,6 +43,14 @@ When `devloop run` starts, it:
 7. runs each workflow named in `startup_workflows` in order
 8. starts watching the configured `root`
 
+Before starting a managed process with a loopback HTTP readiness probe,
+`devloop` checks whether it can bind that process-owned readiness address. An
+occupied address, including one that is bound but not yet accepting
+connections, stops startup with a non-zero error that names the process and
+address. The colliding session does not enter its restart loop or disturb the
+existing listener. This check is per configured address: concurrent sessions
+and worktrees remain independent when they use different ports.
+
 The in-memory session state is authoritative for the running process.
 Edits made directly to the JSON file while `devloop` is running are not
 merged back into the live session.
@@ -124,7 +132,10 @@ Managed processes are long-running child commands.
   process stops or exits, so a failed dependency cannot leave a stale URL or
   other process-derived value available to later workflows.
 - `restart = "always"` restarts a child after any exit unless
-  `devloop` is shutting down.
+  `devloop` is shutting down. A child that exits while a startup workflow is
+  waiting for its first readiness result is treated as a failed start and is
+  not restarted before that startup failure terminates the session. Later
+  runtime workflows preserve the configured restart policy.
 - `restart = "on_failure"` restarts only after unsuccessful exit.
 - `restart = "never"` never restarts automatically.
 - Restart policies use the managed command's exit status. A wrapper that

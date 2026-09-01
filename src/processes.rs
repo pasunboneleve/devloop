@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -81,6 +83,37 @@ const TERMINAL_OUTPUT_QUEUE_CAPACITY: usize = 256;
 const SESSION_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const GUARDIAN_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+#[derive(Debug)]
+pub(crate) struct ManagedAddressInUse {
+    process: String,
+    address: String,
+}
+
+impl ManagedAddressInUse {
+    pub(crate) fn new(process: &str, address: impl ToString) -> Self {
+        Self {
+            process: process.to_owned(),
+            address: address.to_string(),
+        }
+    }
+}
+
+struct LocalReadinessAddress {
+    display: String,
+    candidates: Vec<SocketAddr>,
+}
+
+impl fmt::Display for ManagedAddressInUse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "process '{}' cannot start: address {} is already in use",
+            self.process, self.address
+        )
+    }
+}
+
+impl std::error::Error for ManagedAddressInUse {}
 
 struct CommandContext<'a> {
     env: &'a BTreeMap<String, String>,
@@ -136,11 +169,19 @@ impl<'a> ProcessManager<'a> {
         if self.shutting_down {
             return Ok(());
         }
+        if self.children.contains_key(name) {
+            return Ok(());
+        }
         let spec = self
             .config
             .process
             .get(name)
             .ok_or_else(|| anyhow!("unknown process '{name}'"))?;
+        if let Some(address) = local_readiness_address(name, spec)?
+            && address_is_occupied(&address)
+        {
+            return Err(ManagedAddressInUse::new(name, address.display).into());
+        }
         self.start(name, spec, state).await
     }
 
@@ -175,7 +216,12 @@ impl<'a> ProcessManager<'a> {
         self.start_named(name, state).await
     }
 
-    pub async fn wait_for_named(&mut self, name: &str, state: &SessionState) -> Result<()> {
+    pub async fn wait_for_named(
+        &mut self,
+        name: &str,
+        state: &SessionState,
+        restart_after_failed_start: bool,
+    ) -> Result<()> {
         let (readiness, output_rules) = self
             .config
             .process
@@ -184,7 +230,7 @@ impl<'a> ProcessManager<'a> {
             .ok_or_else(|| anyhow!("unknown process '{name}'"))?;
         let Some(probe) = readiness else {
             return self
-                .ensure_process_running(name, &output_rules, state)
+                .ensure_process_running(name, &output_rules, state, restart_after_failed_start)
                 .await;
         };
         let probe = expand_probe_env(name, &probe)?;
@@ -196,10 +242,10 @@ impl<'a> ProcessManager<'a> {
         };
         let interval = Duration::from_millis(probe.interval());
         loop {
-            self.ensure_process_running(name, &output_rules, state)
+            self.ensure_process_running(name, &output_rules, state, restart_after_failed_start)
                 .await?;
             if check_probe(&self.client, name, &probe, state).await.is_ok() {
-                self.ensure_process_running(name, &output_rules, state)
+                self.ensure_process_running(name, &output_rules, state, restart_after_failed_start)
                     .await?;
                 return Ok(());
             }
@@ -215,6 +261,7 @@ impl<'a> ProcessManager<'a> {
         name: &str,
         output_rules: &[OutputRule],
         state: &SessionState,
+        restart_after_failed_start: bool,
     ) -> Result<()> {
         let child = self
             .children
@@ -229,13 +276,29 @@ impl<'a> ProcessManager<'a> {
             self.retire_output_state(name, output_rules, state);
             signal_process_group(name, managed.guarded.process_group, Signal::KILL)?;
             self.spawn_output_cleanup(name.to_owned(), managed.output_tasks);
-            let now_ms = self.clock_start.elapsed().as_millis() as u64;
-            for effect in self.supervisor.on_tick(
-                self.config,
-                now_ms,
-                vec![(name.to_owned(), status.success())],
-            ) {
-                self.apply_process_effect(effect, state).await?;
+            let occupied_address = if let Some(spec) = self.config.process.get(name)
+                && let Some(address) = local_readiness_address(name, spec)?
+                && address_is_occupied(&address)
+            {
+                Some(address.display)
+            } else {
+                None
+            };
+            if let Some(address) = occupied_address {
+                self.supervisor.on_process_stopped(name);
+                return Err(ManagedAddressInUse::new(name, address).into());
+            }
+            if restart_after_failed_start {
+                let now_ms = self.clock_start.elapsed().as_millis() as u64;
+                for effect in self.supervisor.on_tick(
+                    self.config,
+                    now_ms,
+                    vec![(name.to_owned(), status.success())],
+                ) {
+                    self.apply_process_effect(effect, state).await?;
+                }
+            } else {
+                self.supervisor.on_process_stopped(name);
             }
             return Err(anyhow!(
                 "process '{name}' exited with {status} before it became ready"
@@ -628,6 +691,59 @@ impl<'a> ProcessManager<'a> {
             );
         }
     }
+}
+
+fn local_readiness_address(
+    name: &str,
+    spec: &ProcessSpec,
+) -> Result<Option<LocalReadinessAddress>> {
+    let Some(readiness) = &spec.readiness else {
+        return Ok(None);
+    };
+    let ProbeSpec::Http { url, .. } = expand_probe_env(name, readiness)? else {
+        return Ok(None);
+    };
+    let url = reqwest::Url::parse(&url)
+        .with_context(|| format!("invalid HTTP readiness URL for process '{name}'"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("HTTP readiness URL for process '{name}' has no port"))?;
+    let Some(host) = url.host_str() else {
+        return Ok(None);
+    };
+    if host == "localhost" {
+        return Ok(Some(LocalReadinessAddress {
+            display: format!("localhost:{port}"),
+            candidates: vec![
+                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port),
+                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
+            ],
+        }));
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip = if let Ok(ip) = host.parse::<IpAddr>()
+        && ip.is_loopback()
+    {
+        ip
+    } else {
+        return Ok(None);
+    };
+    let address = SocketAddr::new(ip, port);
+    Ok(Some(LocalReadinessAddress {
+        display: address.to_string(),
+        candidates: vec![address],
+    }))
+}
+
+fn address_is_occupied(address: &LocalReadinessAddress) -> bool {
+    for candidate in &address.candidates {
+        match TcpListener::bind(candidate) {
+            Ok(listener) => drop(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return true,
+            Err(_) => {}
+        }
+    }
+    false
 }
 
 /// Spawns a managed command behind devloop's internal Rust guardian.
@@ -1966,7 +2082,7 @@ mod tests {
         );
 
         let error = manager
-            .wait_for_named("tunnel", &state)
+            .wait_for_named("tunnel", &state, false)
             .await
             .expect_err("stale state must not imply readiness");
 
@@ -1994,7 +2110,7 @@ mod tests {
                     timeout_ms: 1000,
                 }),
                 liveness: None,
-                restart: crate::config::RestartPolicy::Never,
+                restart: crate::config::RestartPolicy::Always,
                 env: BTreeMap::new(),
                 output: OutputConfig {
                     rules: vec![OutputRule {
@@ -2041,7 +2157,7 @@ mod tests {
         .expect("capture readiness before observing server exit");
 
         let error = manager
-            .wait_for_named("server", &state)
+            .wait_for_named("server", &state, false)
             .await
             .expect_err("exited process must not become ready");
 
@@ -2408,7 +2524,7 @@ exec sleep 600
             .await
             .expect("start process");
         manager
-            .wait_for_named("server", &state)
+            .wait_for_named("server", &state, true)
             .await
             .expect("wait for first process readiness");
         log.fail_for_test(
@@ -2422,7 +2538,7 @@ exec sleep 600
             .expect("restart process");
 
         manager
-            .wait_for_named("server", &state)
+            .wait_for_named("server", &state, true)
             .await
             .expect("wait for restarted process readiness");
         assert!(manager.children.contains_key("server"));

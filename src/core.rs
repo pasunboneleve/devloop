@@ -100,6 +100,7 @@ pub enum RuntimeEffect {
     RunWorkflow {
         workflow_name: String,
         changed_files: Vec<String>,
+        origin: WorkflowRunOrigin,
     },
     StartWatching,
     MaintainProcesses,
@@ -113,6 +114,12 @@ pub enum RuntimeEffect {
     StopWatching,
     StopAllProcesses,
     Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowRunOrigin {
+    Startup,
+    Runtime,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +378,7 @@ impl RuntimeMachine {
                     self.pending_effects.push_back(RuntimeEffect::RunWorkflow {
                         workflow_name,
                         changed_files: Vec::new(),
+                        origin: WorkflowRunOrigin::Startup,
                     });
                 }
                 self.pending_effects.push_back(RuntimeEffect::StartWatching);
@@ -384,6 +392,7 @@ impl RuntimeMachine {
                     self.pending_effects.push_back(RuntimeEffect::RunWorkflow {
                         workflow_name,
                         changed_files,
+                        origin: WorkflowRunOrigin::Runtime,
                     });
                 }
             }
@@ -413,6 +422,7 @@ impl RuntimeMachine {
                 self.pending_effects.push_front(RuntimeEffect::RunWorkflow {
                     workflow_name,
                     changed_files: Vec::new(),
+                    origin: WorkflowRunOrigin::Runtime,
                 });
             }
             RuntimeEvent::CtrlC => {
@@ -827,14 +837,16 @@ mod tests {
             runtime.next_effect(),
             Some(RuntimeEffect::RunWorkflow {
                 workflow_name: "startup".into(),
-                changed_files: Vec::new()
+                changed_files: Vec::new(),
+                origin: WorkflowRunOrigin::Startup,
             })
         );
         assert_eq!(
             runtime.next_effect(),
             Some(RuntimeEffect::RunWorkflow {
                 workflow_name: "publish".into(),
-                changed_files: Vec::new()
+                changed_files: Vec::new(),
+                origin: WorkflowRunOrigin::Startup,
             })
         );
         assert_eq!(runtime.next_effect(), Some(RuntimeEffect::StartWatching));
@@ -890,7 +902,8 @@ mod tests {
             runtime.next_effect(),
             Some(RuntimeEffect::RunWorkflow {
                 workflow_name: "rust".into(),
-                changed_files: vec!["src/main.rs".into()]
+                changed_files: vec!["src/main.rs".into()],
+                origin: WorkflowRunOrigin::Runtime,
             })
         );
         assert_eq!(
@@ -967,6 +980,7 @@ mod tests {
             Some(RuntimeEffect::RunWorkflow {
                 workflow_name: "publish_post_url".into(),
                 changed_files: Vec::new(),
+                origin: WorkflowRunOrigin::Runtime,
             })
         );
         assert_eq!(runtime.next_effect(), None);
