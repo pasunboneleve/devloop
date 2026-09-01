@@ -13,6 +13,7 @@ mod test_support;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -20,7 +21,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Parser as MarkdownParser, Tag, TagEnd,
 };
-use tracing::{Event, Subscriber, error};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::FmtContext;
 use tracing_subscriber::fmt::MakeWriter;
@@ -77,7 +78,17 @@ enum DocsTopic {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run_cli().await {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            eprintln!("devloop: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_cli() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Command::Validate { config } => {
@@ -102,9 +113,9 @@ async fn main() -> Result<()> {
                 .run()
                 .await
             {
-                error!(error = %format!("{error:#}"), "devloop run failed");
+                report_run_failure(&session_log, &error);
                 flush_session_log_before_exit(&session_log).await;
-                return Err(error);
+                return Ok(ExitCode::FAILURE);
             }
             flush_session_log_before_exit(&session_log).await;
         }
@@ -112,7 +123,15 @@ async fn main() -> Result<()> {
             print!("{}", render_docs_text(topic));
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+fn report_run_failure(session_log: &SessionLog, error: &anyhow::Error) {
+    let message = format!("devloop run failed: {error:#}");
+    if let Err(log_error) = session_log.write_labeled_line("devloop", message.as_bytes()) {
+        eprintln!("devloop: failed to persist run failure: {log_error}");
+    }
+    eprintln!("devloop: {message}");
 }
 
 async fn flush_session_log_before_exit(session_log: &SessionLog) {
