@@ -178,6 +178,7 @@ impl Engine {
                         }
                         Some(Err(error)) if is_transient_missing_path_error(
                             self.config.watcher.kind,
+                            &adapter.watched_targets,
                             &error,
                         ) => {
                             warn!(
@@ -695,15 +696,38 @@ fn resolve_watch_registrations(
     }])
 }
 
-fn is_transient_missing_path_error(watcher_kind: WatcherKind, error: &notify::Error) -> bool {
-    if watcher_kind != WatcherKind::Poll {
+fn is_transient_missing_path_error(
+    watcher_kind: WatcherKind,
+    watched_targets: &[CompiledWatchTarget],
+    error: &notify::Error,
+) -> bool {
+    if watcher_kind != WatcherKind::Poll || error.paths.is_empty() {
         return false;
     }
-    match &error.kind {
+    let is_missing = match &error.kind {
         NotifyErrorKind::PathNotFound => true,
         NotifyErrorKind::Io(io_error) => io_error.kind() == std::io::ErrorKind::NotFound,
         _ => false,
-    }
+    };
+    is_missing
+        && error.paths.iter().all(|path| {
+            watched_targets
+                .iter()
+                .any(|target| path_is_transient_target(path, target))
+        })
+}
+
+fn path_is_transient_target(path: &Path, target: &CompiledWatchTarget) -> bool {
+    let matches = |candidate: &Path| {
+        if target.recursive {
+            candidate != target.path && candidate.starts_with(&target.path)
+        } else {
+            candidate == target.path
+        }
+    };
+    matches(path)
+        || private_path_variant(path).is_some_and(|candidate| matches(&candidate))
+        || public_path_variant(path).is_some_and(|candidate| matches(&candidate))
 }
 
 fn is_unrelated_poll_error(
@@ -956,22 +980,63 @@ mod tests {
 
     #[test]
     fn missing_path_watcher_errors_are_transient() {
+        let target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/watched.txt"),
+            recursive: false,
+        };
         let io_error = notify::Error::io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "file disappeared during scan",
-        ));
+        ))
+        .add_path(target.path.clone());
 
         assert!(is_transient_missing_path_error(
             WatcherKind::Poll,
+            std::slice::from_ref(&target),
             &io_error
         ));
         assert!(is_transient_missing_path_error(
             WatcherKind::Poll,
-            &notify::Error::path_not_found()
+            std::slice::from_ref(&target),
+            &notify::Error::path_not_found().add_path(target.path.clone())
         ));
         assert!(!is_transient_missing_path_error(
             WatcherKind::Native,
+            std::slice::from_ref(&target),
             &io_error
+        ));
+    }
+
+    #[test]
+    fn pathless_and_watch_root_missing_errors_remain_fatal() {
+        let literal_target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/watched.txt"),
+            recursive: false,
+        };
+        let recursive_target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/content"),
+            recursive: true,
+        };
+
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&literal_target),
+            &notify::Error::path_not_found()
+        ));
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&literal_target),
+            &notify::Error::path_not_found().add_path(PathBuf::from("/tmp/example"))
+        ));
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&recursive_target),
+            &notify::Error::path_not_found().add_path(recursive_target.path.clone())
+        ));
+        assert!(is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&recursive_target),
+            &notify::Error::path_not_found().add_path(recursive_target.path.join("post.md"))
         ));
     }
 
@@ -982,7 +1047,11 @@ mod tests {
             "permission denied",
         ));
 
-        assert!(!is_transient_missing_path_error(WatcherKind::Poll, &error));
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Poll,
+            &[],
+            &error
+        ));
     }
 
     #[test]
