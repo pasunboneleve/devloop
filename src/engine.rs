@@ -176,10 +176,23 @@ impl Engine {
                                 watch_deadline = Some(Instant::now() + self.config.debounce());
                             }
                         }
-                        Some(Err(error)) if is_transient_missing_path_error(&error) => {
+                        Some(Err(error)) if is_transient_missing_path_error(
+                            self.config.watcher.kind,
+                            &error,
+                        ) => {
                             warn!(
                                 error = %error,
                                 "watched path disappeared during a filesystem scan; continuing"
+                            );
+                        }
+                        Some(Err(error)) if is_unrelated_poll_error(
+                            self.config.watcher.kind,
+                            &adapter.watched_targets,
+                            &error,
+                        ) => {
+                            warn!(
+                                error = %error,
+                                "polling backend reported an error outside configured watch targets; continuing"
                             );
                         }
                         Some(Err(error)) => return Err(error.into()),
@@ -682,12 +695,37 @@ fn resolve_watch_registrations(
     }])
 }
 
-fn is_transient_missing_path_error(error: &notify::Error) -> bool {
+fn is_transient_missing_path_error(watcher_kind: WatcherKind, error: &notify::Error) -> bool {
+    if watcher_kind != WatcherKind::Poll {
+        return false;
+    }
     match &error.kind {
         NotifyErrorKind::PathNotFound => true,
         NotifyErrorKind::Io(io_error) => io_error.kind() == std::io::ErrorKind::NotFound,
         _ => false,
     }
+}
+
+fn is_unrelated_poll_error(
+    watcher_kind: WatcherKind,
+    watched_targets: &[CompiledWatchTarget],
+    error: &notify::Error,
+) -> bool {
+    watcher_kind == WatcherKind::Poll
+        && !error.paths.is_empty()
+        && error.paths.iter().all(|path| {
+            watched_targets
+                .iter()
+                .all(|target| !paths_overlap(path, &target.path))
+        })
+}
+
+fn paths_overlap(path: &Path, target: &Path) -> bool {
+    let overlaps =
+        |candidate: &Path| candidate.starts_with(target) || target.starts_with(candidate);
+    overlaps(path)
+        || private_path_variant(path).is_some_and(|candidate| overlaps(&candidate))
+        || public_path_variant(path).is_some_and(|candidate| overlaps(&candidate))
 }
 
 fn closest_existing_ancestor(path: &Path) -> Result<std::path::PathBuf> {
@@ -923,9 +961,17 @@ mod tests {
             "file disappeared during scan",
         ));
 
-        assert!(is_transient_missing_path_error(&io_error));
         assert!(is_transient_missing_path_error(
+            WatcherKind::Poll,
+            &io_error
+        ));
+        assert!(is_transient_missing_path_error(
+            WatcherKind::Poll,
             &notify::Error::path_not_found()
+        ));
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Native,
+            &io_error
         ));
     }
 
@@ -936,7 +982,47 @@ mod tests {
             "permission denied",
         ));
 
-        assert!(!is_transient_missing_path_error(&error));
+        assert!(!is_transient_missing_path_error(WatcherKind::Poll, &error));
+    }
+
+    #[test]
+    fn polling_errors_for_unrelated_siblings_are_non_fatal() {
+        let target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/watched.txt"),
+            recursive: false,
+        };
+        let unrelated_error = notify::Error::io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+        .add_path(PathBuf::from("/tmp/example/unrelated.txt"));
+
+        assert!(is_unrelated_poll_error(
+            WatcherKind::Poll,
+            &[target],
+            &unrelated_error
+        ));
+    }
+
+    #[test]
+    fn polling_errors_overlapping_a_target_remain_fatal() {
+        let target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/watched.txt"),
+            recursive: false,
+        };
+        for error_path in ["/tmp/example", "/tmp/example/watched.txt"] {
+            let error = notify::Error::io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied",
+            ))
+            .add_path(PathBuf::from(error_path));
+
+            assert!(!is_unrelated_poll_error(
+                WatcherKind::Poll,
+                std::slice::from_ref(&target),
+                &error
+            ));
+        }
     }
 
     #[test]

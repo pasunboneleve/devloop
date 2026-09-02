@@ -71,7 +71,9 @@ watch-group patterns and watches only those files or directories.
 - Literal file targets are watched as narrowly as the backend allows.
   The polling backend scans each file's immediate parent so deleting and
   recreating the file remains observable. A file that disappears during a
-  scan is treated as a transient condition; other watcher errors remain fatal.
+  scan is treated as a transient condition. Errors confined to unconfigured
+  siblings do not widen the watch group's failure boundary; errors overlapping
+  a configured target remain fatal.
   Use a trailing `/` in the config when you mean an explicit directory
   target that should be watched recursively.
 
