@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use notify::{
-    Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
-    Watcher,
+    Config as NotifyConfig, ErrorKind as NotifyErrorKind, Event, EventKind, PollWatcher,
+    RecommendedWatcher, RecursiveMode, Watcher,
     event::{AccessKind, AccessMode},
 };
 use serde_json::{Map, Value};
@@ -170,12 +170,19 @@ impl Engine {
                 }
                 event = rx.recv() => {
                     match event {
-                        Some(result) => {
-                            pending_watch_events.push(result?);
+                        Some(Ok(event)) => {
+                            pending_watch_events.push(event);
                             if watch_deadline.is_none() {
                                 watch_deadline = Some(Instant::now() + self.config.debounce());
                             }
                         }
+                        Some(Err(error)) if is_transient_missing_path_error(&error) => {
+                            warn!(
+                                error = %error,
+                                "watched path disappeared during a filesystem scan; continuing"
+                            );
+                        }
+                        Some(Err(error)) => return Err(error.into()),
                         None => return Err(anyhow!("watcher event channel disconnected")),
                     }
                 }
@@ -645,7 +652,16 @@ fn resolve_watch_registrations(
                 }
                 registrations
             }
-            WatcherKind::Poll => vec![target.clone()],
+            WatcherKind::Poll => target
+                .path
+                .parent()
+                .map(|parent| {
+                    vec![CompiledWatchTarget {
+                        path: parent.to_path_buf(),
+                        recursive: false,
+                    }]
+                })
+                .ok_or_else(|| anyhow!("watch target '{}' has no parent", target.path.display()))?,
         });
     }
 
@@ -664,6 +680,14 @@ fn resolve_watch_registrations(
         path: closest_existing_ancestor(immediate_parent)?,
         recursive: true,
     }])
+}
+
+fn is_transient_missing_path_error(error: &notify::Error) -> bool {
+    match &error.kind {
+        NotifyErrorKind::PathNotFound => true,
+        NotifyErrorKind::Io(io_error) => io_error.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 fn closest_existing_ancestor(path: &Path) -> Result<std::path::PathBuf> {
@@ -869,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_watch_registration_keeps_existing_poll_file_exact() {
+    fn resolve_watch_registration_uses_parent_for_existing_poll_file() {
         let dir = tempdir().expect("tempdir");
         let file = dir.path().join("watched.txt");
         std::fs::write(&file, "hello\n").expect("write watched file");
@@ -886,10 +910,33 @@ mod tests {
         assert_eq!(
             registrations,
             vec![CompiledWatchTarget {
-                path: file,
+                path: dir.path().to_path_buf(),
                 recursive: false,
             }]
         );
+    }
+
+    #[test]
+    fn missing_path_watcher_errors_are_transient() {
+        let io_error = notify::Error::io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file disappeared during scan",
+        ));
+
+        assert!(is_transient_missing_path_error(&io_error));
+        assert!(is_transient_missing_path_error(
+            &notify::Error::path_not_found()
+        ));
+    }
+
+    #[test]
+    fn permission_watcher_errors_remain_fatal() {
+        let error = notify::Error::io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+
+        assert!(!is_transient_missing_path_error(&error));
     }
 
     #[test]
