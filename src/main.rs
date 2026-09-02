@@ -73,6 +73,7 @@ enum Command {
 enum DocsTopic {
     Config,
     Behavior,
+    Artifacts,
     Development,
     Security,
 }
@@ -325,6 +326,7 @@ fn docs_text(topic: DocsTopic) -> &'static str {
     match topic {
         DocsTopic::Config => include_str!("../docs/configuration.md"),
         DocsTopic::Behavior => include_str!("../docs/behavior.md"),
+        DocsTopic::Artifacts => include_str!("../docs/artifacts.md"),
         DocsTopic::Development => include_str!("../docs/development.md"),
         DocsTopic::Security => include_str!("../docs/security.md"),
     }
@@ -660,6 +662,16 @@ mod tests {
 
         assert!(rendered.starts_with("# Development Guide"));
         assert!(rendered.contains("DEVLOOP_RUN_WATCH_FLAKE_SMOKE"));
+    }
+
+    #[test]
+    fn docs_text_exposes_agent_safe_artifact_workflow() {
+        let rendered = docs_text(DocsTopic::Artifacts);
+
+        assert!(rendered.starts_with("# Transactional Artifact Generations"));
+        assert!(rendered.contains("## Agent rule"));
+        assert!(rendered.contains("publish_artifact"));
+        assert!(rendered.contains("DEVLOOP_ARTIFACT_CANDIDATE"));
     }
 
     #[test]

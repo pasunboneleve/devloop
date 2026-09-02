@@ -40,6 +40,11 @@ pub enum WorkflowEffect {
         workflow_name: String,
         changed_files: Vec<String>,
     },
+    PublishArtifact {
+        artifact: String,
+        workflow_name: String,
+        changed_files: Vec<String>,
+    },
     SleepMs {
         duration_ms: u64,
     },
@@ -237,6 +242,13 @@ impl WorkflowMachine {
                 WorkflowStep::RunHook { hook } => {
                     return Ok(Some(WorkflowEffect::RunHook {
                         hook,
+                        workflow_name,
+                        changed_files,
+                    }));
+                }
+                WorkflowStep::PublishArtifact { artifact } => {
+                    return Ok(Some(WorkflowEffect::PublishArtifact {
+                        artifact,
                         workflow_name,
                         changed_files,
                     }));
@@ -628,6 +640,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -673,6 +686,35 @@ mod tests {
             })
         );
         assert_eq!(machine.next_effect(&config).expect("effect"), None);
+    }
+
+    #[test]
+    fn machine_exposes_artifact_publication_as_one_effect() {
+        let mut config = base_config();
+        config.workflow.insert(
+            "site".into(),
+            WorkflowSpec {
+                steps: vec![WorkflowStep::PublishArtifact {
+                    artifact: "site".into(),
+                }],
+                triggers: vec![],
+            },
+        );
+        let changed_files = vec!["src/page.ts".into()];
+        let mut machine = WorkflowMachine::start(&config, Map::new(), "site", &changed_files)
+            .expect("start machine");
+        let _ = machine.next_effect(&config).expect("workflow state effect");
+        let _ = machine.next_effect(&config).expect("changed files effect");
+
+        assert_eq!(
+            machine.next_effect(&config).expect("publication effect"),
+            Some(WorkflowEffect::PublishArtifact {
+                artifact: "site".into(),
+                workflow_name: "site".into(),
+                changed_files,
+            })
+        );
+        assert_eq!(machine.next_effect(&config).expect("complete"), None);
     }
 
     #[test]

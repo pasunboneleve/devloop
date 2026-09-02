@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process_group};
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Stderr, Stdout};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc};
@@ -314,16 +316,31 @@ impl<'a> ProcessManager<'a> {
         changed_files: &[String],
         workflow: &str,
     ) -> Result<()> {
+        self.run_hook_with_env(name, state, changed_files, workflow, &BTreeMap::new())
+            .await
+    }
+
+    async fn run_hook_with_env(
+        &self,
+        name: &str,
+        state: &SessionState,
+        changed_files: &[String],
+        workflow: &str,
+        extra_env: &BTreeMap<String, String>,
+    ) -> Result<()> {
         let spec = self
             .config
             .hook
             .get(name)
             .ok_or_else(|| anyhow!("unknown hook '{name}'"))?;
+        let mut hook_env = spec.env.clone();
+        hook_env.extend(active_artifact_env(self.config, state)?);
+        hook_env.extend(extra_env.clone());
         let command = configure_command(
             &spec.command,
             resolve_cwd(&self.config.root, spec.cwd.as_deref()),
             CommandContext {
-                env: &spec.env,
+                env: &hook_env,
                 external_event_env: self.external_event_env.as_ref(),
                 browser_reload_env: self.browser_reload_env.as_ref(),
                 root: &self.config.root,
@@ -378,6 +395,165 @@ impl<'a> ProcessManager<'a> {
         let stdout = String::from_utf8(stdout)
             .with_context(|| format!("hook '{name}' produced non-utf8 stdout"))?;
         apply_hook_capture(spec, stdout.trim(), state)
+    }
+
+    /// Builds and switches one artifact generation as a single recoverable operation.
+    pub async fn publish_artifact(
+        &mut self,
+        name: &str,
+        state: &SessionState,
+        changed_files: &[String],
+        workflow: &str,
+    ) -> Result<()> {
+        let spec = self
+            .config
+            .artifact
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown artifact '{name}'"))?;
+        let artifact_root = state
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("artifacts")
+            .join(name);
+        std::fs::create_dir_all(&artifact_root).with_context(|| {
+            format!(
+                "failed to create artifact directory {}",
+                artifact_root.display()
+            )
+        })?;
+        let artifact_root = std::fs::canonicalize(&artifact_root).with_context(|| {
+            format!(
+                "failed to resolve absolute artifact directory {}",
+                artifact_root.display()
+            )
+        })?;
+        recover_interrupted_artifact(name, &artifact_root, state)?;
+        remove_candidate_directories(&artifact_root)?;
+
+        let generation = new_artifact_generation()?;
+        let candidate = artifact_root.join(format!(".candidate-{generation}"));
+        let published = artifact_root.join(&generation);
+        std::fs::create_dir(&candidate).with_context(|| {
+            format!(
+                "failed to create artifact candidate {}",
+                candidate.display()
+            )
+        })?;
+
+        let env_name = artifact_env_name(name);
+        let build_env = BTreeMap::from([
+            ("DEVLOOP_ARTIFACT".into(), name.to_owned()),
+            ("DEVLOOP_ARTIFACT_GENERATION".into(), generation.clone()),
+            (
+                "DEVLOOP_ARTIFACT_CANDIDATE".into(),
+                candidate.to_string_lossy().into_owned(),
+            ),
+            (
+                format!("DEVLOOP_ARTIFACT_{env_name}_GENERATION"),
+                generation.clone(),
+            ),
+            (
+                format!("DEVLOOP_ARTIFACT_{env_name}_DIR"),
+                candidate.to_string_lossy().into_owned(),
+            ),
+        ]);
+        if let Err(error) = self
+            .run_hook_with_env(&spec.build_hook, state, changed_files, workflow, &build_env)
+            .await
+        {
+            let _ = std::fs::remove_dir_all(&candidate);
+            return Err(error.context(format!(
+                "failed to build candidate generation for artifact '{name}'"
+            )));
+        }
+        std::fs::rename(&candidate, &published).with_context(|| {
+            format!(
+                "failed to publish artifact candidate {} as {}",
+                candidate.display(),
+                published.display()
+            )
+        })?;
+
+        let generation_key = artifact_generation_key(name);
+        let path_key = artifact_path_key(name);
+        let switching_key = artifact_switching_key(name);
+        let rollback_generation_key = artifact_rollback_generation_key(name);
+        let rollback_path_key = artifact_rollback_path_key(name);
+        let previous_generation = state.get_string(&generation_key)?;
+        let previous_path = state.get_string(&path_key)?;
+        state.merge_json_object(serde_json::Map::from_iter([
+            (generation_key.clone(), Value::String(generation.clone())),
+            (
+                path_key.clone(),
+                Value::String(published.to_string_lossy().into_owned()),
+            ),
+            (switching_key, Value::String(generation.clone())),
+            (
+                rollback_generation_key,
+                Value::String(previous_generation.clone().unwrap_or_default()),
+            ),
+            (
+                rollback_path_key,
+                Value::String(previous_path.clone().unwrap_or_default()),
+            ),
+        ]))?;
+
+        let switch_result = async {
+            for consumer in &spec.consumers {
+                self.restart_named(consumer, state).await?;
+            }
+            for consumer in &spec.consumers {
+                self.wait_for_named(consumer, state, false).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(error) = switch_result {
+            restore_state_value(state, &generation_key, previous_generation.as_deref())?;
+            restore_state_value(state, &path_key, previous_path.as_deref())?;
+            let mut rollback_failures = Vec::new();
+            for consumer in &spec.consumers {
+                let rollback = if previous_generation.is_some() {
+                    async {
+                        self.restart_named(consumer, state).await?;
+                        self.wait_for_named(consumer, state, false).await
+                    }
+                    .await
+                } else {
+                    self.stop_named(consumer, state).await
+                };
+                if let Err(rollback_error) = rollback {
+                    rollback_failures.push(format!("{consumer}: {rollback_error:#}"));
+                }
+            }
+            if !rollback_failures.is_empty() {
+                return Err(error.context(format!(
+                    "artifact '{name}' generation {generation} did not become ready; rollback failed and the rejected generation was preserved for recovery: {}",
+                    rollback_failures.join("; ")
+                )));
+            }
+            clear_artifact_switch(state, name)?;
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&published) {
+                warn!(
+                    "artifact {name} rolled back, but rejected generation cleanup failed: {cleanup_error}"
+                );
+            }
+            return Err(error.context(format!(
+                "artifact '{name}' generation {generation} did not become ready; restored previous generation"
+            )));
+        }
+
+        clear_artifact_switch(state, name)?;
+        if let Err(error) = retain_artifact_generations(&artifact_root, &generation, spec.retain) {
+            warn!(
+                "artifact {name} generation {generation} is active, but old-generation cleanup failed: {error:#}"
+            );
+        }
+        info!("published artifact {name} generation {generation}");
+        Ok(())
     }
 
     pub async fn run_observed_hook(
@@ -532,11 +708,13 @@ impl<'a> ProcessManager<'a> {
         }
         let output_generation =
             self.next_output_state_generation(name, &spec.output.rules, state)?;
+        let mut process_env = spec.env.clone();
+        process_env.extend(active_artifact_env(self.config, state)?);
         let command = configure_command(
             &spec.command,
             resolve_cwd(&self.config.root, spec.cwd.as_deref()),
             CommandContext {
-                env: &spec.env,
+                env: &process_env,
                 external_event_env: self.external_event_env.as_ref(),
                 browser_reload_env: self.browser_reload_env.as_ref(),
                 root: &self.config.root,
@@ -1657,6 +1835,164 @@ fn configure_command(
     Ok(cmd)
 }
 
+fn artifact_generation_key(name: &str) -> String {
+    format!("artifact.{name}.generation")
+}
+
+fn artifact_path_key(name: &str) -> String {
+    format!("artifact.{name}.path")
+}
+
+fn artifact_switching_key(name: &str) -> String {
+    format!("artifact.{name}.switching_generation")
+}
+
+fn artifact_rollback_generation_key(name: &str) -> String {
+    format!("artifact.{name}.rollback_generation")
+}
+
+fn artifact_rollback_path_key(name: &str) -> String {
+    format!("artifact.{name}.rollback_path")
+}
+
+fn validate_generation_component(generation: &str) -> Result<()> {
+    if generation.is_empty()
+        || !generation
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err(anyhow!("invalid persisted artifact generation identifier"));
+    }
+    Ok(())
+}
+
+fn artifact_env_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn active_artifact_env(config: &Config, state: &SessionState) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for name in config.artifact.keys() {
+        let Some(generation) = state.get_string(&artifact_generation_key(name))? else {
+            continue;
+        };
+        let Some(path) = state.get_string(&artifact_path_key(name))? else {
+            continue;
+        };
+        let name = artifact_env_name(name);
+        env.insert(format!("DEVLOOP_ARTIFACT_{name}_GENERATION"), generation);
+        env.insert(format!("DEVLOOP_ARTIFACT_{name}_DIR"), path);
+    }
+    Ok(env)
+}
+
+fn new_artifact_generation() -> Result<String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis();
+    Ok(format!("{millis}-{:08x}", rand::random::<u32>()))
+}
+
+fn restore_state_value(state: &SessionState, key: &str, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(value) => state.set(key, Value::String(value.to_owned())),
+        None => state.remove(key),
+    }
+}
+
+fn clear_artifact_switch(state: &SessionState, name: &str) -> Result<()> {
+    state.remove(&artifact_switching_key(name))?;
+    state.remove(&artifact_rollback_generation_key(name))?;
+    state.remove(&artifact_rollback_path_key(name))
+}
+
+fn recover_interrupted_artifact(name: &str, root: &Path, state: &SessionState) -> Result<()> {
+    let Some(interrupted) = state.get_string(&artifact_switching_key(name))? else {
+        return Ok(());
+    };
+    validate_generation_component(&interrupted)?;
+    let rollback_generation = state
+        .get_string(&artifact_rollback_generation_key(name))?
+        .filter(|value| !value.is_empty());
+    let rollback_path = state
+        .get_string(&artifact_rollback_path_key(name))?
+        .filter(|value| !value.is_empty());
+    restore_state_value(
+        state,
+        &artifact_generation_key(name),
+        rollback_generation.as_deref(),
+    )?;
+    restore_state_value(state, &artifact_path_key(name), rollback_path.as_deref())?;
+    clear_artifact_switch(state, name)?;
+    let interrupted_path = root.join(&interrupted);
+    if interrupted_path.exists() {
+        std::fs::remove_dir_all(&interrupted_path).with_context(|| {
+            format!(
+                "failed to remove interrupted artifact generation {}",
+                interrupted_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn remove_candidate_directories(root: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("failed to inspect artifact directory {}", root.display()))?
+    {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".candidate-")
+        {
+            std::fs::remove_dir_all(entry.path()).with_context(|| {
+                format!(
+                    "failed to remove stale candidate {}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn retain_artifact_generations(root: &Path, active: &str, retain: usize) -> Result<()> {
+    let mut generations = std::fs::read_dir(root)
+        .with_context(|| format!("failed to inspect artifact directory {}", root.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (!name.starts_with('.')).then_some((name, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    generations.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut kept_others = 0;
+    let other_limit = retain.saturating_sub(1);
+    for (generation, path) in generations {
+        if generation == active {
+            continue;
+        }
+        if kept_others < other_limit {
+            kept_others += 1;
+            continue;
+        }
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("failed to remove old generation {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn resolve_program(root: &Path, program: &str) -> PathBuf {
     let path = Path::new(program);
     if path.is_absolute() || path.components().count() == 1 {
@@ -1806,10 +2142,12 @@ fn expand_probe_env(process: &str, probe: &ProbeSpec) -> Result<ProbeSpec> {
     match probe {
         ProbeSpec::Http {
             url,
+            expect_body,
             interval_ms,
             timeout_ms,
         } => Ok(ProbeSpec::Http {
             url: env_expand::expand_value(url, &format!("process '{process}' http probe url"))?,
+            expect_body: expect_body.clone(),
             interval_ms: *interval_ms,
             timeout_ms: *timeout_ms,
         }),
@@ -1834,6 +2172,7 @@ async fn check_probe(
     match probe {
         ProbeSpec::Http {
             url,
+            expect_body,
             interval_ms,
             timeout_ms,
         } => match client
@@ -1843,6 +2182,21 @@ async fn check_probe(
             .await
         {
             Ok(response) if response.status().is_success() => {
+                if let Some(expected) = expect_body {
+                    let expected =
+                        crate::state::render_template_values(&state.snapshot()?, expected)?;
+                    let actual = response
+                        .text()
+                        .await
+                        .with_context(|| format!("failed to read probe body for '{name}'"))?;
+                    if actual.trim() != expected {
+                        return Err(anyhow!(
+                            "probe for '{name}' at {url} returned generation body {:?}, expected {:?}",
+                            actual.trim(),
+                            expected
+                        ));
+                    }
+                }
                 info!("process {} is healthy at {}", name, url);
                 Ok(())
             }
@@ -1889,6 +2243,7 @@ mod tests {
     use crate::test_support::{EnvVarGuard, RustLogGuard};
     use rustix::process::test_kill_process;
     use serde_json::Value;
+    use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1907,6 +2262,24 @@ mod tests {
         std::env::temp_dir().join(format!("devloop-process-state-{unique}-{sequence}.json"))
     }
 
+    fn serve_probe_body(body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe server");
+        let address = listener.local_addr().expect("probe address");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept probe request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write probe response");
+        });
+        format!("http://{address}/generation")
+    }
+
     fn test_config(root: &Path) -> Config {
         Config {
             root: root.to_path_buf(),
@@ -1917,6 +2290,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -3582,6 +3956,188 @@ exec sleep 600
         std::fs::remove_file(state_path).expect("cleanup state file");
     }
 
+    #[tokio::test]
+    async fn http_probe_rejects_a_different_artifact_generation() {
+        let state_path = unique_state_path();
+        let state = SessionState::load(state_path.clone()).expect("load state");
+        state
+            .set("artifact.site.generation", Value::String("new".into()))
+            .expect("set generation");
+        let probe = ProbeSpec::Http {
+            url: serve_probe_body("old"),
+            expect_body: Some("{{ artifact.site.generation }}".into()),
+            interval_ms: 100,
+            timeout_ms: 1000,
+        };
+
+        let error = check_probe(&reqwest::Client::new(), "site", &probe, &state)
+            .await
+            .expect_err("stale generation must not be ready");
+
+        assert!(error.to_string().contains("expected \"new\""));
+        std::fs::remove_file(state_path).expect("cleanup state file");
+    }
+
+    #[tokio::test]
+    async fn failed_artifact_build_preserves_active_generation() {
+        use crate::config::{ArtifactSpec, HookOutputConfig, HookSpec};
+
+        let directory = tempdir().expect("artifact fixture");
+        let state_path = directory.path().join("state.json");
+        let state = SessionState::load(state_path).expect("load state");
+        state
+            .merge_json_object(serde_json::Map::from_iter([
+                (
+                    "artifact.site.generation".into(),
+                    Value::String("old".into()),
+                ),
+                (
+                    "artifact.site.path".into(),
+                    Value::String(directory.path().join("old").to_string_lossy().into_owned()),
+                ),
+            ]))
+            .expect("seed active generation");
+        let mut config = test_config(directory.path());
+        config.hook.insert(
+            "build".into(),
+            HookSpec {
+                command: vec!["sh".into(), "-c".into(), "exit 23".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                output: HookOutputConfig::default(),
+                capture: None,
+                state_key: None,
+                observe: None,
+            },
+        );
+        config.artifact.insert(
+            "site".into(),
+            ArtifactSpec {
+                build_hook: "build".into(),
+                consumers: vec!["unused".into()],
+                retain: 2,
+            },
+        );
+        let mut manager =
+            ProcessManager::new(&config, GuardianExecutable::open().expect("open guardian"));
+
+        manager
+            .publish_artifact("site", &state, &[], "build")
+            .await
+            .expect_err("failed build must fail publication");
+
+        assert_eq!(
+            state
+                .get_string("artifact.site.generation")
+                .expect("read generation")
+                .as_deref(),
+            Some("old")
+        );
+        let artifact_root = directory.path().join("artifacts/site");
+        assert!(
+            std::fs::read_dir(artifact_root)
+                .expect("read artifact root")
+                .next()
+                .is_none(),
+            "failed candidate should be removed"
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_stale_candidates_and_bounds_successful_generations() {
+        let directory = tempdir().expect("artifact fixture");
+        for generation in ["100-a", "200-b", "300-c", ".candidate-crash"] {
+            std::fs::create_dir(directory.path().join(generation)).expect("create generation");
+        }
+
+        remove_candidate_directories(directory.path()).expect("remove stale candidate");
+        retain_artifact_generations(directory.path(), "300-c", 2).expect("retain generations");
+
+        assert!(!directory.path().join(".candidate-crash").exists());
+        assert!(!directory.path().join("100-a").exists());
+        assert!(directory.path().join("200-b").exists());
+        assert!(directory.path().join("300-c").exists());
+    }
+
+    #[test]
+    fn retention_counts_an_older_active_generation_toward_the_limit() {
+        let directory = tempdir().expect("artifact fixture");
+        for generation in ["100-active", "200-b", "300-c"] {
+            std::fs::create_dir(directory.path().join(generation)).expect("create generation");
+        }
+
+        retain_artifact_generations(directory.path(), "100-active", 2).expect("retain generations");
+
+        assert!(directory.path().join("100-active").exists());
+        assert!(!directory.path().join("200-b").exists());
+        assert!(directory.path().join("300-c").exists());
+    }
+
+    #[test]
+    fn recovery_restores_previous_generation_without_leaving_artifact_root() {
+        let directory = tempdir().expect("artifact fixture");
+        let artifact_root = directory.path().join("artifacts/site");
+        std::fs::create_dir_all(artifact_root.join("300-c")).expect("create interrupted output");
+        let state = SessionState::load(directory.path().join("state.json")).expect("load state");
+        state
+            .merge_json_object(serde_json::Map::from_iter([
+                (
+                    "artifact.site.generation".into(),
+                    Value::String("300-c".into()),
+                ),
+                (
+                    "artifact.site.path".into(),
+                    Value::String(artifact_root.join("300-c").to_string_lossy().into_owned()),
+                ),
+                (
+                    "artifact.site.switching_generation".into(),
+                    Value::String("300-c".into()),
+                ),
+                (
+                    "artifact.site.rollback_generation".into(),
+                    Value::String("200-b".into()),
+                ),
+                (
+                    "artifact.site.rollback_path".into(),
+                    Value::String(artifact_root.join("200-b").to_string_lossy().into_owned()),
+                ),
+            ]))
+            .expect("seed interrupted switch");
+
+        recover_interrupted_artifact("site", &artifact_root, &state)
+            .expect("recover interrupted switch");
+
+        assert_eq!(
+            state
+                .get_string("artifact.site.generation")
+                .expect("read generation")
+                .as_deref(),
+            Some("200-b")
+        );
+        assert!(!artifact_root.join("300-c").exists());
+        assert_eq!(
+            state
+                .get_string("artifact.site.switching_generation")
+                .expect("read switch marker"),
+            None
+        );
+
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&outside).expect("create outside directory");
+        state
+            .set(
+                "artifact.site.switching_generation",
+                Value::String("../outside".into()),
+            )
+            .expect("seed malicious marker");
+        recover_interrupted_artifact("site", &artifact_root, &state)
+            .expect_err("path-like generation must be rejected");
+        assert!(
+            outside.exists(),
+            "recovery must remain inside artifact root"
+        );
+    }
+
     #[test]
     fn expands_http_probe_urls_from_parent_env() {
         let _guard = EnvVarGuard::set("CONTAINER_PORT", Some("18080"));
@@ -3590,6 +4146,7 @@ exec sleep 600
             "server",
             &ProbeSpec::Http {
                 url: "http://127.0.0.1:$CONTAINER_PORT/".into(),
+                expect_body: None,
                 interval_ms: 100,
                 timeout_ms: 1000,
             },

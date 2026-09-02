@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub hook: BTreeMap<String, HookSpec>,
     #[serde(default)]
+    pub artifact: BTreeMap<String, ArtifactSpec>,
+    #[serde(default)]
     pub event_server: EventServerConfig,
     #[serde(default)]
     pub browser_reload_server: BrowserReloadServerConfig,
@@ -36,7 +38,14 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .context("failed to resolve current directory for config path")?
+                .join(path)
+        };
+        let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config at {}", path.display()))?;
         let mut config: Config = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config at {}", path.display()))?;
@@ -91,6 +100,11 @@ impl Config {
                     observe.workflow
                 ));
             }
+        }
+        for (name, artifact) in &self.artifact {
+            artifact
+                .validate(self, name)
+                .with_context(|| format!("invalid artifact '{name}'"))?;
         }
         self.event_server.validate()?;
         self.browser_reload_server.validate()?;
@@ -379,6 +393,8 @@ impl ProcessSpec {
 pub enum ProbeSpec {
     Http {
         url: String,
+        /// Optional exact response body required for a successful probe.
+        expect_body: Option<String>,
         #[serde(default = "default_interval_ms")]
         interval_ms: u64,
         #[serde(default = "default_timeout_ms")]
@@ -506,6 +522,72 @@ pub struct HookSpec {
     pub state_key: Option<String>,
     #[serde(default)]
     pub observe: Option<ObservedHookSpec>,
+}
+
+/// One independently built output whose consumers must switch generations atomically.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactSpec {
+    pub build_hook: String,
+    pub consumers: Vec<String>,
+    #[serde(default = "default_artifact_retention")]
+    pub retain: usize,
+}
+
+impl ArtifactSpec {
+    fn validate(&self, config: &Config, artifact_name: &str) -> Result<()> {
+        if artifact_name.is_empty()
+            || !artifact_name
+                .chars()
+                .enumerate()
+                .all(|(index, character)| match index {
+                    0 => character.is_ascii_lowercase(),
+                    _ => {
+                        character.is_ascii_lowercase()
+                            || character.is_ascii_digit()
+                            || character == '_'
+                    }
+                })
+        {
+            return Err(anyhow!(
+                "artifact name must start with a lowercase letter and contain only lowercase letters, digits, and underscores"
+            ));
+        }
+        if !config.hook.contains_key(&self.build_hook) {
+            return Err(anyhow!(
+                "artifact references missing build hook '{}'",
+                self.build_hook
+            ));
+        }
+        if self.consumers.is_empty() {
+            return Err(anyhow!("artifact must define at least one consumer"));
+        }
+        if self.retain == 0 {
+            return Err(anyhow!("artifact retain must be greater than zero"));
+        }
+        let expected = format!("{{{{ artifact.{artifact_name}.generation }}}}");
+        for consumer in &self.consumers {
+            let process = config.process.get(consumer).ok_or_else(|| {
+                anyhow!("artifact references missing consumer process '{consumer}'")
+            })?;
+            if process.autostart {
+                return Err(anyhow!(
+                    "artifact consumer process '{consumer}' must set autostart = false so interrupted switches recover before process start"
+                ));
+            }
+            match process.readiness.as_ref() {
+                Some(ProbeSpec::Http {
+                    expect_body: Some(body),
+                    ..
+                }) if body == &expected => {}
+                _ => {
+                    return Err(anyhow!(
+                        "consumer process '{consumer}' must use exact generation readiness with expect_body = '{expected}'"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -687,6 +769,11 @@ impl WorkflowSpec {
                         return Err(anyhow!("workflow references missing hook '{hook}'"));
                     }
                 }
+                WorkflowStep::PublishArtifact { artifact } => {
+                    if !config.artifact.contains_key(artifact) {
+                        return Err(anyhow!("workflow references missing artifact '{artifact}'"));
+                    }
+                }
                 WorkflowStep::RunWorkflow { workflow } => {
                     validate_nested_workflow(config, stack, workflow)?;
                 }
@@ -804,6 +891,9 @@ pub enum WorkflowStep {
     RunHook {
         hook: String,
     },
+    PublishArtifact {
+        artifact: String,
+    },
     RunWorkflow {
         workflow: String,
     },
@@ -877,6 +967,10 @@ fn default_observe_interval_ms() -> u64 {
     1_000
 }
 
+fn default_artifact_retention() -> usize {
+    2
+}
+
 fn default_event_server_bind() -> String {
     "127.0.0.1:0".to_string()
 }
@@ -893,6 +987,35 @@ fn normalize_path_buf(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
+    const ARTIFACT_CONFIG: &str = r#"
+root = "."
+startup_workflows = ["build_site"]
+
+[watch.site]
+paths = ["src/**"]
+workflow = "build_site"
+
+[hook.build_site]
+command = ["sh", "-c", "mkdir -p \"$DEVLOOP_ARTIFACT_CANDIDATE\" && printf built > \"$DEVLOOP_ARTIFACT_CANDIDATE/index.html\""]
+
+[process.site]
+command = ["serve-site"]
+autostart = false
+readiness = { kind = "http", url = "http://127.0.0.1:8787/__devloop_generation", expect_body = "{{ artifact.site.generation }}" }
+
+[artifact.site]
+build_hook = "build_site"
+consumers = ["site"]
+retain = 2
+
+[workflow.build_site]
+steps = [{ action = "publish_artifact", artifact = "site" }]
+triggers = ["browser_reload"]
+
+[workflow.browser_reload]
+steps = [{ action = "notify_reload" }]
+"#;
+
     fn base_config() -> Config {
         Config {
             root: PathBuf::from("."),
@@ -903,11 +1026,74 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: EventServerConfig::default(),
             browser_reload_server: BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
             workflow: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn accepts_atomic_artifact_publication_contract() {
+        let config: Config = toml::from_str(ARTIFACT_CONFIG).expect("parse artifact config");
+
+        config
+            .validate()
+            .expect("complete artifact publication contract should validate");
+    }
+
+    #[test]
+    fn rejects_artifact_consumer_without_exact_generation_readiness() {
+        let raw = ARTIFACT_CONFIG.replace(
+            "readiness = { kind = \"http\", url = \"http://127.0.0.1:8787/__devloop_generation\", expect_body = \"{{ artifact.site.generation }}\" }",
+            "readiness = { kind = \"http\", url = \"http://127.0.0.1:8787/\" }",
+        );
+        let config: Config = toml::from_str(&raw).expect("parse artifact config");
+
+        let error = config
+            .validate()
+            .expect_err("status-only readiness must not guard artifact promotion");
+        assert!(
+            format!("{error:#}").contains("exact generation readiness"),
+            "unexpected validation error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_exposed_artifact_lifecycle_steps() {
+        let raw = ARTIFACT_CONFIG.replace(
+            "{ action = \"publish_artifact\", artifact = \"site\" }",
+            "{ action = \"prepare_artifact\", artifact = \"site\" }, { action = \"promote_artifact\", artifact = \"site\" }",
+        );
+
+        let error = toml::from_str::<Config>(&raw)
+            .expect_err("partial lifecycle actions must not be part of the public API");
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn rejects_artifact_names_that_are_not_safe_path_components() {
+        let raw = ARTIFACT_CONFIG.replace("[artifact.site]", "[artifact.'..']");
+        let config: Config = toml::from_str(&raw).expect("parse unsafe artifact config");
+
+        let error = config
+            .validate()
+            .expect_err("unsafe artifact name must fail validation");
+
+        assert!(format!("{error:#}").contains("artifact name must start"));
+    }
+
+    #[test]
+    fn rejects_autostart_artifact_consumers() {
+        let raw = ARTIFACT_CONFIG.replace("autostart = false", "autostart = true");
+        let config: Config = toml::from_str(&raw).expect("parse autostart artifact config");
+
+        let error = config
+            .validate()
+            .expect_err("artifact consumer must not start before recovery");
+
+        assert!(format!("{error:#}").contains("must set autostart = false"));
     }
 
     #[test]

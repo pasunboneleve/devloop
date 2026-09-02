@@ -100,11 +100,31 @@ Workflows run step by step, in order.
   emitting output.
 - `notify_reload` broadcasts a generic `reload` event to browser
   listeners connected to `devloop`'s browser reload event stream.
+- `publish_artifact` is one atomic workflow effect. The engine does not expose
+  partial preparation or promotion steps.
 
 If any step fails, that workflow fails immediately and logs the error
 loudly, but `devloop` itself keeps running so later file changes or
 external events can retry the workflow without restarting the
 supervisor.
+
+## Artifact publication
+
+Artifact publication isolates destructive builds from live consumers. A build
+failure deletes only its private candidate. A successful build becomes a named
+generation, then devloop changes the active session state and restarts the
+declared consumers. HTTP readiness succeeds only when its response body equals
+the active generation. A mismatch or consumer failure restores the previous
+state and process generation before the workflow reports failure.
+
+Interrupted candidates are removed at the next publication. Successful
+generations are retained newest-first according to the artifact's `retain`
+limit. Cleanup failure after a ready switch is logged without failing the
+already committed publication. Browser reload belongs in a triggered workflow, so clients are notified
+only after exact-generation readiness succeeds.
+
+See [Transactional Artifact Generations](artifacts.md) for the agent-facing
+configuration and environment contract.
 
 ## Processes
 

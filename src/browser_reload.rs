@@ -141,6 +141,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: EventServerConfig::default(),
             browser_reload_server: BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
