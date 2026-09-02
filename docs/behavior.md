@@ -69,6 +69,11 @@ watch-group patterns and watches only those files or directories.
   backend can be selected in config as a fallback for environments
   where native events are unreliable.
 - Literal file targets are watched as narrowly as the backend allows.
+  The polling backend scans each file's immediate parent so deleting and
+  recreating the file remains observable. A configured file, or a child beneath
+  a recursive target, that disappears during a scan is transient. Pathless and
+  registered-root errors remain fatal. Errors confined to unconfigured siblings
+  do not widen the watch group's failure boundary.
   Use a trailing `/` in the config when you mean an explicit directory
   target that should be watched recursively.
 

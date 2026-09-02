@@ -4,6 +4,13 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-09-02
+
+### Fixed
+
+- Kept polling sessions alive when a watched file is deleted, while preserving
+  delete-and-recreate events and leaving non-transient watcher errors fatal.
+
 ## [0.10.4] - 2026-09-01
 
 ### Fixed

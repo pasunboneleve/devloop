@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use notify::{
-    Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
-    Watcher,
+    Config as NotifyConfig, ErrorKind as NotifyErrorKind, Event, EventKind, PollWatcher,
+    RecommendedWatcher, RecursiveMode, Watcher,
     event::{AccessKind, AccessMode},
 };
 use serde_json::{Map, Value};
@@ -170,12 +170,33 @@ impl Engine {
                 }
                 event = rx.recv() => {
                     match event {
-                        Some(result) => {
-                            pending_watch_events.push(result?);
+                        Some(Ok(event)) => {
+                            pending_watch_events.push(event);
                             if watch_deadline.is_none() {
                                 watch_deadline = Some(Instant::now() + self.config.debounce());
                             }
                         }
+                        Some(Err(error)) if is_transient_missing_path_error(
+                            self.config.watcher.kind,
+                            &adapter.watched_targets,
+                            &error,
+                        ) => {
+                            warn!(
+                                error = %error,
+                                "watched path disappeared during a filesystem scan; continuing"
+                            );
+                        }
+                        Some(Err(error)) if is_unrelated_poll_error(
+                            self.config.watcher.kind,
+                            &adapter.watched_targets,
+                            &error,
+                        ) => {
+                            warn!(
+                                error = %error,
+                                "polling backend reported an error outside configured watch targets; continuing"
+                            );
+                        }
+                        Some(Err(error)) => return Err(error.into()),
                         None => return Err(anyhow!("watcher event channel disconnected")),
                     }
                 }
@@ -645,7 +666,16 @@ fn resolve_watch_registrations(
                 }
                 registrations
             }
-            WatcherKind::Poll => vec![target.clone()],
+            WatcherKind::Poll => target
+                .path
+                .parent()
+                .map(|parent| {
+                    vec![CompiledWatchTarget {
+                        path: parent.to_path_buf(),
+                        recursive: false,
+                    }]
+                })
+                .ok_or_else(|| anyhow!("watch target '{}' has no parent", target.path.display()))?,
         });
     }
 
@@ -664,6 +694,62 @@ fn resolve_watch_registrations(
         path: closest_existing_ancestor(immediate_parent)?,
         recursive: true,
     }])
+}
+
+fn is_transient_missing_path_error(
+    watcher_kind: WatcherKind,
+    watched_targets: &[CompiledWatchTarget],
+    error: &notify::Error,
+) -> bool {
+    if watcher_kind != WatcherKind::Poll || error.paths.is_empty() {
+        return false;
+    }
+    let is_missing = match &error.kind {
+        NotifyErrorKind::PathNotFound => true,
+        NotifyErrorKind::Io(io_error) => io_error.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    };
+    is_missing
+        && error.paths.iter().all(|path| {
+            watched_targets
+                .iter()
+                .any(|target| path_is_transient_target(path, target))
+        })
+}
+
+fn path_is_transient_target(path: &Path, target: &CompiledWatchTarget) -> bool {
+    let matches = |candidate: &Path| {
+        if target.recursive {
+            candidate != target.path && candidate.starts_with(&target.path)
+        } else {
+            candidate == target.path
+        }
+    };
+    matches(path)
+        || private_path_variant(path).is_some_and(|candidate| matches(&candidate))
+        || public_path_variant(path).is_some_and(|candidate| matches(&candidate))
+}
+
+fn is_unrelated_poll_error(
+    watcher_kind: WatcherKind,
+    watched_targets: &[CompiledWatchTarget],
+    error: &notify::Error,
+) -> bool {
+    watcher_kind == WatcherKind::Poll
+        && !error.paths.is_empty()
+        && error.paths.iter().all(|path| {
+            watched_targets
+                .iter()
+                .all(|target| !paths_overlap(path, &target.path))
+        })
+}
+
+fn paths_overlap(path: &Path, target: &Path) -> bool {
+    let overlaps =
+        |candidate: &Path| candidate.starts_with(target) || target.starts_with(candidate);
+    overlaps(path)
+        || private_path_variant(path).is_some_and(|candidate| overlaps(&candidate))
+        || public_path_variant(path).is_some_and(|candidate| overlaps(&candidate))
 }
 
 fn closest_existing_ancestor(path: &Path) -> Result<std::path::PathBuf> {
@@ -869,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_watch_registration_keeps_existing_poll_file_exact() {
+    fn resolve_watch_registration_uses_parent_for_existing_poll_file() {
         let dir = tempdir().expect("tempdir");
         let file = dir.path().join("watched.txt");
         std::fs::write(&file, "hello\n").expect("write watched file");
@@ -886,10 +972,126 @@ mod tests {
         assert_eq!(
             registrations,
             vec![CompiledWatchTarget {
-                path: file,
+                path: dir.path().to_path_buf(),
                 recursive: false,
             }]
         );
+    }
+
+    #[test]
+    fn missing_path_watcher_errors_are_transient() {
+        let target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/watched.txt"),
+            recursive: false,
+        };
+        let io_error = notify::Error::io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file disappeared during scan",
+        ))
+        .add_path(target.path.clone());
+
+        assert!(is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&target),
+            &io_error
+        ));
+        assert!(is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&target),
+            &notify::Error::path_not_found().add_path(target.path.clone())
+        ));
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Native,
+            std::slice::from_ref(&target),
+            &io_error
+        ));
+    }
+
+    #[test]
+    fn pathless_and_watch_root_missing_errors_remain_fatal() {
+        let literal_target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/watched.txt"),
+            recursive: false,
+        };
+        let recursive_target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/content"),
+            recursive: true,
+        };
+
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&literal_target),
+            &notify::Error::path_not_found()
+        ));
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&literal_target),
+            &notify::Error::path_not_found().add_path(PathBuf::from("/tmp/example"))
+        ));
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&recursive_target),
+            &notify::Error::path_not_found().add_path(recursive_target.path.clone())
+        ));
+        assert!(is_transient_missing_path_error(
+            WatcherKind::Poll,
+            std::slice::from_ref(&recursive_target),
+            &notify::Error::path_not_found().add_path(recursive_target.path.join("post.md"))
+        ));
+    }
+
+    #[test]
+    fn permission_watcher_errors_remain_fatal() {
+        let error = notify::Error::io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+
+        assert!(!is_transient_missing_path_error(
+            WatcherKind::Poll,
+            &[],
+            &error
+        ));
+    }
+
+    #[test]
+    fn polling_errors_for_unrelated_siblings_are_non_fatal() {
+        let target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/watched.txt"),
+            recursive: false,
+        };
+        let unrelated_error = notify::Error::io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+        .add_path(PathBuf::from("/tmp/example/unrelated.txt"));
+
+        assert!(is_unrelated_poll_error(
+            WatcherKind::Poll,
+            &[target],
+            &unrelated_error
+        ));
+    }
+
+    #[test]
+    fn polling_errors_overlapping_a_target_remain_fatal() {
+        let target = CompiledWatchTarget {
+            path: PathBuf::from("/tmp/example/watched.txt"),
+            recursive: false,
+        };
+        for error_path in ["/tmp/example", "/tmp/example/watched.txt"] {
+            let error = notify::Error::io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied",
+            ))
+            .add_path(PathBuf::from(error_path));
+
+            assert!(!is_unrelated_poll_error(
+                WatcherKind::Poll,
+                std::slice::from_ref(&target),
+                &error
+            ));
+        }
     }
 
     #[test]

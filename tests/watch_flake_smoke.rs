@@ -27,21 +27,49 @@ fn repeated_literal_file_edits_keep_triggering_native_watch_workflow() {
     }
 }
 
+#[test]
+fn deleting_and_recreating_a_polled_file_keeps_the_runtime_alive() {
+    let fixture = WatchFixture::new_with_watcher("poll");
+    let mut child = DevloopChild::spawn(&fixture);
+
+    child.wait_for_log_line("startup value: initial", Duration::from_secs(10));
+    child.wait_for_log_line("watching ", Duration::from_secs(10));
+
+    fixture.remove_value();
+    child.wait_for_log_line(
+        "workflow failed; continuing runtime in degraded mode",
+        Duration::from_secs(10),
+    );
+    child.assert_running();
+
+    fixture.write_value("recreated");
+    child.wait_for_log_line("changed value: recreated", Duration::from_secs(10));
+    child.assert_running();
+}
+
 struct WatchFixture {
     dir: TempDir,
 }
 
 impl WatchFixture {
     fn new() -> Self {
+        Self::new_with_watcher("native")
+    }
+
+    fn new_with_watcher(watcher_kind: &str) -> Self {
         let dir = tempfile::tempdir().expect("create tempdir");
         let fixture = Self { dir };
         fixture.write("watched.txt", "initial\n");
         fixture.write(
             "devloop.toml",
-            r#"root = "."
+            &r#"root = "."
 debounce_ms = 300
 state_file = "./.devloop/state.json"
 startup_workflows = ["startup"]
+
+[watcher]
+kind = "__WATCHER_KIND__"
+poll_interval_ms = 50
 
 [watch.content]
 paths = ["watched.txt"]
@@ -65,7 +93,8 @@ steps = [
   { action = "run_hook", hook = "current_value" },
   { action = "log", message = "changed value: {{current_value}}" },
 ]
-"#,
+"#
+            .replace("__WATCHER_KIND__", watcher_kind),
         );
         fixture
     }
@@ -76,6 +105,11 @@ steps = [
 
     fn write_value(&self, value: &str) {
         self.write("watched.txt", &format!("{value}\n"));
+    }
+
+    fn remove_value(&self) {
+        std::fs::remove_file(self.dir.path().join("watched.txt"))
+            .expect("remove watched fixture file");
     }
 
     fn write(&self, relative_path: &str, contents: &str) {
@@ -101,6 +135,7 @@ impl DevloopChild {
             .arg("--config")
             .arg(fixture.config_path())
             .current_dir(fixture.dir.path())
+            .env("RUST_LOG", "info")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn devloop");
@@ -148,6 +183,16 @@ impl DevloopChild {
                 return;
             }
         }
+    }
+
+    fn assert_running(&mut self) {
+        assert!(
+            self.child
+                .try_wait()
+                .expect("query devloop status")
+                .is_none(),
+            "devloop exited after a watched file was deleted"
+        );
     }
 }
 
