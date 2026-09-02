@@ -4,6 +4,8 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-02
+
 ### Fixed
 
 - Made transactional artifact guidance discoverable from root help, the bare
