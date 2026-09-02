@@ -71,7 +71,7 @@ devloop_bin="${repo_root}/target/debug/devloop"
 
 (cd "${repo_root}" && cargo build --bins >/dev/null)
 
-"${devloop_bin}" run --config "${tmp_dir}/devloop.toml" >"${log_path}" 2>&1 &
+RUST_LOG=info "${devloop_bin}" run --config "${tmp_dir}/devloop.toml" >"${log_path}" 2>&1 &
 devloop_pid=$!
 start_watchdog
 

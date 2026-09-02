@@ -4,6 +4,15 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-02
+
+### Fixed
+
+- Made transactional artifact guidance discoverable from root help, the bare
+  `devloop docs` index, and artifact validation errors.
+- Made the runtime smoke test select its required informational log level
+  instead of inheriting a caller setting that could hide its readiness signal.
+
 ## [0.11.0] - 2026-09-02
 
 ### Added

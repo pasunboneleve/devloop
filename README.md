@@ -102,6 +102,7 @@ The tool will:
 Built-in reference docs are also available from the CLI:
 
 ```bash
+devloop docs
 devloop docs config
 devloop docs behavior
 devloop docs artifacts
