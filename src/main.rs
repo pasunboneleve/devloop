@@ -41,7 +41,8 @@ const SESSION_LOG_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
     author,
     version,
     about = "Run config-driven local development workflows",
-    long_about = "devloop watches a client repository, supervises its processes, and executes ordered workflows defined in a TOML config file."
+    long_about = "devloop watches a client repository, supervises its processes, and executes ordered workflows defined in a TOML config file.",
+    after_help = "Serving generated files that are replaced during rebuilds? Use transactional artifacts. Run `devloop docs artifacts`."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -65,7 +66,7 @@ enum Command {
     /// Print built-in reference documentation.
     Docs {
         #[arg(value_enum)]
-        topic: DocsTopic,
+        topic: Option<DocsTopic>,
     },
 }
 
@@ -322,17 +323,18 @@ fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn docs_text(topic: DocsTopic) -> &'static str {
+fn docs_text(topic: Option<DocsTopic>) -> &'static str {
     match topic {
-        DocsTopic::Config => include_str!("../docs/configuration.md"),
-        DocsTopic::Behavior => include_str!("../docs/behavior.md"),
-        DocsTopic::Artifacts => include_str!("../docs/artifacts.md"),
-        DocsTopic::Development => include_str!("../docs/development.md"),
-        DocsTopic::Security => include_str!("../docs/security.md"),
+        None => include_str!("../docs/README.md"),
+        Some(DocsTopic::Config) => include_str!("../docs/configuration.md"),
+        Some(DocsTopic::Behavior) => include_str!("../docs/behavior.md"),
+        Some(DocsTopic::Artifacts) => include_str!("../docs/artifacts.md"),
+        Some(DocsTopic::Development) => include_str!("../docs/development.md"),
+        Some(DocsTopic::Security) => include_str!("../docs/security.md"),
     }
 }
 
-fn render_docs_text(topic: DocsTopic) -> String {
+fn render_docs_text(topic: Option<DocsTopic>) -> String {
     render_markdown_for_terminal(docs_text(topic))
 }
 
@@ -524,7 +526,7 @@ mod tests {
     };
     use crate::session_log::SessionLog;
     use crate::test_support::RustLogGuard;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use tempfile::tempdir;
 
     #[test]
@@ -639,7 +641,7 @@ mod tests {
 
     #[test]
     fn docs_text_uses_embedded_configuration_reference() {
-        let rendered = docs_text(DocsTopic::Config);
+        let rendered = docs_text(Some(DocsTopic::Config));
 
         assert!(rendered.starts_with("# Configuration Reference"));
         assert!(rendered.contains("startup_workflows"));
@@ -649,7 +651,7 @@ mod tests {
 
     #[test]
     fn docs_text_uses_embedded_session_log_behavior_reference() {
-        let rendered = docs_text(DocsTopic::Behavior);
+        let rendered = docs_text(Some(DocsTopic::Behavior));
 
         assert!(rendered.starts_with("# Behavior Reference"));
         assert!(rendered.contains("### Session logs"));
@@ -658,7 +660,7 @@ mod tests {
 
     #[test]
     fn docs_text_uses_embedded_development_reference() {
-        let rendered = docs_text(DocsTopic::Development);
+        let rendered = docs_text(Some(DocsTopic::Development));
 
         assert!(rendered.starts_with("# Development Guide"));
         assert!(rendered.contains("DEVLOOP_RUN_WATCH_FLAKE_SMOKE"));
@@ -666,7 +668,7 @@ mod tests {
 
     #[test]
     fn docs_text_exposes_agent_safe_artifact_workflow() {
-        let rendered = docs_text(DocsTopic::Artifacts);
+        let rendered = docs_text(Some(DocsTopic::Artifacts));
 
         assert!(rendered.starts_with("# Transactional Artifact Generations"));
         assert!(rendered.contains("## Agent rule"));
@@ -676,7 +678,7 @@ mod tests {
 
     #[test]
     fn rendered_docs_drop_markdown_heading_markers() {
-        let rendered = render_docs_text(DocsTopic::Config);
+        let rendered = render_docs_text(Some(DocsTopic::Config));
 
         assert!(rendered.starts_with("CONFIGURATION REFERENCE"));
         assert!(!rendered.contains("# Configuration Reference"));
@@ -712,7 +714,9 @@ mod tests {
         let cli = Cli::try_parse_from(["devloop", "docs", "security"]).expect("parse cli");
 
         match cli.command {
-            super::Command::Docs { topic } => assert!(matches!(topic, DocsTopic::Security)),
+            super::Command::Docs { topic } => {
+                assert!(matches!(topic, Some(DocsTopic::Security)))
+            }
             _ => panic!("expected docs subcommand"),
         }
     }
@@ -722,8 +726,37 @@ mod tests {
         let cli = Cli::try_parse_from(["devloop", "docs", "development"]).expect("parse cli");
 
         match cli.command {
-            super::Command::Docs { topic } => assert!(matches!(topic, DocsTopic::Development)),
+            super::Command::Docs { topic } => {
+                assert!(matches!(topic, Some(DocsTopic::Development)))
+            }
             _ => panic!("expected docs subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_root_help_points_agents_to_artifact_guidance() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("Serving generated files that are replaced during rebuilds?"));
+        assert!(help.contains("devloop docs artifacts"));
+    }
+
+    #[test]
+    fn cli_accepts_docs_without_a_topic() {
+        let cli = Cli::try_parse_from(["devloop", "docs"]).expect("parse docs index command");
+
+        match cli.command {
+            super::Command::Docs { topic } => assert!(topic.is_none()),
+            _ => panic!("expected docs subcommand"),
+        }
+    }
+
+    #[test]
+    fn docs_index_explains_when_to_use_artifacts() {
+        let rendered = render_docs_text(None);
+
+        assert!(rendered.starts_with("DEVLOOP DOCUMENTATION"));
+        assert!(rendered.contains("devloop docs artifacts"));
+        assert!(rendered.contains("replaces files that a managed process is serving"));
     }
 }

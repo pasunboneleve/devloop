@@ -102,9 +102,9 @@ impl Config {
             }
         }
         for (name, artifact) in &self.artifact {
-            artifact
-                .validate(self, name)
-                .with_context(|| format!("invalid artifact '{name}'"))?;
+            artifact.validate(self, name).with_context(|| {
+                format!("invalid artifact '{name}'; for guidance, run `devloop docs artifacts`")
+            })?;
         }
         self.event_server.validate()?;
         self.browser_reload_server.validate()?;
@@ -1094,6 +1094,7 @@ steps = [{ action = "notify_reload" }]
             .expect_err("artifact consumer must not start before recovery");
 
         assert!(format!("{error:#}").contains("must set autostart = false"));
+        assert!(format!("{error:#}").contains("devloop docs artifacts"));
     }
 
     #[test]
