@@ -223,7 +223,12 @@ kind = "http"
 url = "http://127.0.0.1:$CONTAINER_PORT/"
 interval_ms = 500
 timeout_ms = 30000
+expect_body = "{{ artifact.site.generation }}"
 ```
+
+- `expect_body`: optional exact response-body match after trimming the response.
+  Templates read current session state. Artifact consumers must match their
+  `artifact.<name>.generation`; a status-only probe is rejected for them.
 
 ### State-key probe
 
@@ -274,6 +279,31 @@ output = { inherit = true, body_style = "dim" }
 Hooks default to dimmed inherited output because they are typically
 short-lived helper commands whose output is useful context but not the
 primary long-running log stream.
+
+## Artifacts
+
+Artifacts describe build outputs that long-running processes consume.
+
+```toml
+[artifact.site]
+build_hook = "build_site"
+consumers = ["site"]
+retain = 2
+```
+
+- `build_hook`: hook that writes to `DEVLOOP_ARTIFACT_CANDIDATE`.
+- `consumers`: managed processes restarted against a completed generation.
+- `retain`: total successful generation directories to keep. Default: `2`;
+  must be greater than zero.
+
+Artifact table names must start with a lowercase letter and contain only
+lowercase letters, digits, and underscores.
+
+Each consumer must have HTTP readiness whose `expect_body` is exactly
+`{{ artifact.<name>.generation }}`. Use the artifact only through
+`publish_artifact`; lifecycle fragments are intentionally not configurable.
+See [Transactional Artifact Generations](artifacts.md) for the complete
+contract and environment variables.
 
 ### Observed hooks
 
@@ -422,6 +452,7 @@ would make ordering and duplication ambiguous.
 - `restart_process`
 - `wait_for_process`
 - `run_hook`
+- `publish_artifact`
 - `run_workflow`
 - `sleep_ms`
 - `write_state`
@@ -441,6 +472,16 @@ would make ordering and duplication ambiguous.
 
 `value` supports `{{state_key}}` interpolation from the current session
 state.
+
+### `publish_artifact`
+
+```toml
+{ action = "publish_artifact", artifact = "site" }
+```
+
+Builds a private candidate, switches all declared consumers, verifies that
+they serve the selected generation, rolls back a failed switch, and cleans old
+generations. Downstream triggers run only after publication succeeds.
 
 ### `log`
 

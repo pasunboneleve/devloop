@@ -66,6 +66,16 @@ impl SessionState {
         self.save_snapshot(&snapshot)
     }
 
+    pub fn remove(&self, key: &str) -> Result<()> {
+        let mut values = self.lock_values()?;
+        if values.remove(key).is_none() {
+            return Ok(());
+        }
+        let snapshot = values.clone();
+        drop(values);
+        self.save_snapshot(&snapshot)
+    }
+
     pub fn get_string(&self, key: &str) -> Result<Option<String>> {
         let values = self.lock_values()?;
         Ok(values

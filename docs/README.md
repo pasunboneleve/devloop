@@ -2,6 +2,7 @@
 
 - [Behavior Reference](behavior.md)
 - [Configuration Reference](configuration.md)
+- [Transactional Artifact Generations](artifacts.md)
 - [Development Guide](development.md)
 - [Security Notes](security.md)
 

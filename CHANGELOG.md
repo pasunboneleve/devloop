@@ -4,6 +4,16 @@ All notable changes to `devloop` will be recorded in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added transactional artifact generations through the single
+  `publish_artifact` workflow action. Devloop now builds in isolated candidate
+  directories, switches declared consumers only after build success, requires
+  exact-generation HTTP readiness, rolls back failed switches, cleans crash
+  remnants, and bounds retained generations.
+- Added `devloop docs artifacts` with an agent-oriented configuration contract
+  and complete lifecycle guidance.
+
 ## [0.10.5] - 2026-09-02
 
 ### Fixed

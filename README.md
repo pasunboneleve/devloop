@@ -104,6 +104,7 @@ Built-in reference docs are also available from the CLI:
 ```bash
 devloop docs config
 devloop docs behavior
+devloop docs artifacts
 devloop docs development
 devloop docs security
 ```
@@ -196,6 +197,11 @@ For the runtime behavior reference, see
 
 For the full configuration reference, see
 [`docs/configuration.md`](docs/configuration.md).
+
+For servers that consume directories replaced by a build, see
+[`docs/artifacts.md`](docs/artifacts.md). It defines the agent-safe
+`publish_artifact` workflow, exact-generation readiness, rollback, and bounded
+retention.
 
 For local contributor workflow details, including the opt-in watch
 flake smoke test, see [`docs/development.md`](docs/development.md).

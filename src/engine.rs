@@ -44,6 +44,12 @@ trait WorkflowEffectAdapter {
         changed_files: &[String],
         workflow_name: &str,
     ) -> Result<()>;
+    async fn publish_artifact(
+        &mut self,
+        artifact: &str,
+        changed_files: &[String],
+        workflow_name: &str,
+    ) -> Result<()>;
     async fn notify_reload(&mut self) -> Result<()>;
     async fn sleep_ms(&mut self, duration_ms: u64) -> Result<()>;
     async fn persist_state(&mut self, key: String, value: Value) -> Result<()>;
@@ -113,7 +119,16 @@ impl Engine {
             .with_session_log(self.session_log.clone());
         let watch_groups = self.config.compiled_watchers()?;
         let watched_targets = self.config.compiled_watch_targets();
-        let ignored_watch_paths = vec![self.session_log.path().to_path_buf()];
+        let state_path = state.path().to_path_buf();
+        let artifact_root = state_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("artifacts");
+        let ignored_watch_paths = vec![
+            self.session_log.path().to_path_buf(),
+            state_path,
+            artifact_root,
+        ];
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (external_event_tx, mut external_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_watcher = tx.clone();
@@ -265,6 +280,17 @@ impl WorkflowEffectAdapter for LiveWorkflowAdapter<'_, '_> {
     ) -> Result<()> {
         self.processes
             .run_hook(hook, self.state, changed_files, workflow_name)
+            .await
+    }
+
+    async fn publish_artifact(
+        &mut self,
+        artifact: &str,
+        changed_files: &[String],
+        workflow_name: &str,
+    ) -> Result<()> {
+        self.processes
+            .publish_artifact(artifact, self.state, changed_files, workflow_name)
             .await
     }
 
@@ -609,6 +635,15 @@ async fn execute_workflow_effect<A: WorkflowEffectAdapter>(
                 .run_hook(&hook, &changed_files, &workflow_name)
                 .await
         }
+        WorkflowEffect::PublishArtifact {
+            artifact,
+            workflow_name,
+            changed_files,
+        } => {
+            adapter
+                .publish_artifact(&artifact, &changed_files, &workflow_name)
+                .await
+        }
         WorkflowEffect::NotifyReload => adapter.notify_reload().await,
         WorkflowEffect::SleepMs { duration_ms } => adapter.sleep_ms(duration_ms).await,
         WorkflowEffect::PersistState { key, value } => adapter.persist_state(key, value).await,
@@ -808,16 +843,16 @@ fn relativize_event_path<'a>(root: &'a Path, path: &'a Path) -> Option<&'a Path>
 }
 
 fn path_is_equivalent_to_ignored_path(path: &Path, ignored_path: &Path) -> bool {
-    if path == ignored_path {
+    if path == ignored_path || path.starts_with(ignored_path) {
         return true;
     }
     if let Some(private_path) = private_path_variant(ignored_path)
-        && path == private_path
+        && (path == private_path || path.starts_with(&private_path))
     {
         return true;
     }
     if let Some(public_path) = public_path_variant(ignored_path)
-        && path == public_path
+        && (path == public_path || path.starts_with(&public_path))
     {
         return true;
     }
@@ -952,6 +987,29 @@ mod tests {
         let grouped = classify_events(&root, &groups, &events, &ignored_paths);
 
         assert!(grouped.is_empty());
+    }
+
+    #[test]
+    fn classify_events_ignore_engine_owned_state_and_artifact_tree() {
+        let root = PathBuf::from("/tmp/example");
+        let groups = vec![CompiledWatchGroup::for_test(&["**/*"], "all").expect("watch group")];
+        let ignored_paths = vec![
+            root.join(".devloop/state.json"),
+            root.join(".devloop/artifacts"),
+        ];
+        let events = vec![Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![
+                root.join(".devloop/state.json"),
+                root.join(".devloop/artifacts/site/123/index.html"),
+                root.join("src/page.ts"),
+            ],
+            attrs: Default::default(),
+        }];
+
+        let grouped = classify_events(&root, &groups, &events, &ignored_paths);
+
+        assert_eq!(grouped["all"], vec!["src/page.ts"]);
     }
 
     #[test]
@@ -1279,6 +1337,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -1338,6 +1397,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -1410,6 +1470,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -1507,6 +1568,19 @@ mod tests {
             Ok(())
         }
 
+        async fn publish_artifact(
+            &mut self,
+            artifact: &str,
+            changed_files: &[String],
+            workflow_name: &str,
+        ) -> Result<()> {
+            self.calls.push(format!(
+                "artifact:{artifact}:{workflow_name}:{}",
+                changed_files.join(",")
+            ));
+            Ok(())
+        }
+
         async fn notify_reload(&mut self) -> Result<()> {
             self.calls.push("notify_reload".into());
             if self.fail_reload {
@@ -1547,6 +1621,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -1605,6 +1680,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -1656,6 +1732,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -1734,6 +1811,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -1794,6 +1872,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -1945,6 +2024,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -2030,6 +2110,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -2106,6 +2187,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::from([(
@@ -2172,6 +2254,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::from([(
@@ -2224,6 +2307,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -2259,6 +2343,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
@@ -2295,6 +2380,7 @@ mod tests {
             watch: BTreeMap::new(),
             process: BTreeMap::new(),
             hook: BTreeMap::new(),
+            artifact: BTreeMap::new(),
             event_server: crate::config::EventServerConfig::default(),
             browser_reload_server: crate::config::BrowserReloadServerConfig::default(),
             event: BTreeMap::new(),
